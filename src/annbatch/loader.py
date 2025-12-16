@@ -414,14 +414,14 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
             dataset_index_to_slices_sorted[k] = dataset_index_to_slices[k]
         return dataset_index_to_slices_sorted
 
-    def _get_chunks(self, chunk_size: int) -> np.ndarray:
+    def _get_chunks(self) -> np.ndarray:
         """Get a potentially shuffled list of chunk ids, accounting for the fact that this dataset might be inside a worker.
 
         Returns
         -------
             A :class:`numpy.ndarray` of chunk ids.
         """
-        chunks = np.arange(math.ceil(self.n_obs / chunk_size))
+        chunks = np.arange(math.ceil(self.n_obs / self._chunk_size))
         if self._shuffle:
             self._worker_handle.shuffle(chunks)
 
@@ -605,7 +605,7 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
         in_memory_labels = None
         in_memory_indices = None
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
-        for chunk_indices in _batched(self._get_chunks(self._chunk_size), self._preload_nchunks):
+        for chunk_indices in _batched(self._get_chunks(), self._preload_nchunks):
             slices = [
                 slice(
                     index * self._chunk_size,
