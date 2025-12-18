@@ -732,3 +732,32 @@ class TestCategorySampler:
 
         assert sorted_covered == set(range(8))
         assert unsorted_covered == set(range(8))
+
+    def test_sorted_categories_explicit_true(self):
+        """Test explicit sorted_categories=True skips detection."""
+        categories = np.array([0, 0, 0, 1, 1, 1])
+        sampler = CategorySampler(categories=categories, batch_size=2, sorted_categories=True)
+
+        assert sampler._is_sorted is True
+        # Should store ranges, not indices
+        assert sampler._category_data[0] == (0, 3)
+
+    def test_sorted_categories_explicit_false(self):
+        """Test explicit sorted_categories=False skips detection."""
+        categories = np.array([0, 0, 0, 1, 1, 1])
+        sampler = CategorySampler(categories=categories, batch_size=2, sorted_categories=False)
+
+        assert sampler._is_sorted is False
+        # Should store indices, not ranges
+        np.testing.assert_array_equal(sampler._category_data[0], [0, 1, 2])
+
+    def test_sorted_categories_none_autodetects(self):
+        """Test sorted_categories=None auto-detects."""
+        sorted_cats = np.array([0, 0, 1, 1])
+        unsorted_cats = np.array([0, 1, 0, 1])
+
+        sampler_sorted = CategorySampler(categories=sorted_cats, batch_size=2, sorted_categories=None)
+        sampler_unsorted = CategorySampler(categories=unsorted_cats, batch_size=2, sorted_categories=None)
+
+        assert sampler_sorted._is_sorted is True
+        assert sampler_unsorted._is_sorted is False
