@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections import OrderedDict, defaultdict
 from functools import singledispatchmethod
 from importlib.util import find_spec
@@ -16,17 +15,9 @@ import zarr.core.sync as zsync
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
+from annbatch.sampler import Sampler, SliceSampler
 from annbatch.types import BackingArray_T, InputInMemoryArray_T, OutputInMemoryArray_T
-from annbatch.utils import (
-    CSRContainer,
-    MultiBasicIndexer,
-    WorkerHandle,
-    _batched,
-    check_lt_1,
-    check_var_shapes,
-    split_given_size,
-    to_torch,
-)
+from annbatch.utils import CSRContainer, MultiBasicIndexer, check_lt_1, check_var_shapes, split_given_size, to_torch
 
 try:
     from cupy import ndarray as CupyArray
@@ -80,8 +71,11 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
             The obs size (i.e., axis 0) of contiguous array data to fetch.
         preload_nchunks
             The number of chunks of contiguous array data to fetch.
+        sampler
+            A sampler instance that yields lists of slices for data access.
+            If None, a :class:`~annbatch.sampler.SliceSampler` is used by default.
         shuffle
-            Whether or not to shuffle the data.
+            Whether to shuffle chunk order and in-batch data after loading.
         return_index
             Whether or not to yield the index on each iteration.
         batch_size
@@ -123,19 +117,21 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
     _preload_to_gpu: bool = True
     _drop_last: bool = False
     _to_torch: bool = True
+    _shuffle: bool = False
     _used_anndata_adder: bool = False
-    _shuffle: bool
+    _batch_sampler: Sampler[list[slice]] | None
     _preload_nchunks: int
-    _worker_handle: WorkerHandle
     _chunk_size: int
     _dataset_elem_cache: dict[int, CSRDatasetElems]
+    _cached_sampler: Sampler[list[slice]] | None = None
 
     def __init__(
         self,
         *,
         chunk_size: int = 512,
         preload_nchunks: int = 32,
-        shuffle: bool = True,
+        batch_sampler: Sampler[list[slice]] | None = None,
+        shuffle: bool = False,
         return_index: bool = False,
         batch_size: int = 1,
         preload_to_gpu: bool = find_spec("cupy") is not None,
@@ -162,10 +158,10 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
         self._preload_to_gpu = preload_to_gpu
         self._to_torch = to_torch
         self._drop_last = drop_last
+        self._shuffle = shuffle
         self._chunk_size = chunk_size
         self._preload_nchunks = preload_nchunks
-        self._shuffle = shuffle
-        self._worker_handle = WorkerHandle()
+        self._batch_sampler = batch_sampler
         self._train_datasets = []
         self._shapes = []
         self._dataset_elem_cache = {}
@@ -414,18 +410,27 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
             dataset_index_to_slices_sorted[k] = dataset_index_to_slices[k]
         return dataset_index_to_slices_sorted
 
-    def _get_chunks(self) -> np.ndarray:
-        """Get a potentially shuffled list of chunk ids, accounting for the fact that this dataset might be inside a worker.
+    def _get_sampler(self) -> Sampler[list[slice]]:
+        """Get the sampler to use for iteration.
+
+        If no sampler was provided, creates a default SliceSampler.
 
         Returns
         -------
-            A :class:`numpy.ndarray` of chunk ids.
+            The sampler instance to use.
         """
-        chunks = np.arange(math.ceil(self.n_obs / self._chunk_size))
-        if self._shuffle:
-            self._worker_handle.shuffle(chunks)
-
-        return self._worker_handle.get_part_for_worker(chunks)
+        if self._cached_sampler is not None:
+            return self._cached_sampler
+        if self._batch_sampler is not None:
+            self._cached_sampler = self._batch_sampler
+        else:
+            self._cached_sampler = SliceSampler(
+                n_obs=self.n_obs,
+                batch_size=self._batch_size * self._preload_nchunks,
+                chunk_size=self._chunk_size,
+                shuffle=self._shuffle,
+            )
+        return self._cached_sampler
 
     @singledispatchmethod
     async def _fetch_data(self, dataset: ZarrArray | CSRDatasetElems, slices: list[slice]) -> InputInMemoryArray:
@@ -605,14 +610,9 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
         in_memory_labels = None
         in_memory_indices = None
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
-        for chunk_indices in _batched(self._get_chunks(), self._preload_nchunks):
-            slices = [
-                slice(
-                    index * self._chunk_size,
-                    min(self.n_obs, (index + 1) * self._chunk_size),
-                )
-                for index in chunk_indices
-            ]
+        sampler = self._get_sampler()
+        for slices in sampler:
+            # Sampler yields a list of slices that sum to batch_size
             dataset_index_to_slices = self._slices_to_slices_with_array_index(slices)
             # Fetch the data over slices
             chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(dataset_index_to_slices))
@@ -674,6 +674,7 @@ class Loader[BackingArray: BackingArray_T, InputInMemoryArray: InputInMemoryArra
             # If there is "leftover" at the end (see the modulo op),
             # save it for the next iteration.
             batch_indices = np.arange(in_memory_data.shape[0])
+            # TODO: consider a batch_finalize method that returns shuffling indices
             if self._shuffle:
                 np.random.default_rng().shuffle(batch_indices)
             splits = split_given_size(batch_indices, self._batch_size)
