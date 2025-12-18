@@ -111,12 +111,10 @@ class Loader[
     _drop_last: bool = False
     _to_torch: bool = True
     _shuffle: bool = False
-    _used_anndata_adder: bool = False
     _batch_sampler: Sampler[list[slice]] | None
     _preload_nchunks: int
     _chunk_size: int
     _dataset_elem_cache: dict[int, CSRDatasetElems]
-    _cached_sampler: Sampler[list[slice]] | None = None
 
     def __init__(
         self,
@@ -384,18 +382,15 @@ class Loader[
         -------
             The sampler instance to use.
         """
-        if self._cached_sampler is not None:
-            return self._cached_sampler
-        if self._batch_sampler is not None:
-            self._cached_sampler = self._batch_sampler
-        else:
-            self._cached_sampler = SliceSampler(
+        if self._batch_sampler is None:
+            self._batch_sampler = SliceSampler(
                 n_obs=self.n_obs,
-                batch_size=self._batch_size * self._preload_nchunks,
+                batch_size=self._batch_size,
+                preload_nchunks=self._preload_nchunks,
                 chunk_size=self._chunk_size,
                 shuffle=self._shuffle,
             )
-        return self._cached_sampler
+        return self._batch_sampler
 
     @singledispatchmethod
     async def _fetch_data(self, dataset: ZarrArray | CSRDatasetElems, slices: list[slice]) -> InputInMemoryArray:

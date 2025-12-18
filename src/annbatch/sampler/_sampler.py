@@ -6,10 +6,6 @@ import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from annbatch.sampler._utils import batch_by_obs_count, generate_chunk_slices, shuffle_for_worker
-
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -52,17 +48,21 @@ class SliceSampler(Sampler[list[slice]]):
         self._batch_size = batch_size
         self._chunk_size = chunk_size
         self._shuffle = shuffle
-        self._n_iters = math.ceil(n_obs / batch_size)
+        self._n_iters = math.ceil(n_obs / (self._chunk_size * preload_nchunks))
 
     def __len__(self) -> int:
         return self._n_iters
 
     def __iter__(self) -> Iterator[list[slice]]:
-        n_chunks = math.ceil(self._n_obs / self._chunk_size)
-        chunk_indices = np.arange(n_chunks)
+        pass
+        # would have
+        # for s in sampler:
+        #     assert sum( s.stop - s.start for s in s) == self._chunk_size * preload_nchunks
 
-        if self._shuffle:
-            chunk_indices = shuffle_for_worker(chunk_indices)
 
-        slices = generate_chunk_slices(self._n_obs, self._chunk_size, chunk_indices)
-        yield from batch_by_obs_count(slices, self._batch_size)
+class CategorySampler(SliceSampler):
+
+    def __iter__(self) -> Iterator[list[slice]]:
+        # each iteration should yield a list of slices that sum to chunk_size * preload_nchunks
+        # the sum of the slice ranges within one category should be
+
