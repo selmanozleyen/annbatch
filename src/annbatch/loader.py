@@ -16,8 +16,8 @@ from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
 from annbatch.sampler import Sampler, SliceSampler
-from annbatch.types import BackingArray_T, InputInMemoryArray_T, OutputInMemoryArray_T
-from annbatch.utils import CSRContainer, MultiBasicIndexer, check_lt_1, check_var_shapes, split_given_size, to_torch
+from annbatch.types import BackingArray_T, InputInMemoryArray_T, LoaderOutput, OutputInMemoryArray_T
+from annbatch.utils import CSRContainer, MultiBasicIndexer, check_lt_1, check_var_shapes, to_torch
 
 from .compat import IterableDataset
 
@@ -569,7 +569,7 @@ class Loader[
         in_memory_indices = None
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
         sampler = self._get_sampler()
-        for slices in sampler:
+        for slices, splits in sampler:
             # Sampler yields a list of slices that sum to batch_size
             dataset_index_to_slices = self._slices_to_slices_with_array_index(slices)
             # Fetch the data over slices
@@ -629,11 +629,8 @@ class Loader[
             # Create random indices into in_memory_data and then index into it
             # If there is "leftover" at the end (see the modulo op),
             # save it for the next iteration.
-            batch_indices = np.arange(in_memory_data.shape[0])
+            # batch_indices = np.arange(in_memory_data.shape[0])
             # TODO: consider a batch_finalize method that returns shuffling indices
-            if self._shuffle:
-                np.random.default_rng().shuffle(batch_indices)
-            splits = split_given_size(batch_indices, self._batch_size)
             for i, s in enumerate(splits):
                 if s.shape[0] == self._batch_size:
                     output: LoaderOutput = {
