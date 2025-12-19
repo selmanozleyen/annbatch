@@ -27,7 +27,7 @@ class Sampler[T_co](ABC):
     """Base class for all samplers."""
 
     @abstractmethod
-    def __iter__(self) -> Iterator[T_co, list[np.ndarray]]:
+    def __iter__(self) -> Iterator[tuple[T_co, list[np.ndarray], np.ndarray | None]]:
         """Iterate over batch access patterns."""
         pass
 
@@ -52,7 +52,26 @@ class SliceSampler(Sampler[list[slice]]):
         Whether to shuffle chunk order.
     """
 
-    __slots__ = ("_n_obs", "_batch_size", "_chunk_size", "_shuffle", "_n_iters", "_worker_handle")
+    __slots__ = (
+        "_n_obs",
+        "_batch_size",
+        "_chunk_size",
+        "_shuffle",
+        "_n_iters",
+        "_worker_handle",
+        "_drop_last",
+        "_start_index",
+        "_end_index",
+        "_start_chunk_id",
+        "_end_chunk_id",
+        "_n_chunks_to_load",
+        "_n_chunks_total",
+        "_n_batches",
+        "_total_yielded_obs",
+        "_n_iters",
+        "_worker_handle",
+        "_drop_last",
+    )
 
     def __init__(
         self,
@@ -62,7 +81,10 @@ class SliceSampler(Sampler[list[slice]]):
         chunk_size: int,
         shuffle: bool = False,
         preload_nchunks: int,
+        drop_last: bool = False,
         worker_handle: WorkerHandle | None = None,
+        start_index: int = 0,
+        end_index: int | None = None,
     ):
         if preload_nchunks < 1:
             raise ValueError("preload_nchunks must be >= 1")
@@ -71,9 +93,34 @@ class SliceSampler(Sampler[list[slice]]):
         self._chunk_size = chunk_size
         self._shuffle = shuffle
         self._preload_nchunks = preload_nchunks
-        self._n_iters = math.ceil(n_obs / (self._chunk_size * preload_nchunks))
-        self._n_chunks = math.ceil(n_obs / chunk_size)
+
+        if start_index < 0 or start_index >= n_obs:
+            raise ValueError("start_index must be >= 0 and < n_obs")
+        self._start_index = start_index
+        if end_index is not None:
+            if end_index < 0 or end_index > n_obs or end_index < start_index:
+                raise ValueError("end_index must be >= 0 and < n_obs and > start_index")
+            self._end_index = end_index
+        else:
+            self._end_index = n_obs
+
+        self._start_chunk_id = self._start_index // self._chunk_size
+        self._end_chunk_id = (self._end_index - 1) // self._chunk_size
+
+        self._n_chunks_to_load = self._end_chunk_id - self._start_chunk_id + 1
+        self._n_chunks_total = math.ceil(self._n_obs / self._chunk_size)
+
+        self._n_batches = (
+            math.floor((self._end_index - self._start_index) / self._batch_size)
+            if drop_last
+            else math.ceil((self._end_index - self._start_index) / self._batch_size)
+        )
+        # this is the total number of observations that will be yielded
+        # and won't be ignored when applying the batch indices.
+        self._total_yielded_obs = self._n_batches * self._batch_size
+        self._n_iters = math.ceil(self._total_yielded_obs / (self._chunk_size * preload_nchunks))
         self._worker_handle = worker_handle
+        self._drop_last = drop_last
 
     def __len__(self) -> int:
         return self._n_iters
@@ -93,17 +140,85 @@ class SliceSampler(Sampler[list[slice]]):
             for chunk_id in chunk_ids
         ]
 
-    def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray]]]:
-        chunk_ids = np.arange(self._n_chunks)
+    def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray], np.ndarray | None]]:
+        chunk_ids = np.arange(self._n_chunks_to_load) + self._start_chunk_id
         # indices applied to the loaded data
-        preloaded_indices = np.arange(self._preload_nchunks * self._chunk_size)
-        if self._shuffle:
-            preloaded_indices = self._shuffle_integers(preloaded_indices)
-            chunk_ids = self._shuffle_integers(chunk_ids)
-        splits = np.split(preloaded_indices, np.arange(self._batch_size, len(preloaded_indices), self._batch_size))
 
-        for preloaded_chunk_ids in _batched(chunk_ids, self._preload_nchunks):
-            yield (
-                self._chunk_ids_to_slices(preloaded_chunk_ids),
-                splits,
+        # # data needs to be preserved from previous batches if below is not 0
+        # n_leftover_each_batch = (self._preload_nchunks * self._chunk_size) % self._batch_size
+        # # last batch data will be ommited if below is not 0 and drop_last is True
+        # n_leftover_total = self._n_obs % self._batch_size
+
+        # is this memory expensive?
+        slices = self._chunk_ids_to_slices(chunk_ids)
+        if self._n_chunks_to_load == 1:
+            slices[0] = slice(
+                self._start_index,
+                self._end_index,
             )
+        else:
+            slices[0] = slice(
+                self._start_index,
+                min((self._start_chunk_id + 1) * self._chunk_size, self._end_index),
+            )
+            slices[-1] = slice(
+                self._end_chunk_id * self._chunk_size,
+                self._end_index,
+            )
+
+        if self._shuffle:
+            chunk_ids = self._shuffle_integers(chunk_ids)
+
+        assert len(chunk_ids) == self._n_chunks_to_load
+
+        n_leftover_loaded_indices = 0
+        leftover_split = None
+
+        for i, chunk_ids_to_load in enumerate(_batched(chunk_ids, self._preload_nchunks)):
+            # maybe below can be avoided
+            total_obs_to_load = sum(
+                slices[i - self._start_chunk_id].stop - slices[i - self._start_chunk_id].start
+                for i in chunk_ids_to_load
+            )
+            # splits is a list of arrays of indices that will be used to index the data after it is loaded
+            loaded_indices = np.arange(total_obs_to_load + n_leftover_loaded_indices)
+            if self._shuffle:
+                loaded_indices = self._shuffle_integers(loaded_indices)
+            splits = np.split(loaded_indices, np.arange(self._batch_size, len(loaded_indices), self._batch_size))
+
+            # too lazy to check the docs of np.split, reconsider this later
+            assert splits[-1].shape[0] != 0
+            if splits[-1].shape[0] == self._batch_size:
+                n_leftover_loaded_indices = 0
+                leftover_split = None
+            else:
+                n_leftover_loaded_indices = splits[-1].shape[0]
+                if self._drop_last and i == self._n_batches - 1:
+                    # if last batch and drop_last don't keep leftover data
+                    leftover_split = None
+                else:
+                    leftover_split = splits[-1]
+                splits = splits[:-1]
+
+            yield (
+                [slices[i - self._start_chunk_id] for i in chunk_ids_to_load],
+                splits,
+                leftover_split,
+            )
+
+        # # for i, preloaded_chunk_ids in enumerate(_batched(
+        # #                                 self._chunk_ids_to_slices(chunk_ids),
+        # #                                 self._preload_nchunks), end):
+
+        # for preloaded_chunk_ids in _batched(chunk_ids, self._preload_nchunks):
+        #     # there can be some optimization if shuffle is false
+        #     preloaded_indices = np.arange(self._preload_nchunks * self._chunk_size)
+        #     if self._shuffle:
+        #         preloaded_indices = self._shuffle_integers(preloaded_indices)
+        #     splits = np.split(preloaded_indices, np.arange(self._batch_size, len(preloaded_indices), self._batch_size))
+
+        #     # if self._shuffle:
+        #     yield (
+        #         self._chunk_ids_to_slices(preloaded_chunk_ids),
+        #         splits,
+        #     )
