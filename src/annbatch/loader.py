@@ -740,19 +740,19 @@ class Loader[
         in_memory_data: OutputInMemoryArray_T,
         concatenated_obs: pd.DataFrame | None,
         in_memory_indices: np.ndarray | None,
-        s: np.ndarray,
+        split: np.ndarray,
     ) -> LoaderOutput:
         """Prepare the final output dict for a single batch."""
         index = None
         labels = None
         if self._obs is not None and concatenated_obs is not None:
-            labels = concatenated_obs.iloc[s]
+            labels = concatenated_obs.iloc[split]
         if self._return_index and in_memory_indices is not None:
-            index = in_memory_indices[s]
+            index = in_memory_indices[split]
         if self._to_torch:
-            data = to_torch(in_memory_data[s], self._preload_to_gpu)
+            data = to_torch(in_memory_data[split], self._preload_to_gpu)
         else:
-            data = in_memory_data[s]
+            data = in_memory_data[split]
         return {"data": data, "labels": labels, "index": index}
 
     def _prepare_leftover_data(
