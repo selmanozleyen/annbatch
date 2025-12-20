@@ -124,21 +124,6 @@ class SliceSampler(Sampler[list[slice]]):
     def __len__(self) -> int:
         return self._n_iters
 
-    def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:
-        if self._worker_handle is None:
-            # TODO: deal with generators later
-            self._rng.shuffle(integers)
-        else:
-            # should we always have a worker handle? even if its no-op?
-            self._worker_handle.shuffle(integers)
-        return integers
-
-    def _chunk_ids_to_slices(self, chunk_ids: np.ndarray) -> list[slice]:
-        return [
-            slice(chunk_id * self._chunk_size, min((chunk_id + 1) * self._chunk_size, self._n_obs))
-            for chunk_id in chunk_ids
-        ]
-
     def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray], np.ndarray | None]]:
         chunk_ids = np.arange(self._n_chunks_to_load) + self._start_chunk_id
 
@@ -203,3 +188,18 @@ class SliceSampler(Sampler[list[slice]]):
                 splits,
                 leftover_split,
             )
+
+    def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:
+        if self._worker_handle is None:
+            # TODO: deal with generators later
+            self._rng.shuffle(integers)
+        else:
+            # should we always have a worker handle? even if its no-op?
+            self._worker_handle.shuffle(integers)
+        return integers
+
+    def _chunk_ids_to_slices(self, chunk_ids: np.ndarray) -> list[slice]:
+        return [
+            slice(chunk_id * self._chunk_size, min((chunk_id + 1) * self._chunk_size, self._n_obs))
+            for chunk_id in chunk_ids
+        ]
