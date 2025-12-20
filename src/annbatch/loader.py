@@ -679,9 +679,9 @@ class Loader[
                 if in_memory_data is None
                 else mod.vstack([in_memory_data, *chunks_converted])
             )
-            if obs is not None:
+            if self._obs is not None and obs is not None:
                 concatenated_obs = pd.concat(obs) if concatenated_obs is None else pd.concat([concatenated_obs, *obs])
-            if indices is not None:
+            if self._return_index and indices is not None:
                 in_memory_indices = (
                     np.concatenate(indices)
                     if in_memory_indices is None
