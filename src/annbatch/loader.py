@@ -409,11 +409,40 @@ class Loader[
         """Get the sampler to use for iteration.
 
         If no sampler was provided, creates a default SliceSampler.
+        When using PyTorch DataLoader with multiple workers, each worker
+        gets a shard of the data based on worker_info.
 
         Returns
         -------
             The sampler instance to use.
         """
+        # Check for PyTorch DataLoader multiprocessing context
+        worker_info = None
+        if find_spec("torch"):
+            import torch.utils.data
+
+            worker_info = torch.utils.data.get_worker_info()
+
+        # When in a worker process, always create a fresh sampler with proper sharding
+        # to avoid using a cached sampler from before pickling
+        if worker_info is not None:
+            per_worker = int(self.n_obs / worker_info.num_workers)
+            worker_id = worker_info.id
+            start_index = worker_id * per_worker
+            # Last worker handles any remainder
+            end_index = self.n_obs if worker_id == worker_info.num_workers - 1 else start_index + per_worker
+            return SliceSampler(
+                n_obs=self.n_obs,
+                batch_size=self._batch_size,
+                preload_nchunks=self._preload_nchunks,
+                chunk_size=self._chunk_size,
+                shuffle=self._shuffle,
+                drop_last=self._drop_last,
+                start_index=start_index,
+                end_index=end_index,
+            )
+
+        # Not in a worker - use cached sampler or create one with full range
         if self._batch_sampler is None:
             self._batch_sampler = SliceSampler(
                 n_obs=self.n_obs,
