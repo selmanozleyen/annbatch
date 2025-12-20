@@ -27,7 +27,7 @@ class TestSliceSamplerBasic:
         )
 
         all_indices = set()
-        for slices, splits, _ in sampler:
+        for slices, _splits, _ in sampler:
             for s in slices:
                 all_indices.update(range(s.start, s.stop))
 
@@ -48,7 +48,7 @@ class TestSliceSamplerBasic:
         )
 
         batch_sizes = []
-        for _, splits, leftover_ in sampler:
+        for _, splits, _ in sampler:
             for split in splits:
                 batch_sizes.append(len(split))
 
