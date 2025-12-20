@@ -212,20 +212,3 @@ class SliceSampler(Sampler[list[slice]]):
                 splits,
                 leftover_split,
             )
-
-        # # for i, preloaded_chunk_ids in enumerate(_batched(
-        # #                                 self._chunk_ids_to_slices(chunk_ids),
-        # #                                 self._preload_nchunks), end):
-
-        # for preloaded_chunk_ids in _batched(chunk_ids, self._preload_nchunks):
-        #     # there can be some optimization if shuffle is false
-        #     preloaded_indices = np.arange(self._preload_nchunks * self._chunk_size)
-        #     if self._shuffle:
-        #         preloaded_indices = self._shuffle_integers(preloaded_indices)
-        #     splits = np.split(preloaded_indices, np.arange(self._batch_size, len(preloaded_indices), self._batch_size))
-
-        #     # if self._shuffle:
-        #     yield (
-        #         self._chunk_ids_to_slices(preloaded_chunk_ids),
-        #         splits,
-        #     )
