@@ -133,7 +133,9 @@ nitpick_ignore = [
     # If building the documentation fails because of a missing link that is outside your control,
     # you can add an exception to this list.
     #     ("py:class", "igraph.Graph"),
-    ("py:class", "annbatch.types.TypeAliasType")
+    ("py:class", "annbatch.types.TypeAliasType"),
+    # Private module paths that Sphinx may still try to resolve
+    ("py:class", "annbatch.sampler._sampler.Sampler"),
 ]
 
 qualname_overrides = {

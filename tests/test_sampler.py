@@ -1,11 +1,12 @@
-"""Tests for SliceSampler with various start_index and end_index configurations."""
+"""Tests for SliceSampler and CategoricalSampler."""
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
-from annbatch.sampler import SliceSampler
+from annbatch.sampler import CategoricalSampler, SliceSampler
 
 
 class TestSliceSamplerBasic:
@@ -270,7 +271,10 @@ class TestSliceSamplerBothIndices:
         all_worker_indices = set()
         for worker_id in range(num_workers):
             start_index = worker_id * per_worker
-            end_index = n_obs if worker_id == num_workers - 1 else start_index + per_worker
+            if worker_id == num_workers - 1:
+                end_index = n_obs
+            else:
+                end_index = start_index + per_worker
 
             sampler = SliceSampler(
                 n_obs=n_obs,
@@ -432,3 +436,380 @@ class TestSliceSamplerEdgeCases:
 
         expected = set(range(start_index, end_index))
         assert all_indices == expected
+
+
+class TestCategoricalSamplerBasic:
+    """Tests for basic CategoricalSampler functionality."""
+
+    def test_single_key_contiguous(self):
+        """Test sampler with a single categorical key, contiguous groups."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 40 + ["C"] * 30,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_each_batch_single_category(self):
+        """Test that each batch contains only one category."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 40 + ["C"] * 30,
+            }
+        )
+        # Category bounds: A=[0,30), B=[30,70), C=[70,100)
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        for slices, _, _ in sampler:
+            # Collect all indices in this batch
+            batch_indices = []
+            for s in slices:
+                batch_indices.extend(range(s.start, s.stop))
+
+            # Determine categories for these indices
+            categories = set(obs.iloc[batch_indices]["cell_type"].values)
+
+            # Each batch should contain only one category
+            assert len(categories) == 1, f"Batch contains multiple categories: {categories}"
+
+    def test_multiple_keys_contiguous(self):
+        """Test sampler with multiple categorical keys."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 20 + ["A"] * 30 + ["B"] * 25 + ["B"] * 25,
+                "batch": ["X"] * 20 + ["Y"] * 30 + ["X"] * 25 + ["Y"] * 25,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys=["cell_type", "batch"],
+            batch_size=5,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        # Should have 4 categories: (A, X), (A, Y), (B, X), (B, Y)
+        assert sampler.n_categories == 4
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_category_bounds(self):
+        """Test that category bounds are computed correctly."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 40 + ["C"] * 30,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=1,
+        )
+
+        expected_bounds = [(0, 30), (30, 70), (70, 100)]
+        assert sampler.category_bounds == expected_bounds
+        assert sampler.category_labels == [("A",), ("B",), ("C",)]
+
+
+class TestCategoricalSamplerValidation:
+    """Tests for CategoricalSampler validation."""
+
+    def test_non_contiguous_raises(self):
+        """Test that non-contiguous categories raise ValueError."""
+        # A appears twice (non-contiguously)
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 10 + ["B"] * 10 + ["A"] * 10,
+            }
+        )
+
+        with pytest.raises(ValueError, match="non-contiguously"):
+            CategoricalSampler(
+                obs=obs,
+                keys="cell_type",
+                batch_size=5,
+                chunk_size=10,
+                preload_nchunks=1,
+            )
+
+    def test_missing_key_raises(self):
+        """Test that missing key raises ValueError."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 10,
+            }
+        )
+
+        with pytest.raises(ValueError, match="not found in obs columns"):
+            CategoricalSampler(
+                obs=obs,
+                keys="nonexistent_key",
+                batch_size=5,
+                chunk_size=10,
+                preload_nchunks=1,
+            )
+
+    def test_invalid_weights_length(self):
+        """Test that incorrect weights length raises ValueError."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 30 + ["C"] * 40,
+            }
+        )
+
+        with pytest.raises(ValueError, match="category_weights length"):
+            CategoricalSampler(
+                obs=obs,
+                keys="cell_type",
+                batch_size=5,
+                chunk_size=10,
+                preload_nchunks=1,
+                category_weights=np.array([0.5, 0.5]),  # 2 weights for 3 cats
+            )
+
+    def test_invalid_weights_sum(self):
+        """Test that weights not summing to 1 raises ValueError."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 30 + ["C"] * 40,
+            }
+        )
+
+        with pytest.raises(ValueError, match="must sum to 1.0"):
+            CategoricalSampler(
+                obs=obs,
+                keys="cell_type",
+                batch_size=5,
+                chunk_size=10,
+                preload_nchunks=1,
+                category_weights=np.array([0.3, 0.3, 0.3]),  # Sums to 0.9
+            )
+
+
+class TestCategoricalSamplerShuffle:
+    """Tests for CategoricalSampler with shuffling."""
+
+    def test_shuffle_covers_all_indices(self):
+        """Test that shuffle still covers all indices."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 40 + ["C"] * 30,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle=True,
+            rng=np.random.default_rng(42),
+        )
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_shuffle_changes_order(self):
+        """Test that shuffle actually changes iteration order."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 30 + ["C"] * 40,
+            }
+        )
+
+        # Collect first slice from each run
+        first_slices_no_shuffle = []
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=1,
+            shuffle=False,
+        )
+        for slices, _, _ in sampler:
+            first_slices_no_shuffle.append(slices[0].start)
+            break
+
+        # With shuffle, the order might be different
+        first_slices_with_shuffle = []
+        for _ in range(10):
+            sampler = CategoricalSampler(
+                obs=obs,
+                keys="cell_type",
+                batch_size=10,
+                chunk_size=10,
+                preload_nchunks=1,
+                shuffle=True,
+            )
+            for slices, _, _ in sampler:
+                first_slices_with_shuffle.append(slices[0].start)
+                break
+
+        # At least one shuffled run should start from a different position
+        # (probabilistically almost certain with 10 runs)
+        assert len(set(first_slices_with_shuffle)) > 1 or first_slices_with_shuffle[0] != first_slices_no_shuffle[0]
+
+
+class TestCategoricalSamplerWeights:
+    """Tests for CategoricalSampler with category weights."""
+
+    def test_valid_weights(self):
+        """Test sampler works with valid weights."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 30 + ["B"] * 30 + ["C"] * 40,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=1,
+            category_weights=np.array([0.5, 0.3, 0.2]),
+            shuffle=True,
+            rng=np.random.default_rng(42),
+        )
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+
+class TestCategoricalSamplerEdgeCases:
+    """Tests for edge cases."""
+
+    def test_single_category(self):
+        """Test with a single category."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 100,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        assert sampler.n_categories == 1
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_many_small_categories(self):
+        """Test with many small categories."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": [f"cat_{i // 5}" for i in range(100)],
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=2,
+            chunk_size=5,
+            preload_nchunks=1,
+        )
+
+        assert sampler.n_categories == 20
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_uneven_category_sizes(self):
+        """Test with very uneven category sizes."""
+        obs = pd.DataFrame(
+            {
+                "cell_type": ["A"] * 5 + ["B"] * 90 + ["C"] * 5,
+            }
+        )
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        assert sampler.category_bounds == [(0, 5), (5, 95), (95, 100)]
+
+        all_indices = set()
+        for slices, _, _ in sampler:
+            for s in slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(100))
+
+    def test_empty_dataframe(self):
+        """Test with empty DataFrame."""
+        obs = pd.DataFrame({"cell_type": []})
+
+        sampler = CategoricalSampler(
+            obs=obs,
+            keys="cell_type",
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=1,
+        )
+
+        assert sampler.n_categories == 0
+        assert len(sampler) == 0
+
+        count = 0
+        for _ in sampler:
+            count += 1
+        assert count == 0
