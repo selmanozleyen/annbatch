@@ -499,8 +499,8 @@ class Loader[
             A lookup between the dataset and its indexing slices, ordered by keys.
         """
         dataset_index_to_slices: defaultdict[int, list[slice]] = defaultdict(list)
-        for slice in slices:
-            for relative_obs_indices in self._get_relative_obs_indices(slice, use_original_space=use_original_space):
+        for slice_ in slices:
+            for relative_obs_indices in self._get_relative_obs_indices(slice_, use_original_space=use_original_space):
                 dataset_index_to_slices[relative_obs_indices[1]] += [relative_obs_indices[0]]
         keys = sorted(dataset_index_to_slices.keys())
         dataset_index_to_slices_sorted = OrderedDict()
