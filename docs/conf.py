@@ -136,6 +136,8 @@ nitpick_ignore = [
     ("py:class", "annbatch.types.TypeAliasType"),
     # Private module paths that Sphinx may still try to resolve
     ("py:class", "annbatch.sampler._sampler.Sampler"),
+    # Internal utility classes not part of public API
+    ("py:class", "annbatch.utils.WorkerHandle"),
 ]
 
 qualname_overrides = {
