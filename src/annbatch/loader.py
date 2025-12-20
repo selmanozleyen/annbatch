@@ -688,11 +688,19 @@ class Loader[
                     else np.concatenate([in_memory_indices, *indices])
                 )
 
-            for s in splits:
-                yield self._prepare_output(in_memory_data, concatenated_obs, in_memory_indices, s)
+            for split in splits:
+                yield self._prepare_output(
+                    in_memory_data=in_memory_data,
+                    concatenated_obs=concatenated_obs,
+                    in_memory_indices=in_memory_indices,
+                    split=split,
+                )
             if leftover_split is not None:
                 in_memory_data, concatenated_obs, in_memory_indices = self._prepare_leftover_data(
-                    in_memory_data, concatenated_obs, in_memory_indices, leftover_split
+                    in_memory_data=in_memory_data,
+                    concatenated_obs=concatenated_obs,
+                    in_memory_indices=in_memory_indices,
+                    leftover_split=leftover_split,
                 )
             else:
                 in_memory_data = None
