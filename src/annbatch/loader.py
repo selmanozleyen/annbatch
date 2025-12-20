@@ -39,7 +39,7 @@ class CSRDatasetElems(NamedTuple):
     data: zarr.AsyncArray
 
 
-class SamplerArgs(NamedTuple):
+class CommonSamplerArgs(NamedTuple):
     """Common arguments with the sampler class."""
 
     chunk_size: int
@@ -129,7 +129,7 @@ class Loader[
     _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool = True
     _to_torch: bool = True
-    
+
     # args mutually exclusive with sampler start
     _batch_size: int = 1
     _drop_last: bool = False
@@ -137,7 +137,7 @@ class Loader[
     _preload_nchunks: int = 32
     _chunk_size: int = 512
     # args mutually exclusive with sampler end
-    
+
     _batch_sampler: Sampler[list[slice]] | None
     _dataset_elem_cache: dict[int, CSRDatasetElems]
 
@@ -268,7 +268,7 @@ class Loader[
         batch_size: int | None = None,
         shuffle: bool | None = None,
         drop_last: bool | None = None,
-    ) -> SamplerArgs:
+    ) -> CommonSamplerArgs:
         """Handle the sampler arguments. Is used in the initializer."""
         sampler_args = {
             "chunk_size": chunk_size if chunk_size is not None else None,
@@ -285,16 +285,16 @@ class Loader[
                     f"Cannot specify {', '.join(provided_args)} when providing a custom sampler. "
                     "These parameters are controlled by the sampler."
                 )
-            
-            return SamplerArgs(
-                batch_size=self._batch_size, # Loader is going to use this later
-                chunk_size=self._chunk_size, # not going to be used
-                preload_nchunks=self._preload_nchunks, # not going to be used
-                shuffle=self._shuffle, # not going to be used
-                drop_last=self._drop_last, # not going to be used
+
+            return CommonSamplerArgs(
+                batch_size=self._batch_size,  # Loader is going to use this later
+                chunk_size=self._chunk_size,  # not going to be used
+                preload_nchunks=self._preload_nchunks,  # not going to be used
+                shuffle=self._shuffle,  # not going to be used
+                drop_last=self._drop_last,  # not going to be used
             )
         # Apply defaults when no custom sampler
-        return SamplerArgs(
+        return CommonSamplerArgs(
             chunk_size=chunk_size if chunk_size is not None else self._chunk_size,
             preload_nchunks=preload_nchunks if preload_nchunks is not None else self._preload_nchunks,
             batch_size=batch_size if batch_size is not None else self._batch_size,
@@ -539,44 +539,9 @@ class Loader[
             import torch.distributed
             import torch.utils.data
 
-            # First level: distributed training across ranks
-            if torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-                world_size = torch.distributed.get_world_size()
-                per_rank = self.n_obs // world_size
-                start_index = rank * per_rank
-                end_index = self.n_obs if rank == world_size - 1 else start_index + per_rank
-                needs_fresh_sampler = True
+            raise ValueError("TODO: distributed training not supported")
+            # I have an idea how this will look like
 
-            # Second level: DataLoader workers within each rank
-            worker_info = torch.utils.data.get_worker_info()
-            if worker_info is not None:
-                rank_n_obs = end_index - start_index
-                per_worker = rank_n_obs // worker_info.num_workers
-                worker_id = worker_info.id
-                worker_start = start_index + worker_id * per_worker
-                # Last worker handles any remainder within this rank's shard
-                if worker_id == worker_info.num_workers - 1:
-                    worker_end = end_index
-                else:
-                    worker_end = worker_start + per_worker
-                start_index = worker_start
-                end_index = worker_end
-                needs_fresh_sampler = True
-
-        # When sharding is needed, always create a fresh sampler
-        # to avoid using a cached sampler from before pickling/distribution
-        if needs_fresh_sampler:
-            return SliceSampler(
-                n_obs=self.n_obs,
-                batch_size=self._batch_size,
-                preload_nchunks=self._preload_nchunks,
-                chunk_size=self._chunk_size,
-                shuffle=self._shuffle,
-                drop_last=self._drop_last,
-                start_index=start_index,
-                end_index=end_index,
-            )
 
         # Not in distributed/worker context - use cached sampler or create one with full range
         if self._batch_sampler is None:

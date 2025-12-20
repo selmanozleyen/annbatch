@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 T_co = TypeVar("T_co", covariant=True)
 
 
-class Sampler(ABC, Generic[T_co]):
+class Sampler[T_co](ABC):
     """Base sampler class."""
 
     @abstractmethod
