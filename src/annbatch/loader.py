@@ -719,27 +719,19 @@ class Loader[
                 result.append(self._np_module.asarray(chunk))
         return result
 
-    def _accumulate_labels(
-        self, dataset_index_to_slices: OrderedDict[int, list[slice]]
-    ) -> list[pd.DataFrame]:
+    def _accumulate_labels(self, dataset_index_to_slices: OrderedDict[int, list[slice]]) -> list[pd.DataFrame]:
         """Gather obs labels for the loaded slices."""
         assert self._obs is not None  # Caller ensures this
         return [
-            self._obs[idx].iloc[
-                np.concatenate([np.arange(s.start, s.stop) for s in slices])
-            ]
+            self._obs[idx].iloc[np.concatenate([np.arange(s.start, s.stop) for s in slices])]
             for idx, slices in dataset_index_to_slices.items()
         ]
 
     def _accumulate_indices(self, slices: list[slice]) -> list[np.ndarray]:
         """Gather original indices for the loaded slices."""
-        dataset_index_to_slices = self._slices_to_slices_with_array_index(
-            slices, use_original_space=True
-        )
+        dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=True)
         return [
-            np.concatenate(
-                [np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]]
-            )
+            np.concatenate([np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]])
             for idx in dataset_index_to_slices
         ]
 
