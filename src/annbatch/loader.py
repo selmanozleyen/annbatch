@@ -67,6 +67,8 @@ class Loader[
     If `preload_to_gpu` to True and `to_torch` is False, the yielded type is a `cupy` matrix.
     If `to_torch` is True, the yielded type is a :class:`torch.Tensor`.
     If both `preload_to_gpu` and `to_torch` are False, then the return type is the CPU class for the fiven data type.
+    When providing a custom sampler, `chunk_size`, `preload_nchunks`, `batch_size`,
+    `shuffle`, and `drop_last` must not be set (they are controlled by the sampler).
 
     Parameters
     ----------
@@ -77,10 +79,8 @@ class Loader[
         sampler
             A sampler instance that yields lists of slices for data access.
             If None, a :class:`~annbatch.sampler.SliceSampler` is used by default.
-            When providing a custom sampler, `chunk_size`, `preload_nchunks`, `batch_size`,
-            `shuffle`, and `drop_last` must not be set (they are controlled by the sampler).
         shuffle
-            Whether to shuffle chunk order and in-batch data after loading.
+            Whether or not to shuffle the data.
         return_index
             Whether or not to yield the index on each iteration.
         batch_size
