@@ -638,77 +638,6 @@ class Loader[
             )
         return await asyncio.gather(*tasks)
 
-    def _accumulate_chunks(self, chunks: list[InputInMemoryArray]) -> list[OutputInMemoryArray_T]:
-        # All chunks are same type (either all CSRContainer or all ndarray)
-        result: list[OutputInMemoryArray_T] = []
-        for chunk in chunks:
-            if isinstance(chunk, CSRContainer):
-                result.append(
-                    self._sp_module.csr_matrix(
-                        tuple(self._np_module.asarray(e) for e in chunk.elems),
-                        shape=chunk.shape,
-                        dtype="float64" if self._preload_to_gpu else chunk.dtype,
-                    )
-                )
-            else:
-                result.append(self._np_module.asarray(chunk))
-        return result
-
-    def _accumulate_labels(self, dataset_index_to_slices: OrderedDict[int, list[slice]]) -> list[pd.DataFrame]:
-        assert self._obs is not None  # Caller ensures this
-        return [
-            self._obs[idx].iloc[np.concatenate([np.arange(s.start, s.stop) for s in slices])]
-            for idx, slices in dataset_index_to_slices.items()
-        ]
-
-    def _accumulate_indices(self, slices: list[slice]) -> list[np.ndarray]:
-        dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=True)
-        return [
-            np.concatenate([np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]])
-            for idx in dataset_index_to_slices
-        ]
-
-    def _handle_leftover_chunks(
-        self, in_memory_data: OutputInMemoryArray_T | None, chunks_converted: list[OutputInMemoryArray_T]
-    ) -> OutputInMemoryArray_T:
-        mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
-        return (
-            mod.vstack(chunks_converted) if in_memory_data is None else mod.vstack([in_memory_data, *chunks_converted])
-        )
-
-    def _prepare_output(
-        self,
-        in_memory_data: OutputInMemoryArray_T,
-        concatenated_obs: pd.DataFrame | None,
-        in_memory_indices: np.ndarray | None,
-        s: np.ndarray,
-    ) -> LoaderOutput:
-        index = None
-        labels = None
-        if self._obs is not None and concatenated_obs is not None:
-            labels = concatenated_obs.iloc[s]
-        if self._return_index and in_memory_indices is not None:
-            index = in_memory_indices[s]
-        return {
-            "data": (to_torch(in_memory_data[s], self._preload_to_gpu) if self._to_torch else in_memory_data[s]),
-            "labels": labels,
-            "index": index,
-        }
-
-    def _prepare_leftover_data(
-        self,
-        in_memory_data: OutputInMemoryArray_T,
-        concatenated_obs: pd.DataFrame | None,
-        in_memory_indices: np.ndarray | None,
-        leftover_split: np.ndarray,
-    ) -> tuple[OutputInMemoryArray_T, pd.DataFrame | None, np.ndarray | None]:
-        in_memory_data = in_memory_data[leftover_split]
-        if concatenated_obs is not None:
-            concatenated_obs = concatenated_obs.iloc[leftover_split]
-        if in_memory_indices is not None:
-            in_memory_indices = in_memory_indices[leftover_split]
-        return in_memory_data, concatenated_obs, in_memory_indices
-
     def __iter__(
         self,
     ) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
@@ -769,3 +698,82 @@ class Loader[
                 in_memory_data = None
                 concatenated_obs = None
                 in_memory_indices = None
+
+    # -------------------------------------------------------------------------
+    # Iteration helper methods (used by __iter__)
+    # -------------------------------------------------------------------------
+
+    def _accumulate_chunks(self, chunks: list[InputInMemoryArray]) -> list[OutputInMemoryArray_T]:
+        """Convert fetched chunks to output array format (CSR or ndarray)."""
+        result: list[OutputInMemoryArray_T] = []
+        for chunk in chunks:
+            if isinstance(chunk, CSRContainer):
+                result.append(
+                    self._sp_module.csr_matrix(
+                        tuple(self._np_module.asarray(e) for e in chunk.elems),
+                        shape=chunk.shape,
+                        dtype="float64" if self._preload_to_gpu else chunk.dtype,
+                    )
+                )
+            else:
+                result.append(self._np_module.asarray(chunk))
+        return result
+
+    def _accumulate_labels(
+        self, dataset_index_to_slices: OrderedDict[int, list[slice]]
+    ) -> list[pd.DataFrame]:
+        """Gather obs labels for the loaded slices."""
+        assert self._obs is not None  # Caller ensures this
+        return [
+            self._obs[idx].iloc[
+                np.concatenate([np.arange(s.start, s.stop) for s in slices])
+            ]
+            for idx, slices in dataset_index_to_slices.items()
+        ]
+
+    def _accumulate_indices(self, slices: list[slice]) -> list[np.ndarray]:
+        """Gather original indices for the loaded slices."""
+        dataset_index_to_slices = self._slices_to_slices_with_array_index(
+            slices, use_original_space=True
+        )
+        return [
+            np.concatenate(
+                [np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]]
+            )
+            for idx in dataset_index_to_slices
+        ]
+
+    def _prepare_output(
+        self,
+        in_memory_data: OutputInMemoryArray_T,
+        concatenated_obs: pd.DataFrame | None,
+        in_memory_indices: np.ndarray | None,
+        s: np.ndarray,
+    ) -> LoaderOutput:
+        """Prepare the final output dict for a single batch."""
+        index = None
+        labels = None
+        if self._obs is not None and concatenated_obs is not None:
+            labels = concatenated_obs.iloc[s]
+        if self._return_index and in_memory_indices is not None:
+            index = in_memory_indices[s]
+        return {
+            "data": (to_torch(in_memory_data[s], self._preload_to_gpu) if self._to_torch else in_memory_data[s]),
+            "labels": labels,
+            "index": index,
+        }
+
+    def _prepare_leftover_data(
+        self,
+        in_memory_data: OutputInMemoryArray_T,
+        concatenated_obs: pd.DataFrame | None,
+        in_memory_indices: np.ndarray | None,
+        leftover_split: np.ndarray,
+    ) -> tuple[OutputInMemoryArray_T, pd.DataFrame | None, np.ndarray | None]:
+        """Subset data/labels/indices to keep only leftover rows for next iter."""
+        in_memory_data = in_memory_data[leftover_split]
+        if concatenated_obs is not None:
+            concatenated_obs = concatenated_obs.iloc[leftover_split]
+        if in_memory_indices is not None:
+            in_memory_indices = in_memory_indices[leftover_split]
+        return in_memory_data, concatenated_obs, in_memory_indices
