@@ -290,6 +290,38 @@ def test_bad_adata_X_hdf5(adata_with_h5_path_different_var_space: tuple[ad.AnnDa
             ds.add_dataset(data)
 
 
+def test_add_dataset_mismatched_var_shape(tmp_path: Path):
+    """Test adding datasets with different var dimensions raises."""
+    # Create two zarr stores with different var dimensions
+    n_obs, var_dim_1, var_dim_2 = 50, 100, 80
+
+    idx = np.arange(n_obs).astype(str)
+    obs1 = pd.DataFrame({"label": np.arange(n_obs)}, index=idx)
+    obs2 = pd.DataFrame({"label": np.arange(n_obs)}, index=idx)
+
+    adata1 = ad.AnnData(X=sp.random(n_obs, var_dim_1, format="csr", dtype="f4"), obs=obs1)
+    adata2 = ad.AnnData(X=sp.random(n_obs, var_dim_2, format="csr", dtype="f4"), obs=obs2)
+
+    path1 = tmp_path / "store1.zarr"
+    path2 = tmp_path / "store2.zarr"
+
+    # Write using standard anndata zarr I/O
+    adata1.write_zarr(path1)
+    adata2.write_zarr(path2)
+
+    # Open as sparse datasets
+    dataset1 = ad.io.sparse_dataset(zarr.open(path1)["X"])
+    dataset2 = ad.io.sparse_dataset(zarr.open(path2)["X"])
+    obs1_loaded = ad.io.read_elem(zarr.open(path1)["obs"])
+    obs2_loaded = ad.io.read_elem(zarr.open(path2)["obs"])
+
+    loader = Loader(chunk_size=10, preload_nchunks=5, preload_to_gpu=False, to_torch=False)
+    loader.add_dataset(dataset1, obs1_loaded)
+
+    with pytest.raises(ValueError, match="same shape along var axis"):
+        loader.add_dataset(dataset2, obs2_loaded)
+
+
 def _custom_collate_fn(elems):
     import torch
 

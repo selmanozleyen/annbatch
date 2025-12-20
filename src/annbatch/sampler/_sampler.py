@@ -127,7 +127,7 @@ class SliceSampler(Sampler[list[slice]]):
 
     def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:
         if self._worker_handle is None:
-            # todo: deal with generators later
+            # TODO: deal with generators later
             np.random.default_rng().shuffle(integers)
         else:
             # should we always have a worker handle? even if its no-op?
@@ -186,8 +186,6 @@ class SliceSampler(Sampler[list[slice]]):
                 loaded_indices = self._shuffle_integers(loaded_indices)
             splits = np.split(loaded_indices, np.arange(self._batch_size, len(loaded_indices), self._batch_size))
 
-            # too lazy to check the docs of np.split, reconsider this later
-            assert splits[-1].shape[0] != 0
             if splits[-1].shape[0] == self._batch_size:
                 n_leftover_loaded_indices = 0
                 leftover_split = None
