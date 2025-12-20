@@ -104,6 +104,15 @@ class Loader[
                 do_fit(batch)
     """
 
+    # Default values for sampler-controlled arguments
+    SAMPLER_ARG_DEFAULTS: dict[str, int | bool] = {
+        "chunk_size": 512,
+        "preload_nchunks": 32,
+        "batch_size": 1,
+        "shuffle": False,
+        "drop_last": False,
+    }
+
     _train_datasets: list[BackingArray]
     _obs: list[pd.DataFrame] | None = None
     _return_index: bool = False
@@ -121,44 +130,44 @@ class Loader[
     def __init__(
         self,
         *,
-        chunk_size: int = 512,
-        preload_nchunks: int = 32,
+        chunk_size: int | None = None,
+        preload_nchunks: int | None = None,
         sampler: Sampler[list[slice]] | None = None,
-        shuffle: bool = False,
+        shuffle: bool | None = None,
         return_index: bool = False,
-        batch_size: int = 1,
+        batch_size: int | None = None,
         preload_to_gpu: bool = find_spec("cupy") is not None,
-        drop_last: bool = False,
+        drop_last: bool | None = None,
         to_torch: bool = find_spec("torch") is not None,
     ):
-        # Validate mutually exclusive arguments
+        # Validate mutually exclusive arguments when custom sampler provided
+        sampler_args = {
+            "chunk_size": chunk_size,
+            "preload_nchunks": preload_nchunks,
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "drop_last": drop_last,
+        }
         if sampler is not None:
-            sampler_exclusive_args = []
-            if shuffle:
-                sampler_exclusive_args.append("shuffle")
-            if drop_last:
-                sampler_exclusive_args.append("drop_last")
-            if batch_size != 1:
-                sampler_exclusive_args.append("batch_size")
-            if chunk_size != 512:
-                sampler_exclusive_args.append("chunk_size")
-            if preload_nchunks != 32:
-                sampler_exclusive_args.append("preload_nchunks")
-            if sampler_exclusive_args:
+            provided_args = [name for name, val in sampler_args.items() if val is not None]
+            if provided_args:
                 raise ValueError(
-                    f"Cannot specify {', '.join(sampler_exclusive_args)} when providing a custom sampler. "
+                    f"Cannot specify {', '.join(provided_args)} when providing a custom sampler. "
                     "These parameters are controlled by the sampler."
                 )
-        else:
-            check_lt_1(
-                [chunk_size, preload_nchunks],
-                ["Chunk size", "Preload chunks"],
-            )
-            if batch_size > (chunk_size * preload_nchunks):
-                raise NotImplementedError(
-                    "Cannot yield batches bigger than the iterated in-memory size i.e., "
-                    "batch_size > (chunk_size * preload_nchunks)."
-                )
+
+        # Apply defaults when no custom sampler
+        defaults = self.SAMPLER_ARG_DEFAULTS
+        chunk_size = chunk_size if chunk_size is not None else int(defaults["chunk_size"])
+        preload_nchunks = preload_nchunks if preload_nchunks is not None else int(defaults["preload_nchunks"])
+        batch_size = batch_size if batch_size is not None else int(defaults["batch_size"])
+        shuffle = shuffle if shuffle is not None else bool(defaults["shuffle"])
+        drop_last = drop_last if drop_last is not None else bool(defaults["drop_last"])
+
+        # Validate sampler args early when using default sampler
+        # to not wait for the sampler to be initialized to raise an error
+        if sampler is None:
+            check_lt_1([chunk_size, preload_nchunks], ["Chunk size", "Preload chunks"])
 
         if to_torch and not find_spec("torch"):
             raise ImportError("Could not find torch dependency. Try `pip install torch`.")

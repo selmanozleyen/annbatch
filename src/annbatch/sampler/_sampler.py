@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from annbatch.utils import check_lt_1
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -85,8 +87,13 @@ class SliceSampler(Sampler[list[slice]]):
         end_index: int | None = None,
         rng: np.random.Generator | None = None,
     ):
-        if preload_nchunks < 1:
-            raise ValueError("preload_nchunks must be >= 1")
+        check_lt_1([chunk_size, preload_nchunks], ["Chunk size", "Preload chunks"])
+
+        if batch_size > (chunk_size * preload_nchunks):
+            raise ValueError(
+                "batch_size cannot exceed chunk_size * preload_nchunks. "
+                f"Got batch_size={batch_size}, but max is {chunk_size * preload_nchunks}."
+            )
         self._n_obs = n_obs
         self._batch_size = batch_size
         self._chunk_size = chunk_size
