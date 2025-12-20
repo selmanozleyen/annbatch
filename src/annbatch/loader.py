@@ -672,21 +672,3 @@ class Loader[
                 in_memory_data = None
                 concatenated_obs = None
                 in_memory_indices = None
-        #         if i == (len(splits) - 1):  # end of iteration, leftover data needs be kept
-        #             if (s.shape[0] % self._batch_size) != 0:
-        #                 in_memory_data = in_memory_data[s]
-        #                 if concatenated_obs is not None:
-        #                     concatenated_obs = concatenated_obs.iloc[s]
-        #                 if in_memory_indices is not None:
-        #                     in_memory_indices = in_memory_indices[s]
-        #             else:
-        #                 in_memory_data = None
-        #                 concatenated_obs = None
-        #                 in_memory_indices = None
-        # if in_memory_data is not None and not self._drop_last:  # handle any leftover data
-        #     output: LoaderOutput = {
-        #         "data": to_torch(in_memory_data, self._preload_to_gpu) if self._to_torch else in_memory_data,
-        #         "labels": concatenated_obs if self._obs is not None else None,
-        #         "index": in_memory_indices if self._return_index else None,
-        #     }
-        #     yield output
