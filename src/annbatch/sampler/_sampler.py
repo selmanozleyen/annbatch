@@ -57,15 +57,14 @@ class SliceSampler(Sampler[list[slice]]):
         "_batch_size",
         "_chunk_size",
         "_shuffle",
-        "_n_iters",
-        "_worker_handle",
-        "_drop_last",
+        "_preload_nchunks",
         "_start_index",
         "_end_index",
         "_start_chunk_id",
         "_end_chunk_id",
         "_n_chunks_to_load",
         "_n_chunks_total",
+        "_n_chunk_iters",
         "_n_batches",
         "_total_yielded_obs",
         "_n_iters",
@@ -109,6 +108,7 @@ class SliceSampler(Sampler[list[slice]]):
 
         self._n_chunks_to_load = self._end_chunk_id - self._start_chunk_id + 1
         self._n_chunks_total = math.ceil(self._n_obs / self._chunk_size)
+        self._n_chunk_iters = math.ceil(self._n_chunks_to_load / preload_nchunks)
 
         self._n_batches = (
             math.floor((self._end_index - self._start_index) / self._batch_size)
@@ -171,8 +171,6 @@ class SliceSampler(Sampler[list[slice]]):
 
         assert len(chunk_ids) == self._n_chunks_to_load
 
-        n_chunk_iters = math.ceil(self._n_chunks_to_load / self._preload_nchunks)
-
         n_leftover_loaded_indices = 0
         leftover_split = None
 
@@ -194,8 +192,7 @@ class SliceSampler(Sampler[list[slice]]):
                 n_leftover_loaded_indices = 0
                 leftover_split = None
             else:
-                n_chunk_iters = math.ceil(self._n_chunks_to_load / self._preload_nchunks)
-                is_last_iter = i == n_chunk_iters - 1
+                is_last_iter = i == self._n_chunk_iters - 1
 
                 if is_last_iter and not self._drop_last:
                     # Yield the final partial batch
