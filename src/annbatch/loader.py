@@ -757,11 +757,11 @@ class Loader[
             labels = concatenated_obs.iloc[s]
         if self._return_index and in_memory_indices is not None:
             index = in_memory_indices[s]
-        return {
-            "data": (to_torch(in_memory_data[s], self._preload_to_gpu) if self._to_torch else in_memory_data[s]),
-            "labels": labels,
-            "index": index,
-        }
+        if self._to_torch:
+            data = to_torch(in_memory_data[s], self._preload_to_gpu)
+        else:
+            data = in_memory_data[s]
+        return {"data": data, "labels": labels, "index": index}
 
     def _prepare_leftover_data(
         self,
