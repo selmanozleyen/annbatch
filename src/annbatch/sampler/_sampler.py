@@ -162,10 +162,14 @@ class SliceSampler(Sampler[list[slice]]):
         for i in range(self._n_chunk_iters):
             start = i * self._preload_nchunks
             end = min(start + self._preload_nchunks, len(chunk_ids))
-            chunk_ids_to_load = chunk_ids[start:end] + self._start_chunk_id
+            # chunk_ids contain absolute chunk IDs (with _start_chunk_id offset)
+            chunk_ids_to_load = chunk_ids[start:end]
             # for smaller preload_nchunks, below is not expensive but for large preload_nchunks,
             # maybe it would be worth consideration to precompute the slice_sizes and use them here
-            total_obs_to_load = sum(slices[i].stop - slices[i].start for i in chunk_ids_to_load)
+            total_obs_to_load = sum(
+                slices[c - self._start_chunk_id].stop - slices[c - self._start_chunk_id].start
+                for c in chunk_ids_to_load
+            )
             # splits is a list of arrays of indices that will be used to index the data after it is loaded
             loaded_indices = np.arange(total_obs_to_load + n_leftover_loaded_indices)
             if self._shuffle:
