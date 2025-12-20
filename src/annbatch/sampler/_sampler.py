@@ -15,11 +15,11 @@ if TYPE_CHECKING:
 
 
 class Sampler[T_co](ABC):
-    """Base class for all samplers."""
+    """Base sampler class."""
 
     @abstractmethod
     def __iter__(self) -> Iterator[tuple[T_co, list[np.ndarray], np.ndarray | None]]:
-        """Iterate over batch access patterns."""
+        """Yield (slices, batch_indices, leftover_indices) tuples."""
 
     @abstractmethod
     def __len__(self) -> int:
@@ -27,18 +27,30 @@ class Sampler[T_co](ABC):
 
 
 class SliceSampler(Sampler[list[slice]]):
-    """Chunk-aligned sampler for efficient Zarr store access.
+    """Chunk-based slice sampler for batched data access.
 
     Parameters
     ----------
     n_obs
-        Total number of observations.
+        Total number of observations in the dataset.
     batch_size
-        Target total observations per batch.
+        Number of observations per batch.
     chunk_size
-        Size of each chunk slice.
+        Size of each chunk in the backing store.
     shuffle
-        Whether to shuffle chunk order.
+        Whether to shuffle chunk and index order.
+    preload_nchunks
+        Number of chunks to load per iteration.
+    drop_last
+        Whether to drop the last incomplete batch.
+    worker_handle
+        Optional handle for worker-specific shuffling.
+    start_index
+        Starting observation index (inclusive).
+    end_index
+        Ending observation index (exclusive). Defaults to `n_obs`.
+    rng
+        Random number generator for shuffling.
     """
 
     __slots__ = (
@@ -52,10 +64,7 @@ class SliceSampler(Sampler[list[slice]]):
         "_start_chunk_id",
         "_end_chunk_id",
         "_n_chunks_to_load",
-        "_n_chunks_total",
         "_n_chunk_iters",
-        "_n_batches",
-        "_total_yielded_obs",
         "_n_iters",
         "_worker_handle",
         "_drop_last",
@@ -98,18 +107,15 @@ class SliceSampler(Sampler[list[slice]]):
         self._end_chunk_id = (self._end_index - 1) // self._chunk_size
 
         self._n_chunks_to_load = self._end_chunk_id - self._start_chunk_id + 1
-        self._n_chunks_total = math.ceil(self._n_obs / self._chunk_size)
         self._n_chunk_iters = math.ceil(self._n_chunks_to_load / preload_nchunks)
 
-        self._n_batches = (
+        n_batches = (
             math.floor((self._end_index - self._start_index) / self._batch_size)
             if drop_last
             else math.ceil((self._end_index - self._start_index) / self._batch_size)
         )
-        # this is the total number of observations that will be yielded
-        # and won't be ignored when applying the batch indices.
-        self._total_yielded_obs = self._n_batches * self._batch_size
-        self._n_iters = math.ceil(self._total_yielded_obs / (self._chunk_size * preload_nchunks))
+        total_yielded_obs = n_batches * self._batch_size
+        self._n_iters = math.ceil(total_yielded_obs / (self._chunk_size * preload_nchunks))
         self._worker_handle = worker_handle
         self._drop_last = drop_last
 
