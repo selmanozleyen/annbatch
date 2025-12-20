@@ -409,28 +409,52 @@ class Loader[
         """Get the sampler to use for iteration.
 
         If no sampler was provided, creates a default SliceSampler.
-        When using PyTorch DataLoader with multiple workers, each worker
-        gets a shard of the data based on worker_info.
+        Handles both distributed training (multiple ranks) and DataLoader
+        multiprocessing (multiple workers per rank) by hierarchical sharding:
+        - First shard across distributed ranks (if torch.distributed is initialized)
+        - Then shard across DataLoader workers (if num_workers > 0)
 
         Returns
         -------
             The sampler instance to use.
         """
-        # Check for PyTorch DataLoader multiprocessing context
-        worker_info = None
+        # Calculate sharding bounds based on distributed rank and DataLoader workers
+        start_index = 0
+        end_index = self.n_obs
+        needs_fresh_sampler = False
+
         if find_spec("torch"):
+            import torch.distributed
             import torch.utils.data
 
-            worker_info = torch.utils.data.get_worker_info()
+            # First level: distributed training across ranks
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+                per_rank = self.n_obs // world_size
+                start_index = rank * per_rank
+                end_index = self.n_obs if rank == world_size - 1 else start_index + per_rank
+                needs_fresh_sampler = True
 
-        # When in a worker process, always create a fresh sampler with proper sharding
-        # to avoid using a cached sampler from before pickling
-        if worker_info is not None:
-            per_worker = int(self.n_obs / worker_info.num_workers)
-            worker_id = worker_info.id
-            start_index = worker_id * per_worker
-            # Last worker handles any remainder
-            end_index = self.n_obs if worker_id == worker_info.num_workers - 1 else start_index + per_worker
+            # Second level: DataLoader workers within each rank
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                rank_n_obs = end_index - start_index
+                per_worker = rank_n_obs // worker_info.num_workers
+                worker_id = worker_info.id
+                worker_start = start_index + worker_id * per_worker
+                # Last worker handles any remainder within this rank's shard
+                if worker_id == worker_info.num_workers - 1:
+                    worker_end = end_index
+                else:
+                    worker_end = worker_start + per_worker
+                start_index = worker_start
+                end_index = worker_end
+                needs_fresh_sampler = True
+
+        # When sharding is needed, always create a fresh sampler
+        # to avoid using a cached sampler from before pickling/distribution
+        if needs_fresh_sampler:
             return SliceSampler(
                 n_obs=self.n_obs,
                 batch_size=self._batch_size,
@@ -442,7 +466,7 @@ class Loader[
                 end_index=end_index,
             )
 
-        # Not in a worker - use cached sampler or create one with full range
+        # Not in distributed/worker context - use cached sampler or create one with full range
         if self._batch_sampler is None:
             self._batch_sampler = SliceSampler(
                 n_obs=self.n_obs,
@@ -735,7 +759,6 @@ class Loader[
                     else np.concatenate([in_memory_indices, *indices])
                 )
 
-            # TODO: Haven't considered distributed sampling yet
             for s in splits:
                 yield self._prepare_output(in_memory_data, concatenated_obs, in_memory_indices, s)
             if leftover_split is not None:
