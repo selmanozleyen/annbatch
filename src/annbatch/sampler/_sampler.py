@@ -4,23 +4,14 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from itertools import islice
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Iterator
+    from collections.abc import Iterator
 
     from annbatch.utils import WorkerHandle
-
-
-def _batched[T](iterable: Iterable[T], n: int) -> Generator[list[T], None, None]:
-    if n < 1:
-        raise ValueError("n must be >= 1")
-    it = iter(iterable)
-    while batch := list(islice(it, n)):
-        yield batch
 
 
 class Sampler[T_co](ABC):
@@ -70,6 +61,7 @@ class SliceSampler(Sampler[list[slice]]):
         "_n_iters",
         "_worker_handle",
         "_drop_last",
+        "_rng",
     )
 
     def __init__(
@@ -84,6 +76,7 @@ class SliceSampler(Sampler[list[slice]]):
         worker_handle: WorkerHandle | None = None,
         start_index: int = 0,
         end_index: int | None = None,
+        rng: np.random.Generator | None = None,
     ):
         if preload_nchunks < 1:
             raise ValueError("preload_nchunks must be >= 1")
@@ -122,13 +115,15 @@ class SliceSampler(Sampler[list[slice]]):
         self._worker_handle = worker_handle
         self._drop_last = drop_last
 
+        self._rng = np.random.default_rng() if rng is None else rng
+
     def __len__(self) -> int:
         return self._n_iters
 
     def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:
         if self._worker_handle is None:
             # TODO: deal with generators later
-            np.random.default_rng().shuffle(integers)
+            self._rng.shuffle(integers)
         else:
             # should we always have a worker handle? even if its no-op?
             self._worker_handle.shuffle(integers)
@@ -142,14 +137,8 @@ class SliceSampler(Sampler[list[slice]]):
 
     def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray], np.ndarray | None]]:
         chunk_ids = np.arange(self._n_chunks_to_load) + self._start_chunk_id
-        # indices applied to the loaded data
 
-        # # data needs to be preserved from previous batches if below is not 0
-        # n_leftover_each_batch = (self._preload_nchunks * self._chunk_size) % self._batch_size
-        # # last batch data will be ommited if below is not 0 and drop_last is True
-        # n_leftover_total = self._n_obs % self._batch_size
-
-        # is this memory expensive?
+        # precompute slices before shuffling
         slices = self._chunk_ids_to_slices(chunk_ids)
         if self._n_chunks_to_load == 1:
             slices[0] = slice(
@@ -174,21 +163,24 @@ class SliceSampler(Sampler[list[slice]]):
         n_leftover_loaded_indices = 0
         leftover_split = None
 
-        for i, chunk_ids_to_load in enumerate(_batched(chunk_ids, self._preload_nchunks)):
-            # maybe below can be avoided
-            total_obs_to_load = sum(
-                slices[i - self._start_chunk_id].stop - slices[i - self._start_chunk_id].start
-                for i in chunk_ids_to_load
-            )
+        for i in range(self._n_chunk_iters):
+            start = i * self._preload_nchunks
+            end = min(start + self._preload_nchunks, len(chunk_ids))
+            chunk_ids_to_load = chunk_ids[start:end] + self._start_chunk_id
+            # for smaller preload_nchunks, below is not expensive but for large preload_nchunks,
+            # maybe it would be worth consideration to precompute the slice_sizes and use them here
+            total_obs_to_load = sum(slices[i].stop - slices[i].start for i in chunk_ids_to_load)
             # splits is a list of arrays of indices that will be used to index the data after it is loaded
             loaded_indices = np.arange(total_obs_to_load + n_leftover_loaded_indices)
             if self._shuffle:
                 loaded_indices = self._shuffle_integers(loaded_indices)
             splits = np.split(loaded_indices, np.arange(self._batch_size, len(loaded_indices), self._batch_size))
 
+            # if the last batch is full, there is no leftover data
             if splits[-1].shape[0] == self._batch_size:
                 n_leftover_loaded_indices = 0
                 leftover_split = None
+            # handle leftover data
             else:
                 is_last_iter = i == self._n_chunk_iters - 1
 
