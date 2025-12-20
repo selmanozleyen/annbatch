@@ -38,7 +38,6 @@
 
     sampler.Sampler
     sampler.SliceSampler
-    sampler.CategoricalSampler
 ```
 
 (types)=

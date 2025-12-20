@@ -145,5 +145,4 @@ qualname_overrides = {
     "zarr.core.group.Group": "zarr.Group",
     "annbatch.sampler._sampler.SliceSampler": "annbatch.sampler.SliceSampler",
     "annbatch.sampler._sampler.Sampler": "annbatch.sampler.Sampler",
-    "annbatch.sampler._categorical_sampler.CategoricalSampler": ("annbatch.sampler.CategoricalSampler"),
 }
