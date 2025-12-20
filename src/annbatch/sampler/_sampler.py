@@ -171,6 +171,8 @@ class SliceSampler(Sampler[list[slice]]):
 
         assert len(chunk_ids) == self._n_chunks_to_load
 
+        n_chunk_iters = math.ceil(self._n_chunks_to_load / self._preload_nchunks)
+
         n_leftover_loaded_indices = 0
         leftover_split = None
 
@@ -192,13 +194,18 @@ class SliceSampler(Sampler[list[slice]]):
                 n_leftover_loaded_indices = 0
                 leftover_split = None
             else:
-                n_leftover_loaded_indices = splits[-1].shape[0]
-                if self._drop_last and i == self._n_batches - 1:
-                    # if last batch and drop_last don't keep leftover data
+                n_chunk_iters = math.ceil(self._n_chunks_to_load / self._preload_nchunks)
+                is_last_iter = i == n_chunk_iters - 1
+
+                if is_last_iter and not self._drop_last:
+                    # Yield the final partial batch
+                    n_leftover_loaded_indices = 0
                     leftover_split = None
                 else:
-                    leftover_split = splits[-1]
-                splits = splits[:-1]
+                    # Either save for next iteration, or drop on last iter
+                    n_leftover_loaded_indices = splits[-1].shape[0]
+                    leftover_split = None if (self._drop_last and is_last_iter) else splits[-1]
+                    splits = splits[:-1]
 
             yield (
                 [slices[i - self._start_chunk_id] for i in chunk_ids_to_load],
