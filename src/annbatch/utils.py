@@ -4,7 +4,6 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from importlib.util import find_spec
-from itertools import islice
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,7 +13,7 @@ import zarr
 from .compat import CupyArray, CupyCSRMatrix, Tensor
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Generator
 
     from annbatch.types import OutputInMemoryArray_T
 
@@ -31,14 +30,6 @@ class CSRContainer:
     elems: tuple[np.ndarray, np.ndarray, np.ndarray]
     shape: tuple[int, int]
     dtype: np.dtype
-
-
-def _batched[T](iterable: Iterable[T], n: int) -> Generator[list[T], None, None]:
-    if n < 1:
-        raise ValueError("n must be >= 1")
-    it = iter(iterable)
-    while batch := list(islice(it, n)):
-        yield batch
 
 
 # TODO: make this part of the public zarr or zarrs-python API.
