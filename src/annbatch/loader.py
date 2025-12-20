@@ -598,6 +598,34 @@ class Loader[
         )
         return in_memory_data
 
+    def _prepare_output(
+        self,
+        in_memory_data: np.ndarray,
+        concatenated_obs: None | pd.DataFrame,
+        in_memory_indices: None | np.ndarray,
+        s: slice,
+    ) -> LoaderOutput:
+        output: LoaderOutput = {
+            "data": to_torch(in_memory_data[s], self._preload_to_gpu) if self._to_torch else in_memory_data[s],
+            "labels": concatenated_obs.iloc[s] if self._obs is not None else None,
+            "index": in_memory_indices[s] if self._return_index else None,
+        }
+        return output
+
+    def _prepare_leftover_data(
+        self,
+        in_memory_data: np.ndarray,
+        concatenated_obs: None | pd.DataFrame,
+        in_memory_indices: None | np.ndarray,
+        leftover_split: np.ndarray,
+    ) -> tuple[np.ndarray, None | pd.DataFrame, None | np.ndarray]:
+        in_memory_data = in_memory_data[leftover_split]
+        if concatenated_obs is not None:
+            concatenated_obs = concatenated_obs.iloc[leftover_split]
+        if in_memory_indices is not None:
+            in_memory_indices = in_memory_indices[leftover_split]
+        return in_memory_data, concatenated_obs, in_memory_indices
+
     def __iter__(
         self,
     ) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
@@ -624,7 +652,7 @@ class Loader[
             # Fetch the data over slices
             chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(dataset_index_to_slices))
             chunks_converted = self._accumulate_chunks(chunks)
-            # Accumulate labels
+            # Accumulate labels if necessary
             obs: None | list[pd.DataFrame] = None
             if self._obs is not None:
                 obs = self._accumulate_labels(dataset_index_to_slices)
@@ -632,8 +660,6 @@ class Loader[
             indices: None | list[np.ndarray] = None
             if self._return_index:
                 indices = self._accumulate_indices(slices)
-
-            # in_memory_data = mod.vstack(chunks_converted)
 
             # # Do batch returns, handling leftover data as necessary
             in_memory_data = (
@@ -650,24 +676,13 @@ class Loader[
                     else np.concatenate([in_memory_indices, *indices])
                 )
 
-            # Create random indices into in_memory_data and then index into it
-            # If there is "leftover" at the end (see the modulo op),
-            # save it for the next iteration.
-            # batch_indices = np.arange(in_memory_data.shape[0])
-            # TODO: consider a batch_finalize method that returns shuffling indices
+            # TODO: Haven't considered distributed sampling yet
             for s in splits:
-                output: LoaderOutput = {
-                    "data": to_torch(in_memory_data[s], self._preload_to_gpu) if self._to_torch else in_memory_data[s],
-                    "labels": concatenated_obs.iloc[s] if self._obs is not None else None,
-                    "index": in_memory_indices[s] if self._return_index else None,
-                }
-                yield output
+                yield self._prepare_output(in_memory_data, concatenated_obs, in_memory_indices, s)
             if leftover_split is not None:
-                in_memory_data = in_memory_data[leftover_split]
-                if concatenated_obs is not None:
-                    concatenated_obs = concatenated_obs.iloc[leftover_split]
-                if in_memory_indices is not None:
-                    in_memory_indices = in_memory_indices[leftover_split]
+                in_memory_data, concatenated_obs, in_memory_indices = self._prepare_leftover_data(
+                    in_memory_data, concatenated_obs, in_memory_indices, leftover_split
+                )
             else:
                 in_memory_data = None
                 concatenated_obs = None
