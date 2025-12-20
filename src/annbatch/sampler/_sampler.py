@@ -20,12 +20,10 @@ class Sampler[T_co](ABC):
     @abstractmethod
     def __iter__(self) -> Iterator[tuple[T_co, list[np.ndarray], np.ndarray | None]]:
         """Iterate over batch access patterns."""
-        pass
 
     @abstractmethod
     def __len__(self) -> int:
         """Return the total number of iterations to exhaust the sampler."""
-        pass
 
 
 class SliceSampler(Sampler[list[slice]]):
