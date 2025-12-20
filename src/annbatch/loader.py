@@ -126,15 +126,19 @@ class Loader[
     _train_datasets: list[BackingArray]
     _obs: list[pd.DataFrame] | None = None
     _return_index: bool = False
-    _batch_size: int = 1
     _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool = True
-    _drop_last: bool = False
     _to_torch: bool = True
-    _shuffle: bool
+    
+    # args mutually exclusive with sampler start
+    _batch_size: int = 1
+    _drop_last: bool = False
+    _shuffle: bool = False
+    _preload_nchunks: int = 32
+    _chunk_size: int = 512
+    # args mutually exclusive with sampler end
+    
     _batch_sampler: Sampler[list[slice]] | None
-    _preload_nchunks: int
-    _chunk_size: int
     _dataset_elem_cache: dict[int, CSRDatasetElems]
 
     def __init__(
@@ -281,16 +285,21 @@ class Loader[
                     f"Cannot specify {', '.join(provided_args)} when providing a custom sampler. "
                     "These parameters are controlled by the sampler."
                 )
+            
+            return SamplerArgs(
+                batch_size=self._batch_size, # Loader is going to use this later
+                chunk_size=self._chunk_size, # not going to be used
+                preload_nchunks=self._preload_nchunks, # not going to be used
+                shuffle=self._shuffle, # not going to be used
+                drop_last=self._drop_last, # not going to be used
+            )
         # Apply defaults when no custom sampler
-        sampler_args_finalized: dict[str, int | bool] = {
-            a: v if v is not None else self.SAMPLER_ARG_DEFAULTS[a] for a, v in sampler_args.items()
-        }
         return SamplerArgs(
-            chunk_size=int(sampler_args_finalized["chunk_size"]),
-            preload_nchunks=int(sampler_args_finalized["preload_nchunks"]),
-            batch_size=int(sampler_args_finalized["batch_size"]),
-            shuffle=bool(sampler_args_finalized["shuffle"]),
-            drop_last=bool(sampler_args_finalized["drop_last"]),
+            chunk_size=chunk_size if chunk_size is not None else self._chunk_size,
+            preload_nchunks=preload_nchunks if preload_nchunks is not None else self._preload_nchunks,
+            batch_size=batch_size if batch_size is not None else self._batch_size,
+            shuffle=shuffle if shuffle is not None else self._shuffle,
+            drop_last=drop_last if drop_last is not None else self._drop_last,
         )
 
     @property
