@@ -131,7 +131,7 @@ class Loader[
     _preload_to_gpu: bool = True
     _drop_last: bool = False
     _to_torch: bool = True
-    _shuffle: bool = False
+    _shuffle: bool
     _batch_sampler: Sampler[list[slice]] | None
     _preload_nchunks: int
     _chunk_size: int
