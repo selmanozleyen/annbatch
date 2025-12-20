@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import numpy as np
 
@@ -16,7 +16,10 @@ if TYPE_CHECKING:
     from annbatch.utils import WorkerHandle
 
 
-class Sampler[T_co](ABC):
+T_co = TypeVar("T_co", covariant=True)
+
+
+class Sampler(ABC, Generic[T_co]):
     """Base sampler class."""
 
     @abstractmethod

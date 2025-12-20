@@ -11,16 +11,13 @@ This module provides samplers optimized for chunk-based data access patterns:
 
 """
 
-from annbatch.sampler._categorical_sampler import CategoricalSampler
 from annbatch.sampler._sampler import Sampler, SliceSampler
 
 # Update __module__ so Sphinx can find the re-exported classes
 Sampler.__module__ = "annbatch.sampler"
 SliceSampler.__module__ = "annbatch.sampler"
-CategoricalSampler.__module__ = "annbatch.sampler"
 
 __all__ = [
-    "CategoricalSampler",
     "Sampler",
     "SliceSampler",
 ]
