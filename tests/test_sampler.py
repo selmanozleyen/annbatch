@@ -435,3 +435,146 @@ class TestSliceSamplerEdgeCases:
 
         expected = set(range(start_index, end_index))
         assert all_indices == expected
+
+
+class MockWorkerHandle:
+    """Simulates torch worker context for testing without actual DataLoader."""
+
+    def __init__(self, worker_id: int, num_workers: int, seed: int = 42):
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        self._rng = np.random.default_rng(seed)  # Same seed = consistent shuffle across workers
+
+    def shuffle(self, obj):
+        self._rng.shuffle(obj)
+
+    def get_part_for_worker(self, obj: np.ndarray) -> np.ndarray:
+        chunks_split = np.array_split(obj, self.num_workers)
+        return chunks_split[self.worker_id]
+
+
+class TestSliceSamplerWithWorkers:
+    """Tests for SliceSampler with simulated DataLoader workers."""
+
+    def test_two_workers_divisible_config(self):
+        """Test 2 workers with divisible config cover full dataset without overlap."""
+        n_obs = 200
+        chunk_size = 10
+        preload_nchunks = 2
+        batch_size = 10  # 10 * 2 = 20, divisible by 10
+        num_workers = 2
+
+        all_worker_indices = []
+        for worker_id in range(num_workers):
+            worker_handle = MockWorkerHandle(worker_id, num_workers)
+            sampler = SliceSampler(
+                n_obs=n_obs,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                preload_nchunks=preload_nchunks,
+                worker_handle=worker_handle,
+            )
+
+            worker_indices = set()
+            for slices, _, _ in sampler:
+                for s in slices:
+                    worker_indices.update(range(s.start, s.stop))
+            all_worker_indices.append(worker_indices)
+
+        # Workers should have disjoint chunks
+        assert all_worker_indices[0].isdisjoint(all_worker_indices[1])
+        # Together they cover the full dataset
+        assert all_worker_indices[0] | all_worker_indices[1] == set(range(n_obs))
+
+    def test_three_workers_divisible_config(self):
+        """Test 3 workers with divisible config (odd worker count)."""
+        n_obs = 300
+        chunk_size = 10
+        preload_nchunks = 3
+        batch_size = 10  # 10 * 3 = 30, divisible by 10
+        num_workers = 3
+
+        all_worker_indices = []
+        for worker_id in range(num_workers):
+            worker_handle = MockWorkerHandle(worker_id, num_workers)
+            sampler = SliceSampler(
+                n_obs=n_obs,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                preload_nchunks=preload_nchunks,
+                worker_handle=worker_handle,
+            )
+
+            worker_indices = set()
+            for slices, _, _ in sampler:
+                for s in slices:
+                    worker_indices.update(range(s.start, s.stop))
+            all_worker_indices.append(worker_indices)
+
+        # All workers should have disjoint chunks
+        for i in range(num_workers):
+            for j in range(i + 1, num_workers):
+                assert all_worker_indices[i].isdisjoint(all_worker_indices[j])
+        # Together they cover the full dataset
+        combined = set()
+        for indices in all_worker_indices:
+            combined |= indices
+        assert combined == set(range(n_obs))
+
+    def test_workers_drop_last_warns(self):
+        """Test that drop_last=True with workers emits warning."""
+        worker_handle = MockWorkerHandle(0, 2)
+
+        with pytest.warns(UserWarning, match="multiple workers"):
+            SliceSampler(
+                n_obs=100,
+                batch_size=7,  # Non-divisible
+                chunk_size=10,
+                preload_nchunks=2,
+                drop_last=True,
+                worker_handle=worker_handle,
+            )
+
+    def test_workers_non_divisible_without_drop_last_raises(self):
+        """Test that non-divisible config without drop_last raises ValueError."""
+        worker_handle = MockWorkerHandle(0, 2)
+
+        with pytest.raises(ValueError, match="divisible by batch_size"):
+            SliceSampler(
+                n_obs=100,
+                batch_size=7,  # 10 * 2 = 20, not divisible by 7
+                chunk_size=10,
+                preload_nchunks=2,
+                drop_last=False,
+                worker_handle=worker_handle,
+            )
+
+    def test_two_workers_drop_last_drops_per_worker(self):
+        """Test drop_last with workers - each worker drops its own partial batch."""
+        n_obs = 200
+        chunk_size = 10
+        preload_nchunks = 2
+        batch_size = 7  # Non-divisible: 20 / 7 = 2 full batches + 6 leftover per iter
+        num_workers = 2
+
+        all_batch_sizes = []
+        for worker_id in range(num_workers):
+            worker_handle = MockWorkerHandle(worker_id, num_workers)
+            with pytest.warns(UserWarning):
+                sampler = SliceSampler(
+                    n_obs=n_obs,
+                    batch_size=batch_size,
+                    chunk_size=chunk_size,
+                    preload_nchunks=preload_nchunks,
+                    drop_last=True,
+                    worker_handle=worker_handle,
+                )
+
+            worker_batch_sizes = []
+            for _, splits, _ in sampler:
+                for split in splits:
+                    worker_batch_sizes.append(len(split))
+            all_batch_sizes.extend(worker_batch_sizes)
+
+        # All batches should be exactly batch_size (partial dropped)
+        assert all(bs == batch_size for bs in all_batch_sizes)

@@ -521,30 +521,25 @@ class Loader[
         """Get the sampler to use for iteration.
 
         If no sampler was provided, creates a default SliceSampler.
-        Handles both distributed training (multiple ranks) and DataLoader
-        multiprocessing (multiple workers per rank) by hierarchical sharding:
-        - First shard across distributed ranks (if torch.distributed is initialized)
-        - Then shard across DataLoader workers (if num_workers > 0)
+        When running inside a DataLoader with num_workers > 0, creates a fresh
+        sampler with WorkerHandle for chunk sharding across workers.
 
         Returns
         -------
             The sampler instance to use.
         """
-        # Calculate sharding bounds based on distributed rank and DataLoader workers
-        start_index = 0
-        end_index = self.n_obs
-        needs_fresh_sampler = False
+        from annbatch.utils import WorkerHandle
 
+        worker_handle = None
         if find_spec("torch"):
-            import torch.distributed
-            import torch.utils.data
+            from torch.utils.data import get_worker_info
 
-            raise ValueError("TODO: distributed training not supported")
-            # I have an idea how this will look like
+            if get_worker_info() is not None:
+                worker_handle = WorkerHandle()
 
-
-        # Not in distributed/worker context - use cached sampler or create one with full range
-        if self._batch_sampler is None:
+        # When in worker context, always create fresh sampler (workers don't share state)
+        # Otherwise, use cached sampler
+        if worker_handle is not None or self._batch_sampler is None:
             self._batch_sampler = SliceSampler(
                 n_obs=self.n_obs,
                 batch_size=self._batch_size,
@@ -552,6 +547,7 @@ class Loader[
                 chunk_size=self._chunk_size,
                 shuffle=self._shuffle,
                 drop_last=self._drop_last,
+                worker_handle=worker_handle,
             )
         return self._batch_sampler
 

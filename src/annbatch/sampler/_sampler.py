@@ -97,6 +97,28 @@ class SliceSampler(Sampler[list[slice]]):
                 "batch_size cannot exceed chunk_size * preload_nchunks. "
                 f"Got batch_size={batch_size}, but max is {chunk_size * preload_nchunks}."
             )
+
+        # Worker mode validation
+        if worker_handle is not None:
+            preload_size = chunk_size * preload_nchunks
+            if not drop_last and preload_size % batch_size != 0:
+                raise ValueError(
+                    f"When using DataLoader workers with drop_last=False, "
+                    f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
+                    f"Got {preload_size} % {batch_size} = {preload_size % batch_size}. "
+                    f"Set drop_last=True to allow non-divisible configs."
+                )
+            if drop_last:
+                import warnings
+
+                warnings.warn(
+                    f"With drop_last=True and multiple workers, up to "
+                    f"(batch_size - 1) * num_workers observations may be dropped "
+                    f"(one partial batch per worker).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
         self._n_obs = n_obs
         self._batch_size = batch_size
         self._chunk_size = chunk_size
@@ -157,12 +179,17 @@ class SliceSampler(Sampler[list[slice]]):
         if self._shuffle:
             chunk_ids = self._shuffle_integers(chunk_ids)
 
-        assert len(chunk_ids) == self._n_chunks_to_load
+        # Worker sharding: each worker gets a disjoint subset of chunks
+        if self._worker_handle is not None:
+            chunk_ids = self._worker_handle.get_part_for_worker(chunk_ids)
+
+        n_chunks_for_worker = len(chunk_ids)
+        n_chunk_iters = math.ceil(n_chunks_for_worker / self._preload_nchunks) if n_chunks_for_worker > 0 else 0
 
         n_leftover_loaded_indices = 0
         leftover_split = None
 
-        for i in range(self._n_chunk_iters):
+        for i in range(n_chunk_iters):
             start = i * self._preload_nchunks
             end = min(start + self._preload_nchunks, len(chunk_ids))
             # chunk_ids contain absolute chunk IDs (with _start_chunk_id offset)
@@ -185,7 +212,7 @@ class SliceSampler(Sampler[list[slice]]):
                 leftover_split = None
             # handle leftover data
             else:
-                is_last_iter = i == self._n_chunk_iters - 1
+                is_last_iter = i == n_chunk_iters - 1
 
                 if is_last_iter and not self._drop_last:
                     # Yield the final partial batch
