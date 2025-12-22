@@ -19,15 +19,16 @@ class TestSliceSamplerBasic:
         batch_size = 5
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=0,
+            end_index=n_obs,
             batch_size=batch_size,
             chunk_size=chunk_size,
             preload_nchunks=preload_nchunks,
         )
 
         all_indices = set()
-        for slices, _splits, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         assert all_indices == set(range(n_obs))
@@ -40,15 +41,16 @@ class TestSliceSamplerBasic:
         batch_size = 7
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=0,
+            end_index=n_obs,
             batch_size=batch_size,
             chunk_size=chunk_size,
             preload_nchunks=preload_nchunks,
         )
 
         batch_sizes = []
-        for _, splits, _ in sampler:
-            for split in splits:
+        for load_request in sampler:
+            for split in load_request.splits:
                 batch_sizes.append(len(split))
 
         # All but last should be batch_size
@@ -67,16 +69,16 @@ class TestSliceSamplerStartIndex:
         start_index = 30  # Aligned with chunk 3
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=n_obs,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, n_obs))
@@ -91,16 +93,16 @@ class TestSliceSamplerStartIndex:
         start_index = 35  # Not aligned - middle of chunk 3
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=n_obs,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, n_obs))
@@ -114,16 +116,16 @@ class TestSliceSamplerStartIndex:
         start_index = 90
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=n_obs,
             batch_size=3,
             chunk_size=chunk_size,
             preload_nchunks=1,
-            start_index=start_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, n_obs))
@@ -136,21 +138,20 @@ class TestSliceSamplerEndIndex:
 
     def test_end_index_at_chunk_boundary(self):
         """Test end_index aligned with chunk boundary."""
-        n_obs = 100
         chunk_size = 10
         end_index = 50  # Aligned with end of chunk 4
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=0,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(0, end_index))
@@ -159,21 +160,20 @@ class TestSliceSamplerEndIndex:
 
     def test_end_index_not_at_chunk_boundary(self):
         """Test end_index not aligned with chunk boundary."""
-        n_obs = 100
         chunk_size = 10
         end_index = 47  # Middle of chunk 4
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=0,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(0, end_index))
@@ -186,23 +186,21 @@ class TestSliceSamplerBothIndices:
 
     def test_both_at_chunk_boundaries(self):
         """Test both start and end aligned with chunk boundaries."""
-        n_obs = 100
         chunk_size = 10
         start_index = 20
         end_index = 60
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -211,23 +209,21 @@ class TestSliceSamplerBothIndices:
 
     def test_both_not_at_chunk_boundaries(self):
         """Test both start and end not aligned with chunk boundaries."""
-        n_obs = 100
         chunk_size = 10
         start_index = 23
         end_index = 67
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -237,23 +233,21 @@ class TestSliceSamplerBothIndices:
 
     def test_single_chunk_span(self):
         """Test start and end within a single chunk."""
-        n_obs = 100
         chunk_size = 10
         start_index = 22
         end_index = 28  # Same chunk as start
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=2,
             chunk_size=chunk_size,
             preload_nchunks=1,
-            start_index=start_index,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -276,17 +270,16 @@ class TestSliceSamplerBothIndices:
                 end_index = start_index + per_worker
 
             sampler = SliceSampler(
-                n_obs=n_obs,
+                start_index=start_index,
+                end_index=end_index,
                 batch_size=10,
                 chunk_size=chunk_size,
                 preload_nchunks=4,
-                start_index=start_index,
-                end_index=end_index,
             )
 
             worker_indices = set()
-            for slices, _, _ in sampler:
-                for s in slices:
+            for load_request in sampler:
+                for s in load_request.slices:
                     worker_indices.update(range(s.start, s.stop))
 
             # Check this worker got the right range
@@ -310,18 +303,18 @@ class TestSliceSamplerWithShuffle:
         start_index = 30
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=n_obs,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
             shuffle=True,
             rng=np.random.default_rng(42),
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, n_obs))
@@ -329,25 +322,23 @@ class TestSliceSamplerWithShuffle:
 
     def test_shuffle_with_both_indices(self):
         """Test shuffle works correctly with both start and end index."""
-        n_obs = 100
         chunk_size = 10
         start_index = 25
         end_index = 75
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
-            end_index=end_index,
             shuffle=True,
             rng=np.random.default_rng(42),
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -359,23 +350,21 @@ class TestSliceSamplerEdgeCases:
 
     def test_very_small_shard(self):
         """Test with a very small shard (smaller than batch_size)."""
-        n_obs = 100
         chunk_size = 10
         start_index = 95
         end_index = 100  # Only 5 observations
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=10,  # Larger than shard size
             chunk_size=chunk_size,
             preload_nchunks=1,
-            start_index=start_index,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -388,16 +377,16 @@ class TestSliceSamplerEdgeCases:
         start_index = 10  # Exactly one chunk in
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=n_obs,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, n_obs))
@@ -416,21 +405,19 @@ class TestSliceSamplerEdgeCases:
     )
     def test_parametrized_ranges(self, start_index, end_index):
         """Test various start/end combinations cover correct range."""
-        n_obs = 100
         chunk_size = 10
 
         sampler = SliceSampler(
-            n_obs=n_obs,
+            start_index=start_index,
+            end_index=end_index,
             batch_size=5,
             chunk_size=chunk_size,
             preload_nchunks=2,
-            start_index=start_index,
-            end_index=end_index,
         )
 
         all_indices = set()
-        for slices, _, _ in sampler:
-            for s in slices:
+        for load_request in sampler:
+            for s in load_request.slices:
                 all_indices.update(range(s.start, s.stop))
 
         expected = set(range(start_index, end_index))
@@ -468,7 +455,8 @@ class TestSliceSamplerWithWorkers:
         for worker_id in range(num_workers):
             worker_handle = MockWorkerHandle(worker_id, num_workers)
             sampler = SliceSampler(
-                n_obs=n_obs,
+                start_index=0,
+                end_index=n_obs,
                 batch_size=batch_size,
                 chunk_size=chunk_size,
                 preload_nchunks=preload_nchunks,
@@ -476,8 +464,8 @@ class TestSliceSamplerWithWorkers:
             )
 
             worker_indices = set()
-            for slices, _, _ in sampler:
-                for s in slices:
+            for load_request in sampler:
+                for s in load_request.slices:
                     worker_indices.update(range(s.start, s.stop))
             all_worker_indices.append(worker_indices)
 
@@ -498,7 +486,8 @@ class TestSliceSamplerWithWorkers:
         for worker_id in range(num_workers):
             worker_handle = MockWorkerHandle(worker_id, num_workers)
             sampler = SliceSampler(
-                n_obs=n_obs,
+                start_index=0,
+                end_index=n_obs,
                 batch_size=batch_size,
                 chunk_size=chunk_size,
                 preload_nchunks=preload_nchunks,
@@ -506,8 +495,8 @@ class TestSliceSamplerWithWorkers:
             )
 
             worker_indices = set()
-            for slices, _, _ in sampler:
-                for s in slices:
+            for load_request in sampler:
+                for s in load_request.slices:
                     worker_indices.update(range(s.start, s.stop))
             all_worker_indices.append(worker_indices)
 
@@ -527,7 +516,8 @@ class TestSliceSamplerWithWorkers:
 
         with pytest.warns(UserWarning, match="multiple workers"):
             SliceSampler(
-                n_obs=100,
+                start_index=0,
+                end_index=100,
                 batch_size=7,  # Non-divisible
                 chunk_size=10,
                 preload_nchunks=2,
@@ -541,7 +531,8 @@ class TestSliceSamplerWithWorkers:
 
         with pytest.raises(ValueError, match="divisible by batch_size"):
             SliceSampler(
-                n_obs=100,
+                start_index=0,
+                end_index=100,
                 batch_size=7,  # 10 * 2 = 20, not divisible by 7
                 chunk_size=10,
                 preload_nchunks=2,
@@ -562,7 +553,8 @@ class TestSliceSamplerWithWorkers:
             worker_handle = MockWorkerHandle(worker_id, num_workers)
             with pytest.warns(UserWarning):
                 sampler = SliceSampler(
-                    n_obs=n_obs,
+                    start_index=0,
+                    end_index=n_obs,
                     batch_size=batch_size,
                     chunk_size=chunk_size,
                     preload_nchunks=preload_nchunks,
@@ -571,8 +563,8 @@ class TestSliceSamplerWithWorkers:
                 )
 
             worker_batch_sizes = []
-            for _, splits, _ in sampler:
-                for split in splits:
+            for load_request in sampler:
+                for split in load_request.splits:
                     worker_batch_sizes.append(len(split))
             all_batch_sizes.extend(worker_batch_sizes)
 

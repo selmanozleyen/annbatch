@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
@@ -18,13 +19,28 @@ if TYPE_CHECKING:
 
 T_co = TypeVar("T_co", covariant=True)
 
+@dataclass(frozen=True)
+class LoadRequest[T_co]:
+    """Load request from sampler."""
+    # below the explanations are for when T_co = list[slice]
+    # slices to load
+    # a list of at most chunk_size ranged slices
+    slices: T_co
+    # how the concatenation of slices should be split into batches
+    # a list of n_splits with batch_size arrays
+    splits: list[np.ndarray] 
+    # indices that are not used in the last batch < batch_size
+    # or None if there is none ( usually when drop_last is True)
+    leftover_split: np.ndarray | None
+
+    
 
 class Sampler[T_co](ABC):
     """Base sampler class."""
 
     @abstractmethod
-    def __iter__(self) -> Iterator[tuple[T_co, list[np.ndarray], np.ndarray | None]]:
-        """Yield (slices, batch_indices, leftover_indices) tuples."""
+    def __iter__(self) -> Iterator[LoadRequest[T_co]]:
+        """Iterator over load requests."""
 
     @abstractmethod
     def __len__(self) -> int:
@@ -36,12 +52,14 @@ class SliceSampler(Sampler[list[slice]]):
 
     Parameters
     ----------
-    n_obs
-        Total number of observations in the dataset.
     batch_size
         Number of observations per batch.
     chunk_size
-        Size of each chunk in the backing store.
+        Size of each chunk i.e. the range of each slice.
+    start_index
+        Starting observation index (inclusive).
+    end_index
+        Ending observation index (exclusive).
     shuffle
         Whether to shuffle chunk and index order.
     preload_nchunks
@@ -50,43 +68,37 @@ class SliceSampler(Sampler[list[slice]]):
         Whether to drop the last incomplete batch.
     worker_handle
         Optional handle for worker-specific shuffling.
-    start_index
-        Starting observation index (inclusive).
-    end_index
-        Ending observation index (exclusive). Defaults to `n_obs`.
     rng
         Random number generator for shuffling.
     """
 
-    __slots__ = (
-        "_n_obs",
-        "_batch_size",
-        "_chunk_size",
-        "_shuffle",
-        "_preload_nchunks",
-        "_start_index",
-        "_end_index",
-        "_n_chunks",
-        "_n_iters",
-        "_worker_handle",
-        "_drop_last",
-        "_rng",
-    )
+    _batch_size: int
+    _chunk_size: int
+    _shuffle: bool
+    _preload_nchunks: int
+    _start_index: int
+    _end_index: int
+    _n_chunks: int
+    _n_iters: int
+    _worker_handle: WorkerHandle | None
+    _drop_last: bool
+    _rng: np.random.Generator
 
     def __init__(
         self,
         *,
-        n_obs: int,
         batch_size: int,
         chunk_size: int,
+        start_index: int,
+        end_index: int,
         shuffle: bool = False,
         preload_nchunks: int,
         drop_last: bool = False,
         worker_handle: WorkerHandle | None = None,
-        start_index: int = 0,
-        end_index: int | None = None,
         rng: np.random.Generator | None = None,
     ):
+        if start_index < 0 or start_index >= end_index:
+            raise ValueError("start_index must be >= 0 and < end_index")
         check_lt_1([chunk_size, preload_nchunks], ["Chunk size", "Preload chunks"])
 
         if batch_size > (chunk_size * preload_nchunks):
@@ -115,37 +127,25 @@ class SliceSampler(Sampler[list[slice]]):
                     UserWarning,
                     stacklevel=2,
                 )
+        n_batches = (
+            math.floor((end_index - start_index) / batch_size)
+            if drop_last
+            else math.ceil((end_index - start_index) / batch_size)
+        )
+        total_yielded_obs = n_batches * batch_size
 
-        self._n_obs = n_obs
+        self._rng = np.random.default_rng() if rng is None else rng
+        self._n_iters = math.ceil(total_yielded_obs / (chunk_size * preload_nchunks))
+        self._n_chunks = math.ceil((end_index - start_index) / chunk_size)
         self._batch_size = batch_size
         self._chunk_size = chunk_size
         self._shuffle = shuffle
         self._preload_nchunks = preload_nchunks
-
-        if start_index < 0 or start_index >= n_obs:
-            raise ValueError("start_index must be >= 0 and < n_obs")
         self._start_index = start_index
-        if end_index is not None:
-            if end_index < 0 or end_index > n_obs or end_index < start_index:
-                raise ValueError("end_index must be >= 0 and < n_obs and > start_index")
-            self._end_index = end_index
-        else:
-            self._end_index = n_obs
-
-        # Compute number of chunks spanning [start_index, end_index)
-        self._n_chunks = math.ceil((self._end_index - self._start_index) / self._chunk_size)
-
-        n_batches = (
-            math.floor((self._end_index - self._start_index) / self._batch_size)
-            if drop_last
-            else math.ceil((self._end_index - self._start_index) / self._batch_size)
-        )
-        total_yielded_obs = n_batches * self._batch_size
-        self._n_iters = math.ceil(total_yielded_obs / (self._chunk_size * preload_nchunks))
+        self._end_index = end_index
         self._worker_handle = worker_handle
         self._drop_last = drop_last
 
-        self._rng = np.random.default_rng() if rng is None else rng
 
     def __len__(self) -> int:
         return self._n_iters
@@ -156,7 +156,7 @@ class SliceSampler(Sampler[list[slice]]):
         stops = starts[1:] + [self._end_index]
         return [slice(start, stop) for start, stop in zip(starts, stops)]
 
-    def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray], np.ndarray | None]]:
+    def __iter__(self) -> Iterator[LoadRequest[list[slice]]]:
         # Compute slices directly from index range
         slices = self._compute_slices()
         n_slices = len(slices)
@@ -208,10 +208,10 @@ class SliceSampler(Sampler[list[slice]]):
                     leftover_split = None if (self._drop_last and is_last_iter) else splits[-1]
                     splits = splits[:-1]
 
-            yield (
-                [slices[idx] for idx in indices_to_load],
-                splits,
-                leftover_split,
+            yield LoadRequest(
+                slices=[slices[idx] for idx in indices_to_load],
+                splits=splits,
+                leftover_split=leftover_split,
             )
 
     def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:

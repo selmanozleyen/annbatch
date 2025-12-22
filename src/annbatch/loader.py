@@ -210,7 +210,10 @@ class Loader[
         in_memory_indices = None
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
         sampler = self._get_sampler()
-        for slices, splits, leftover_split in sampler:
+        for load_request in sampler:
+            slices = load_request.slices
+            splits = load_request.splits
+            leftover_split = load_request.leftover_split
             # Sampler yields a list of slices that sum to batch_size
             dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=False)
             # Fetch the data over slices
@@ -541,7 +544,8 @@ class Loader[
         # Otherwise, use cached sampler
         if worker_handle is not None or self._batch_sampler is None:
             self._batch_sampler = SliceSampler(
-                n_obs=self.n_obs,
+                start_index=0,
+                end_index=self.n_obs,
                 batch_size=self._batch_size,
                 preload_nchunks=self._preload_nchunks,
                 chunk_size=self._chunk_size,
