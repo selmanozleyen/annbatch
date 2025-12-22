@@ -460,8 +460,8 @@ class TestSliceSamplerWithWorkers:
                 batch_size=batch_size,
                 chunk_size=chunk_size,
                 preload_nchunks=preload_nchunks,
-                worker_handle=worker_handle,
             )
+            sampler.set_worker_handle(worker_handle)
 
             worker_indices = set()
             for load_request in sampler:
@@ -491,8 +491,8 @@ class TestSliceSamplerWithWorkers:
                 batch_size=batch_size,
                 chunk_size=chunk_size,
                 preload_nchunks=preload_nchunks,
-                worker_handle=worker_handle,
             )
+            sampler.set_worker_handle(worker_handle)
 
             worker_indices = set()
             for load_request in sampler:
@@ -515,30 +515,30 @@ class TestSliceSamplerWithWorkers:
         worker_handle = MockWorkerHandle(0, 2)
 
         with pytest.warns(UserWarning, match="multiple workers"):
-            SliceSampler(
+            sampler = SliceSampler(
                 start_index=0,
                 end_index=100,
                 batch_size=7,  # Non-divisible
                 chunk_size=10,
                 preload_nchunks=2,
                 drop_last=True,
-                worker_handle=worker_handle,
             )
+            sampler.set_worker_handle(worker_handle)
 
     def test_workers_non_divisible_without_drop_last_raises(self):
         """Test that non-divisible config without drop_last raises ValueError."""
         worker_handle = MockWorkerHandle(0, 2)
 
         with pytest.raises(ValueError, match="divisible by batch_size"):
-            SliceSampler(
+            sampler = SliceSampler(
                 start_index=0,
                 end_index=100,
                 batch_size=7,  # 10 * 2 = 20, not divisible by 7
                 chunk_size=10,
                 preload_nchunks=2,
                 drop_last=False,
-                worker_handle=worker_handle,
             )
+            sampler.set_worker_handle(worker_handle)
 
     def test_two_workers_drop_last_drops_per_worker(self):
         """Test drop_last with workers - each worker drops its own partial batch."""
@@ -559,8 +559,8 @@ class TestSliceSamplerWithWorkers:
                     chunk_size=chunk_size,
                     preload_nchunks=preload_nchunks,
                     drop_last=True,
-                    worker_handle=worker_handle,
                 )
+                sampler.set_worker_handle(worker_handle)
 
             worker_batch_sizes = []
             for load_request in sampler:

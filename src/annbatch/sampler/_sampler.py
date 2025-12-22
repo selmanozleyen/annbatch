@@ -46,6 +46,17 @@ class Sampler[T_co](ABC):
     def __len__(self) -> int:
         """Return the total number of iterations to exhaust the sampler."""
 
+    def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
+        """Set the worker handle if desired. If the sampler doesn't support workers, this is a no-op."""
+        # this is a separate method because we'd want the LoaderBuilder itself
+        # passing this to the sampler, this way Loader doesn't need to know about
+        # the sampler's worker handle and knows every Sampler supports this
+        # but we don't want to force every sampler to implement this
+        return None
+    
+    def supports_workers(self) -> bool:
+        """Return whether the sampler supports workers."""
+        return False
 
 class SliceSampler(Sampler[list[slice]]):
     """Chunk-based slice sampler for batched data access.
@@ -66,8 +77,6 @@ class SliceSampler(Sampler[list[slice]]):
         Number of chunks to load per iteration.
     drop_last
         Whether to drop the last incomplete batch.
-    worker_handle
-        Optional handle for worker-specific shuffling.
     rng
         Random number generator for shuffling.
     """
@@ -80,7 +89,6 @@ class SliceSampler(Sampler[list[slice]]):
     _end_index: int
     _n_chunks: int
     _n_iters: int
-    _worker_handle: WorkerHandle | None
     _drop_last: bool
     _rng: np.random.Generator
 
@@ -94,39 +102,22 @@ class SliceSampler(Sampler[list[slice]]):
         shuffle: bool = False,
         preload_nchunks: int,
         drop_last: bool = False,
-        worker_handle: WorkerHandle | None = None,
         rng: np.random.Generator | None = None,
     ):
         if start_index < 0 or start_index >= end_index:
             raise ValueError("start_index must be >= 0 and < end_index")
         check_lt_1([chunk_size, preload_nchunks], ["Chunk size", "Preload chunks"])
+        preload_size = chunk_size * preload_nchunks
 
-        if batch_size > (chunk_size * preload_nchunks):
+        # TODO: asses this: Should we make this check mandatory in the base Sampler class?
+        # Because this is actually a requirement for any sampler to run in a Loader class
+        if batch_size > preload_size:
             raise ValueError(
                 "batch_size cannot exceed chunk_size * preload_nchunks. "
-                f"Got batch_size={batch_size}, but max is {chunk_size * preload_nchunks}."
+                f"Got batch_size={batch_size}, but max is {preload_size}."
             )
 
-        # Worker mode validation
-        if worker_handle is not None:
-            preload_size = chunk_size * preload_nchunks
-            if not drop_last and preload_size % batch_size != 0:
-                raise ValueError(
-                    f"When using DataLoader workers with drop_last=False, "
-                    f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
-                    f"Got {preload_size} % {batch_size} = {preload_size % batch_size}. "
-                    f"Set drop_last=True to allow non-divisible configs."
-                )
-            if drop_last:
-                import warnings
-
-                warnings.warn(
-                    f"With drop_last=True and multiple workers, up to "
-                    f"(batch_size - 1) * num_workers observations may be dropped "
-                    f"(one partial batch per worker).",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        
         n_batches = (
             math.floor((end_index - start_index) / batch_size)
             if drop_last
@@ -143,18 +134,11 @@ class SliceSampler(Sampler[list[slice]]):
         self._preload_nchunks = preload_nchunks
         self._start_index = start_index
         self._end_index = end_index
-        self._worker_handle = worker_handle
         self._drop_last = drop_last
-
+        self._worker_handle = None
 
     def __len__(self) -> int:
         return self._n_iters
-
-    def _compute_slices(self) -> list[slice]:
-        """Compute slices directly from start/end indices."""
-        starts = list(range(self._start_index, self._end_index, self._chunk_size))
-        stops = starts[1:] + [self._end_index]
-        return [slice(start, stop) for start, stop in zip(starts, stops)]
 
     def __iter__(self) -> Iterator[LoadRequest[list[slice]]]:
         # Compute slices directly from index range
@@ -214,6 +198,31 @@ class SliceSampler(Sampler[list[slice]]):
                 leftover_split=leftover_split,
             )
 
+    def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
+        # Worker mode validation
+        if not self._drop_last and self._preload_nchunks * self._chunk_size % self._batch_size != 0:
+            raise ValueError(
+                f"When using DataLoader workers with drop_last=False, "
+                f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
+                f"Got {self._preload_nchunks * self._chunk_size} % {self._batch_size} = {self._preload_nchunks * self._chunk_size % self._batch_size}. "
+                f"Set drop_last=True to allow non-divisible configs."
+            )
+        if self._drop_last:
+            import warnings
+
+            warnings.warn(
+                f"With drop_last=True and multiple workers, up to "
+                f"(batch_size - 1) * num_workers observations may be dropped "
+                f"(one partial batch per worker).",
+                UserWarning,
+                stacklevel=2,
+            )
+        # TODO: asses this: should we raise an error if worker handle is already set?
+        self._worker_handle = worker_handle
+
+    def supports_workers(self) -> bool:
+        return True
+
     def _shuffle_integers(self, integers: np.ndarray) -> np.ndarray:
         if self._worker_handle is None:
             # TODO: deal with generators later
@@ -222,3 +231,9 @@ class SliceSampler(Sampler[list[slice]]):
             # should we always have a worker handle? even if its no-op?
             self._worker_handle.shuffle(integers)
         return integers
+
+    def _compute_slices(self) -> list[slice]:
+        """Compute slices directly from start/end indices."""
+        starts = list(range(self._start_index, self._end_index, self._chunk_size))
+        stops = starts[1:] + [self._end_index]
+        return [slice(start, stop) for start, stop in zip(starts, stops)]
