@@ -19,21 +19,22 @@ if TYPE_CHECKING:
 
 T_co = TypeVar("T_co", covariant=True)
 
+
 @dataclass(frozen=True)
 class LoadRequest[T_co]:
     """Load request from sampler."""
+
     # below the explanations are for when T_co = list[slice]
     # slices to load
     # a list of at most chunk_size ranged slices
     slices: T_co
     # how the concatenation of slices should be split into batches
     # a list of n_splits with batch_size arrays
-    splits: list[np.ndarray] 
+    splits: list[np.ndarray]
     # indices that are not used in the last batch < batch_size
     # or None if there is none ( usually when drop_last is True)
     leftover_split: np.ndarray | None
 
-    
 
 class Sampler[T_co](ABC):
     """Base sampler class."""
@@ -53,10 +54,11 @@ class Sampler[T_co](ABC):
         # the sampler's worker handle and knows every Sampler supports this
         # but we don't want to force every sampler to implement this
         return None
-    
+
     def supports_workers(self) -> bool:
         """Return whether the sampler supports workers."""
         return False
+
 
 class SliceSampler(Sampler[list[slice]]):
     """Chunk-based slice sampler for batched data access.
@@ -117,7 +119,6 @@ class SliceSampler(Sampler[list[slice]]):
                 f"Got batch_size={batch_size}, but max is {preload_size}."
             )
 
-        
         n_batches = (
             math.floor((end_index - start_index) / batch_size)
             if drop_last
@@ -211,9 +212,9 @@ class SliceSampler(Sampler[list[slice]]):
             import warnings
 
             warnings.warn(
-                f"With drop_last=True and multiple workers, up to "
-                f"(batch_size - 1) * num_workers observations may be dropped "
-                f"(one partial batch per worker).",
+                "With drop_last=True and multiple workers, up to "
+                "(batch_size - 1) * num_workers observations may be dropped "
+                "(one partial batch per worker).",
                 UserWarning,
                 stacklevel=2,
             )
@@ -236,4 +237,4 @@ class SliceSampler(Sampler[list[slice]]):
         """Compute slices directly from start/end indices."""
         starts = list(range(self._start_index, self._end_index, self._chunk_size))
         stops = starts[1:] + [self._end_index]
-        return [slice(start, stop) for start, stop in zip(starts, stops)]
+        return [slice(start, stop) for start, stop in zip(starts, stops, strict=False)]

@@ -47,6 +47,8 @@ class CommonSamplerArgs(NamedTuple):
     batch_size: int
     shuffle: bool
     drop_last: bool
+
+
 class LoaderBuilder[
     BackingArray: BackingArray_T,
     InputInMemoryArray: InputInMemoryArray_T,
@@ -118,7 +120,6 @@ class LoaderBuilder[
             # batch = batch.to_dense()
             do_fit(batch)
     """
-
 
     _train_datasets: list[BackingArray]
     _obs: list[pd.DataFrame] | None = None
@@ -222,6 +223,7 @@ class LoaderBuilder[
             shuffle=shuffle if shuffle is not None else self._shuffle,
             drop_last=drop_last if drop_last is not None else self._drop_last,
         )
+
     @property
     def n_obs(self) -> int:
         """The total number of observations in this instance i.e., the sum of the first axis of all added datasets.
