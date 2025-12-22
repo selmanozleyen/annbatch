@@ -66,10 +66,7 @@ class SliceSampler(Sampler[list[slice]]):
         "_preload_nchunks",
         "_start_index",
         "_end_index",
-        "_start_chunk_id",
-        "_end_chunk_id",
-        "_n_chunks_to_load",
-        "_n_chunk_iters",
+        "_n_chunks",
         "_n_iters",
         "_worker_handle",
         "_drop_last",
@@ -135,11 +132,8 @@ class SliceSampler(Sampler[list[slice]]):
         else:
             self._end_index = n_obs
 
-        self._start_chunk_id = self._start_index // self._chunk_size
-        self._end_chunk_id = (self._end_index - 1) // self._chunk_size
-
-        self._n_chunks_to_load = self._end_chunk_id - self._start_chunk_id + 1
-        self._n_chunk_iters = math.ceil(self._n_chunks_to_load / preload_nchunks)
+        # Compute number of chunks spanning [start_index, end_index)
+        self._n_chunks = math.ceil((self._end_index - self._start_index) / self._chunk_size)
 
         n_batches = (
             math.floor((self._end_index - self._start_index) / self._batch_size)
@@ -156,51 +150,41 @@ class SliceSampler(Sampler[list[slice]]):
     def __len__(self) -> int:
         return self._n_iters
 
+    def _compute_slices(self) -> list[slice]:
+        """Compute slices directly from start/end indices."""
+        starts = list(range(self._start_index, self._end_index, self._chunk_size))
+        stops = starts[1:] + [self._end_index]
+        return [slice(start, stop) for start, stop in zip(starts, stops)]
+
     def __iter__(self) -> Iterator[tuple[list[slice], list[np.ndarray], np.ndarray | None]]:
-        chunk_ids = np.arange(self._n_chunks_to_load) + self._start_chunk_id
+        # Compute slices directly from index range
+        slices = self._compute_slices()
+        n_slices = len(slices)
 
-        # precompute slices before shuffling
-        slices = self._chunk_ids_to_slices(chunk_ids)
-        if self._n_chunks_to_load == 1:
-            slices[0] = slice(
-                self._start_index,
-                self._end_index,
-            )
-        else:
-            slices[0] = slice(
-                self._start_index,
-                min((self._start_chunk_id + 1) * self._chunk_size, self._end_index),
-            )
-            slices[-1] = slice(
-                self._end_chunk_id * self._chunk_size,
-                self._end_index,
-            )
-
+        # Create slice indices for shuffling
+        slice_indices = np.arange(n_slices)
         if self._shuffle:
-            chunk_ids = self._shuffle_integers(chunk_ids)
+            slice_indices = self._shuffle_integers(slice_indices)
 
-        # Worker sharding: each worker gets a disjoint subset of chunks
+        # Worker sharding: each worker gets a disjoint subset of slices
         if self._worker_handle is not None:
-            chunk_ids = self._worker_handle.get_part_for_worker(chunk_ids)
+            slice_indices = self._worker_handle.get_part_for_worker(slice_indices)
 
-        n_chunks_for_worker = len(chunk_ids)
-        n_chunk_iters = math.ceil(n_chunks_for_worker / self._preload_nchunks) if n_chunks_for_worker > 0 else 0
+        n_slices_for_worker = len(slice_indices)
+        n_slice_iters = math.ceil(n_slices_for_worker / self._preload_nchunks) if n_slices_for_worker > 0 else 0
 
         n_leftover_loaded_indices = 0
         leftover_split = None
 
-        for i in range(n_chunk_iters):
+        for i in range(n_slice_iters):
             start = i * self._preload_nchunks
-            end = min(start + self._preload_nchunks, len(chunk_ids))
-            # chunk_ids contain absolute chunk IDs (with _start_chunk_id offset)
-            chunk_ids_to_load = chunk_ids[start:end]
-            # for smaller preload_nchunks, below is not expensive but for large preload_nchunks,
-            # maybe it would be worth consideration to precompute the slice_sizes and use them here
-            total_obs_to_load = sum(
-                slices[c - self._start_chunk_id].stop - slices[c - self._start_chunk_id].start
-                for c in chunk_ids_to_load
-            )
-            # splits is a list of arrays of indices that will be used to index the data after it is loaded
+            end = min(start + self._preload_nchunks, n_slices_for_worker)
+            indices_to_load = slice_indices[start:end]
+
+            # Compute total observations to load from selected slices
+            total_obs_to_load = sum(slices[idx].stop - slices[idx].start for idx in indices_to_load)
+
+            # Generate loaded indices with leftover from previous iteration
             loaded_indices = np.arange(total_obs_to_load + n_leftover_loaded_indices)
             if self._shuffle:
                 loaded_indices = self._shuffle_integers(loaded_indices)
@@ -212,7 +196,7 @@ class SliceSampler(Sampler[list[slice]]):
                 leftover_split = None
             # handle leftover data
             else:
-                is_last_iter = i == n_chunk_iters - 1
+                is_last_iter = i == n_slice_iters - 1
 
                 if is_last_iter and not self._drop_last:
                     # Yield the final partial batch
@@ -225,7 +209,7 @@ class SliceSampler(Sampler[list[slice]]):
                     splits = splits[:-1]
 
             yield (
-                [slices[i - self._start_chunk_id] for i in chunk_ids_to_load],
+                [slices[idx] for idx in indices_to_load],
                 splits,
                 leftover_split,
             )
@@ -238,9 +222,3 @@ class SliceSampler(Sampler[list[slice]]):
             # should we always have a worker handle? even if its no-op?
             self._worker_handle.shuffle(integers)
         return integers
-
-    def _chunk_ids_to_slices(self, chunk_ids: np.ndarray) -> list[slice]:
-        return [
-            slice(chunk_id * self._chunk_size, min((chunk_id + 1) * self._chunk_size, self._n_obs))
-            for chunk_id in chunk_ids
-        ]
