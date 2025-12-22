@@ -462,6 +462,7 @@ class Loader[
 
     @property
     def dataset_type(self) -> type[BackingArray]:
+        """The type of on-disk data used in this loader."""
         return self._dataset_type
 
     @property
