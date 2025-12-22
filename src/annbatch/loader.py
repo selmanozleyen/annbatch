@@ -49,11 +49,45 @@ class CommonSamplerArgs(NamedTuple):
     drop_last: bool
 
 
+class _DatasetInfoMixin[BackingArray: BackingArray_T]:
+    """Mixin for classes that contain datasets."""
+
+    _shapes: list[tuple[int, int]]
+    _train_datasets: list[BackingArray]
+
+    @property
+    def n_obs(self) -> int:
+        """The total number of observations in this instance i.e., the sum of the first axis of all added datasets.
+
+        Returns
+        -------
+            The number of observations.
+        """
+        return sum(shape[0] for shape in self._shapes)
+
+    @property
+    def n_var(self) -> int:
+        """The total number of variables in this instance i.e., the second axis (which is the same) across all datasets.
+
+        Returns
+        -------
+            The number of variables.
+        """
+        if not self._shapes:
+            raise ValueError("No datasets added yet")
+        return self._shapes[0][1]
+
+    @property
+    def dataset_type(self) -> type[BackingArray]:
+        """The type of the dataset."""
+        return type(self._train_datasets[0])
+
+
 class LoaderBuilder[
     BackingArray: BackingArray_T,
     InputInMemoryArray: InputInMemoryArray_T,
     OutputInMemoryArray: OutputInMemoryArray_T,
-]:
+](_DatasetInfoMixin[BackingArray]):
     """A builder for creating Loader instances for on-disk anndata stores.
 
     This builder handles configuration and adding datasets. Call `.build()` to create
@@ -277,7 +311,7 @@ class LoaderBuilder[
         self.add_dataset(cast("BackingArray", dataset), obs)
         return self
 
-    def add_datasets(self, datasets: list[BackingArray], obs: list[pd.DataFrame | None] | None = None) -> Self:
+    def add_datasets(self, datasets: list[BackingArray], obs: list[pd.DataFrame] | None = None) -> Self:
         """Append datasets to this dataset.
 
         Parameters
@@ -288,7 +322,7 @@ class LoaderBuilder[
             obs
                 List of :class:`~pandas.DataFrame` labels, generally from :attr:`anndata.AnnData.obs`.
         """
-        obs_list: list[pd.DataFrame | None] = [None] * len(datasets) if obs is None else obs
+        obs_list: list[pd.DataFrame] | list[None] = [None] * len(datasets) if obs is None else obs
         for ds, o in zip(datasets, obs_list, strict=True):
             self.add_dataset(ds, o)
         return self
@@ -312,9 +346,9 @@ class LoaderBuilder[
                 raise ValueError(
                     "Cannot add a dataset with no obs label when training datasets have already been added without labels"
                 )
-            if not isinstance(dataset, type(self._train_datasets[0])):
+            if not isinstance(dataset, self.dataset_type):
                 raise ValueError(
-                    f"All datasets on a given loader must be of the same type {type(self._train_datasets[0])} but got {type(dataset)}"
+                    f"All datasets on a given loader must be of the same type {self.dataset_type} but got {type(dataset)}"
                 )
         if not isinstance(dataset, BackingArray_T.__value__):
             raise TypeError(f"Cannot add dataset of type {type(dataset)}")
@@ -355,9 +389,10 @@ class LoaderBuilder[
             raise ValueError("Cannot build Loader: no datasets have been added")
 
         # Create the sampler now that n_obs is known
-        batch_sampler: Sampler[int] | None = self._batch_sampler
-        if self._batch_sampler is None:
-            batch_sampler = SliceSampler(
+        batch_sampler: Sampler[list[slice]] = (
+            self._batch_sampler
+            if self._batch_sampler is not None
+            else SliceSampler(
                 start_index=0,
                 end_index=self.n_obs,
                 batch_size=self._batch_size,
@@ -366,8 +401,8 @@ class LoaderBuilder[
                 shuffle=self._shuffle,
                 drop_last=self._drop_last,
             )
+        )
 
-        worker_handle: WorkerHandle | None = None
         if find_spec("torch"):
             from torch.utils.data import get_worker_info
 
@@ -391,7 +426,7 @@ class Loader[
     BackingArray: BackingArray_T,
     InputInMemoryArray: InputInMemoryArray_T,
     OutputInMemoryArray: OutputInMemoryArray_T,
-](IterableDataset):
+](_DatasetInfoMixin[BackingArray], IterableDataset):
     """An immutable loader for on-disk anndata stores.
 
     This class is created by :meth:`LoaderBuilder.build()` and handles iteration.
@@ -419,17 +454,12 @@ class Loader[
     _train_datasets: list[BackingArray]
     _obs: list[pd.DataFrame] | None
     _return_index: bool
-    _shapes: tuple[tuple[int, int], ...]
+    _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool
     _to_torch: bool
     _batch_size: int
     _batch_sampler: Sampler[list[slice]]
     _dataset_elem_cache: dict[int, CSRDatasetElems]
-
-    # Immutable computed values
-    n_obs: int
-    n_var: int
-    dataset_type: type[BackingArray]
 
     def __init__(
         self,
@@ -444,7 +474,7 @@ class Loader[
     ):
         """Initialize the Loader. Use LoaderBuilder.build() instead of calling directly."""
         self._train_datasets = train_datasets
-        self._shapes = tuple(shapes)  # Make immutable
+        self._shapes = shapes
         self._obs = obs
         self._batch_sampler = batch_sampler
         self._return_index = return_index
@@ -452,18 +482,8 @@ class Loader[
         self._to_torch = to_torch
         self._dataset_elem_cache = {}
 
-        # Compute once at init
-        self.n_obs = sum(shape[0] for shape in self._shapes)
-        self.n_var = self._shapes[0][1]
-        self._dataset_type = type(self._train_datasets[0])
-
     def __len__(self) -> int:
-        return self.n_obs
-
-    @property
-    def dataset_type(self) -> type[BackingArray]:
-        """The type of on-disk data used in this loader."""
-        return self._dataset_type
+        return self._n_obs
 
     @property
     def _sp_module(self) -> ModuleType:
