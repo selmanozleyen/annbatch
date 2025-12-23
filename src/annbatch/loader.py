@@ -383,8 +383,6 @@ class LoaderBuilder[
         ValueError
             If no datasets have been added.
         """
-        from annbatch.utils import WorkerHandle
-
         if not self._train_datasets:
             raise ValueError("Cannot build Loader: no datasets have been added")
 
@@ -402,14 +400,6 @@ class LoaderBuilder[
                 drop_last=self._drop_last,
             )
         )
-
-        if find_spec("torch"):
-            from torch.utils.data import get_worker_info
-
-            if get_worker_info() is not None:
-                worker_handle = WorkerHandle()
-
-                batch_sampler.set_worker_handle(worker_handle)
 
         return Loader(
             train_datasets=self._train_datasets,
@@ -526,6 +516,16 @@ class Loader[
         in_memory_data = None
         concatenated_obs = None
         in_memory_indices = None
+        # Detect if we're in a PyTorch worker context and configure the sampler
+        # this has to happen here because the workers are spawned here
+        if find_spec("torch"):
+            from torch.utils.data import get_worker_info
+            from annbatch.utils import WorkerHandle
+
+            if get_worker_info() is not None:
+                worker_handle = WorkerHandle()
+                self._batch_sampler.set_worker_handle(worker_handle)
+
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
         for load_request in self._batch_sampler:
             slices = load_request.slices
