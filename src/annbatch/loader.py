@@ -516,6 +516,7 @@ class Loader[
         in_memory_data = None
         concatenated_obs = None
         in_memory_indices = None
+        batch_size = self._batch_sampler.batch_size
         # Detect if we're in a PyTorch worker context and configure the sampler
         # this has to happen here because the workers are spawned here
         if find_spec("torch"):
@@ -530,7 +531,6 @@ class Loader[
         for load_request in self._batch_sampler:
             slices = load_request.slices
             splits = load_request.splits
-            leftover_split = load_request.leftover_split
             # Sampler yields a list of slices that sum to batch_size
             dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=False)
             # Fetch the data over slices
@@ -560,24 +560,46 @@ class Loader[
                     else np.concatenate([in_memory_indices, *indices])
                 )
 
-            for split in splits:
+            # yield all full batches (all but possibly the last)
+            for split in splits[:-1]:
                 yield self._prepare_output(
                     in_memory_data=in_memory_data,
                     concatenated_obs=concatenated_obs,
                     in_memory_indices=in_memory_indices,
                     split=split,
                 )
-            if leftover_split is not None:
+
+            # handle the last split
+            last_split = splits[-1]
+            if len(last_split) == batch_size:
+                # full batch, yield and reset
+                yield self._prepare_output(
+                    in_memory_data=in_memory_data,
+                    concatenated_obs=concatenated_obs,
+                    in_memory_indices=in_memory_indices,
+                    split=last_split,
+                )
+                in_memory_data = None
+                concatenated_obs = None
+                in_memory_indices = None
+            else:
+                # partial batch, carry over for next iteration
                 in_memory_data, concatenated_obs, in_memory_indices = self._prepare_leftover_data(
                     in_memory_data=in_memory_data,
                     concatenated_obs=concatenated_obs,
                     in_memory_indices=in_memory_indices,
-                    leftover_split=leftover_split,
+                    leftover_split=last_split,
                 )
-            else:
-                in_memory_data = None
-                concatenated_obs = None
-                in_memory_indices = None
+
+        # after sampler is exhausted, yield any remaining leftover 
+        # only true when drop_last=False
+        if in_memory_data is not None:
+            yield self._prepare_output(
+                in_memory_data=in_memory_data,
+                concatenated_obs=concatenated_obs,
+                in_memory_indices=in_memory_indices,
+                split=np.arange(in_memory_data.shape[0]),
+            )
 
     def _get_relative_obs_indices(self, index: slice, *, use_original_space: bool = False) -> list[tuple[slice, int]]:
         """Generate a slice relative to a dataset given a global slice index over all datasets.

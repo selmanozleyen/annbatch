@@ -34,11 +34,35 @@ class TestSliceSamplerBasic:
         assert all_indices == set(range(n_obs))
 
     def test_batch_sizes(self):
-        """Test that batches have correct size (except possibly last)."""
+        """Test that batch sizes match expected carry-over pattern."""
         n_obs = 100
         chunk_size = 10
         preload_nchunks = 2
         batch_size = 7
+        
+        # Example with these params (chunk_size=10, preload_nchunks=2, batch_size=7):
+        # Each iter loads chunk_size * preload_nchunks = 20 obs
+        # Iter 1: 20 obs → [7, 7, 6], leftover=6
+        # Iter 2: 20 + 6 = 26 → [7, 7, 7, 5], leftover=5
+        # Iter 3: 20 + 5 = 25 → [7, 7, 7, 4], leftover=4
+        # Iter 4: 20 + 4 = 24 → [7, 7, 7, 3], leftover=3
+        # Iter 5: 20 + 3 = 23 → [7, 7, 7, 2], final partial yielded
+        import math
+
+        obs_per_iter = chunk_size * preload_nchunks
+        n_iters = math.ceil(n_obs / obs_per_iter)
+
+        expected_sizes_per_iter = []
+        leftover = 0
+        for i in range(n_iters):
+            total_obs = obs_per_iter + leftover
+            n_full_batches = total_obs // batch_size
+            remainder = total_obs % batch_size
+            sizes = [batch_size] * n_full_batches
+            if remainder > 0:
+                sizes.append(remainder)
+            expected_sizes_per_iter.append(sizes)
+            leftover = remainder
 
         sampler = SliceSampler(
             start_index=0,
@@ -48,15 +72,11 @@ class TestSliceSamplerBasic:
             preload_nchunks=preload_nchunks,
         )
 
-        batch_sizes = []
-        for load_request in sampler:
-            for split in load_request.splits:
-                batch_sizes.append(len(split))
-
-        # All but last should be batch_size
-        assert all(bs == batch_size for bs in batch_sizes[:-1])
-        # Last batch should be <= batch_size
-        assert batch_sizes[-1] <= batch_size
+        for i, load_request in enumerate(sampler):
+            actual_sizes = [len(split) for split in load_request.splits]
+            assert actual_sizes == expected_sizes_per_iter[i], (
+                f"Iter {i}: expected {expected_sizes_per_iter[i]}, got {actual_sizes}"
+            )
 
 
 class TestSliceSamplerStartIndex:
@@ -541,14 +561,13 @@ class TestSliceSamplerWithWorkers:
             sampler.set_worker_handle(worker_handle)
 
     def test_two_workers_drop_last_drops_per_worker(self):
-        """Test drop_last with workers - each worker drops its own partial batch."""
+        """Test drop_last=True drops only the final partial batch (intermediate partials are for carry-over)."""
         n_obs = 200
         chunk_size = 10
         preload_nchunks = 2
         batch_size = 7  # Non-divisible: 20 / 7 = 2 full batches + 6 leftover per iter
         num_workers = 2
 
-        all_batch_sizes = []
         for worker_id in range(num_workers):
             worker_handle = MockWorkerHandle(worker_id, num_workers)
             with pytest.warns(UserWarning):
@@ -562,11 +581,13 @@ class TestSliceSamplerWithWorkers:
                 )
                 sampler.set_worker_handle(worker_handle)
 
-            worker_batch_sizes = []
-            for load_request in sampler:
-                for split in load_request.splits:
-                    worker_batch_sizes.append(len(split))
-            all_batch_sizes.extend(worker_batch_sizes)
-
-        # All batches should be exactly batch_size (partial dropped)
-        assert all(bs == batch_size for bs in all_batch_sizes)
+            all_requests = list(sampler)
+            # On the final iteration, all splits should be batch_size
+            # (the final partial is dropped when drop_last=True)
+            if all_requests:
+                final_request = all_requests[-1]
+                for split in final_request.splits:
+                    assert len(split) == batch_size, (
+                        f"Worker {worker_id}: final request should have no partial, "
+                        f"expected {batch_size}, got {len(split)}"
+                    )

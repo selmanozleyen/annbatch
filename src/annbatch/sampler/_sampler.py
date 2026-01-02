@@ -29,11 +29,9 @@ class LoadRequest[T_co]:
     # a list of at most chunk_size ranged slices
     slices: T_co
     # how the concatenation of slices should be split into batches
-    # a list of n_splits with batch_size arrays
+    # a list of splits, last one may be partial (< batch_size)
+    # the loader carries over partial batches to the next iteration
     splits: list[np.ndarray]
-    # indices that are not used in the last batch < batch_size
-    # or None if there is none ( usually when drop_last is True)
-    leftover_split: np.ndarray | None
 
 
 class Sampler[T_co](ABC):
@@ -47,12 +45,18 @@ class Sampler[T_co](ABC):
     def __len__(self) -> int:
         """Return the total number of iterations to exhaust the sampler."""
 
+    @property
+    @abstractmethod
+    def batch_size(self) -> int | None:
+        """The batch size of the sampler if valid."""
+
     def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
         """Set the worker handle if desired. If the sampler doesn't support workers, this is a no-op."""
         # this is a separate method because we'd want the LoaderBuilder itself
         # passing this to the sampler, this way Loader doesn't need to know about
         # the sampler's worker handle and knows every Sampler supports this
         # but we don't want to force every sampler to implement this
+        del worker_handle  # to explicitly show that we don't use the worker handle
         return None
 
     def supports_workers(self) -> bool:
@@ -158,8 +162,7 @@ class SliceSampler(Sampler[list[slice]]):
         n_slices_for_worker = len(slice_indices)
         n_slice_iters = math.ceil(n_slices_for_worker / self._preload_nchunks) if n_slices_for_worker > 0 else 0
 
-        n_leftover_loaded_indices = 0
-        leftover_split = None
+        n_leftover_indices = 0
 
         for i in range(n_slice_iters):
             start = i * self._preload_nchunks
@@ -170,33 +173,29 @@ class SliceSampler(Sampler[list[slice]]):
             total_obs_to_load = sum(slices[idx].stop - slices[idx].start for idx in indices_to_load)
 
             # Generate loaded indices with leftover from previous iteration
-            loaded_indices = np.arange(total_obs_to_load + n_leftover_loaded_indices)
+            loaded_indices = np.arange(total_obs_to_load + n_leftover_indices)
             if self._shuffle:
                 loaded_indices = self._shuffle_integers(loaded_indices)
-            splits = np.split(loaded_indices, np.arange(self._batch_size, len(loaded_indices), self._batch_size))
+            splits = list(np.split(loaded_indices, np.arange(self._batch_size, len(loaded_indices), self._batch_size)))
 
-            # if the last batch is full, there is no leftover data
-            if splits[-1].shape[0] == self._batch_size:
-                n_leftover_loaded_indices = 0
-                leftover_split = None
-            # handle leftover data
-            else:
-                is_last_iter = i == n_slice_iters - 1
+            is_last_iter = i == n_slice_iters - 1
+            last_is_partial = splits[-1].shape[0] < self._batch_size
 
-                if is_last_iter and not self._drop_last:
-                    # Yield the final partial batch
-                    n_leftover_loaded_indices = 0
-                    leftover_split = None
-                else:
-                    # Either save for next iteration, or drop on last iter
-                    n_leftover_loaded_indices = splits[-1].shape[0]
-                    leftover_split = None if (self._drop_last and is_last_iter) else splits[-1]
+            if last_is_partial:
+                if is_last_iter and self._drop_last:
+                    # Drop the final partial batch entirely
                     splits = splits[:-1]
+                    n_leftover_indices = 0
+                else:
+                    # Track leftover count for next iteration's index generation
+                    # splits[-1] is partial and will be carried over by Loader
+                    n_leftover_indices = splits[-1].shape[0]
+            else:
+                n_leftover_indices = 0
 
             yield LoadRequest(
                 slices=[slices[idx] for idx in indices_to_load],
                 splits=splits,
-                leftover_split=leftover_split,
             )
 
     def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
@@ -238,3 +237,7 @@ class SliceSampler(Sampler[list[slice]]):
         starts = list(range(self._start_index, self._end_index, self._chunk_size))
         stops = starts[1:] + [self._end_index]
         return [slice(start, stop) for start, stop in zip(starts, stops, strict=False)]
+
+    @property
+    def batch_size(self) -> int | None:
+        return self._batch_size
