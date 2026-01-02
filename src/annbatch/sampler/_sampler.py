@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
-
+import itertools
+import warnings
 from annbatch.utils import check_lt_1
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pandas import DataFrame
 
     from annbatch.utils import WorkerHandle
 
@@ -199,24 +201,25 @@ class SliceSampler(Sampler[list[slice]]):
             )
 
     def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
-        # Worker mode validation
-        if not self._drop_last and self._preload_nchunks * self._chunk_size % self._batch_size != 0:
-            raise ValueError(
-                f"When using DataLoader workers with drop_last=False, "
-                f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
-                f"Got {self._preload_nchunks * self._chunk_size} % {self._batch_size} = {self._preload_nchunks * self._chunk_size % self._batch_size}. "
-                f"Set drop_last=True to allow non-divisible configs."
-            )
-        if self._drop_last:
-            import warnings
-
-            warnings.warn(
-                "With drop_last=True and multiple workers, up to "
-                "(batch_size - 1) * num_workers observations may be dropped "
-                "(one partial batch per worker).",
-                UserWarning,
-                stacklevel=2,
-            )
+        # Worker mode validation - only applies with multiple workers
+        num_workers = worker_handle.num_workers
+        preload_size = self._preload_nchunks * self._chunk_size
+        if num_workers > 1 and preload_size % self._batch_size != 0:
+            if self._drop_last:
+                warnings.warn(
+                    "With drop_last=True and multiple workers, up to "
+                    "(batch_size - 1) * num_workers observations may be dropped "
+                    "(one partial batch per worker).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                raise ValueError(
+                    f"When using DataLoader workers with drop_last=False, "
+                    f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
+                    f"Got {preload_size} % {self._batch_size} = {preload_size % self._batch_size}. "
+                    f"Set drop_last=True to allow non-divisible configs."
+                )
         # TODO: asses this: should we raise an error if worker handle is already set?
         self._worker_handle = worker_handle
 
@@ -241,3 +244,246 @@ class SliceSampler(Sampler[list[slice]]):
     @property
     def batch_size(self) -> int | None:
         return self._batch_size
+
+
+@dataclass(frozen=True)
+class GroupRange:
+    """A named range of observations assigned to a specific distributed node.
+
+    Parameters
+    ----------
+    name
+        Identifier for this group (e.g., cell type name).
+    start
+        Starting observation index (inclusive).
+    end
+        Ending observation index (exclusive).
+    node
+        Which distributed node handles this group (default: 0).
+    """
+
+    name: str
+    start: int
+    end: int
+    node: int = 0
+
+
+class RangeGroupSampler(Sampler[list[slice]]):
+    """Sampler yielding group-pure batches with distributed and multi-worker support.
+
+    Each batch contains only elements from one group. Groups are assigned
+    to distributed nodes; workers within a node shard the slices of their groups.
+
+    Internally composes SliceSampler instances for each group to avoid code duplication.
+
+    `drop_last=True` is enforced for simplicity.
+
+    Parameters
+    ----------
+    groups
+        Sequence of GroupRange objects defining observation ranges and node assignments.
+    rank
+        This node's distributed rank (0 if not using distributed training).
+    world_size
+        Total number of distributed nodes (1 if not using distributed training).
+    batch_size
+        Number of observations per batch.
+    chunk_size
+        Size of each chunk (range of each slice).
+    preload_nchunks
+        Number of chunks to load per iteration.
+    shuffle_groups
+        Whether to shuffle group order each epoch.
+    shuffle_within
+        Whether to shuffle indices within each group.
+    interleave
+        Whether to alternate batches between groups (True) or exhaust one group
+        before moving to the next (False). Default is True.
+    rng
+        Random number generator for shuffling.
+    """
+
+    def __init__(
+        self,
+        *,
+        groups: list[GroupRange],
+        rank: int = 0,
+        world_size: int = 1,
+        batch_size: int,
+        chunk_size: int,
+        preload_nchunks: int,
+        shuffle_groups: bool = True,
+        shuffle_within: bool = True,
+        interleave: bool = True,
+        rng: np.random.Generator | None = None,
+    ):
+        check_lt_1([chunk_size, preload_nchunks, batch_size], ["Chunk size", "Preload chunks", "Batch size"])
+        preload_size = chunk_size * preload_nchunks
+        if preload_size % batch_size != 0:
+            raise ValueError(
+                f"(chunk_size * preload_nchunks) must be divisible by batch_size. "
+                f"Got {preload_size} % {batch_size} = {preload_size % batch_size}."
+            )
+
+        # Validate group sizes
+        for group in groups:
+            group_size = group.end - group.start
+            if group_size < preload_size:
+                raise ValueError(
+                    f"Group '{group.name}' has size {group_size} which is smaller than "
+                    f"preload_size (chunk_size * preload_nchunks = {preload_size}). "
+                    f"Each group must contain at least preload_size observations."
+                )
+
+        self._groups = groups
+        self._rank = rank
+        self._world_size = world_size
+        self._batch_size = batch_size
+        self._chunk_size = chunk_size
+        self._preload_nchunks = preload_nchunks
+        self._shuffle_groups = shuffle_groups
+        self._shuffle_within = shuffle_within
+        self._interleave = interleave
+        self._rng = np.random.default_rng() if rng is None else rng
+        self._worker_handle: WorkerHandle | None = None
+
+        # Filter groups for this node
+        self._my_groups = [g for g in groups if g.node == rank]
+
+        # Create samplers for each group
+        self._group_samplers = [
+            SliceSampler(
+                start_index=group.start,
+                end_index=group.end,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                preload_nchunks=preload_nchunks,
+                shuffle=shuffle_within,
+                drop_last=True,  # Enforced for RangeGroupSampler
+                rng=self._rng,
+            )
+            for group in self._my_groups
+        ]
+
+    @classmethod
+    def from_obs(
+        cls,
+        obs: DataFrame,
+        group_col: str,
+        node_mapping: dict[str, int],
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        batch_size: int,
+        chunk_size: int,
+        preload_nchunks: int,
+        **kwargs,
+    ) -> "RangeGroupSampler":
+        """Create sampler from sorted obs DataFrame.
+
+        Parameters
+        ----------
+        obs
+            DataFrame with observations (must be sorted by group_col).
+        group_col
+            Column name containing group labels.
+        node_mapping
+            Mapping from group name to distributed node id.
+        rank
+            This node's distributed rank.
+        world_size
+            Total number of distributed nodes.
+        batch_size
+            Number of observations per batch.
+        chunk_size
+            Size of each chunk.
+        preload_nchunks
+            Number of chunks to load per iteration.
+        **kwargs
+            Additional arguments passed to __init__.
+
+        Returns
+        -------
+        RangeGroupSampler
+            Sampler configured with groups detected from obs.
+        """
+
+        # TODO: assert sorted
+        group_values = obs[group_col].values
+
+        # Get group keys and their sizes using groupby
+        group_info = [(key, sum(1 for _ in g)) for key, g in itertools.groupby(group_values)]
+
+        # Compute cumulative end positions
+        ends = list(itertools.accumulate(size for _, size in group_info))
+        starts = [0] + ends[:-1]
+
+        groups = [
+            GroupRange(
+                name=str(key),
+                start=start,
+                end=end,
+                node=node_mapping.get(str(key), 0),
+            )
+            for (key, _), start, end in zip(group_info, starts, ends, strict=True)
+        ]
+
+        return cls(
+            groups=groups,
+            rank=rank,
+            world_size=world_size,
+            batch_size=batch_size,
+            chunk_size=chunk_size,
+            preload_nchunks=preload_nchunks,
+            **kwargs,
+        )
+
+    def __len__(self) -> int:
+        # Count total batches across all groups for this node
+        total_batches = 0
+        for group in self._my_groups:
+            group_size = group.end - group.start
+            # drop_last is enforced
+            total_batches += group_size // self._batch_size
+        return total_batches
+
+    def __iter__(self) -> Iterator[LoadRequest[list[slice]]]:
+        # Get list of samplers, optionally shuffle order
+        samplers = list(self._group_samplers)
+        if self._shuffle_groups:
+            self._rng.shuffle(samplers)
+
+        if self._interleave:
+            # Interleaved mode: reshuffle after each round
+            iterators = [iter(s) for s in samplers]
+            while iterators:
+                if self._shuffle_groups:
+                    self._rng.shuffle(iterators)
+                still_active = []
+                for it in iterators:
+                    try:
+                        yield next(it)
+                        still_active.append(it)
+                    except StopIteration:
+                        pass
+                iterators = still_active
+        else:
+            # Sequential mode: exhaust one group before moving to next
+            for sampler in samplers:
+                yield from sampler
+
+    def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
+        """Set the worker handle for multi-worker data loading."""
+        self._worker_handle = worker_handle
+        # Propagate to cached group samplers
+        for sampler in self._group_samplers:
+            sampler.set_worker_handle(worker_handle)
+
+    def supports_workers(self) -> bool:
+        return True
+
+    @property
+    def batch_size(self) -> int | None:
+        return self._batch_size
+
+

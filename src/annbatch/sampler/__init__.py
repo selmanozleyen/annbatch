@@ -6,18 +6,26 @@ This module provides samplers optimized for chunk-based data access patterns:
 - :class:`~annbatch.sampler.SliceSampler`: Chunk-aligned access for full or
   partial dataset iteration. Supports sharding via ``start_index`` and
   ``end_index`` for distributed training.
-- :class:`~annbatch.sampler.CategoricalSampler`: Category-stratified sampling
-  that first samples a category, then samples within that category.
+- :class:`~annbatch.sampler.RangeGroupSampler`: Group-based sampling with
+  distributed and multi-worker support. Each batch contains only elements
+  from one group.
+- :class:`~annbatch.sampler.GroupRange`: Defines a named observation range
+  for use with RangeGroupSampler.
 
 """
 
-from annbatch.sampler._sampler import Sampler, SliceSampler
+from annbatch.sampler._sampler import GroupRange, RangeGroupSampler, Sampler, SliceSampler
 
 # Update __module__ so Sphinx can find the re-exported classes
 Sampler.__module__ = "annbatch.sampler"
 SliceSampler.__module__ = "annbatch.sampler"
+RangeGroupSampler.__module__ = "annbatch.sampler"
+GroupRange.__module__ = "annbatch.sampler"
 
 __all__ = [
     "Sampler",
     "SliceSampler",
+    "RangeGroupSampler",
+    "GroupRange",
 ]
+

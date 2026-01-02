@@ -591,3 +591,308 @@ class TestSliceSamplerWithWorkers:
                         f"Worker {worker_id}: final request should have no partial, "
                         f"expected {batch_size}, got {len(split)}"
                     )
+
+
+# =============================================================================
+# RangeGroupSampler Tests
+# =============================================================================
+
+from annbatch.sampler import GroupRange, RangeGroupSampler
+
+
+class TestRangeGroupSamplerBasic:
+    """Tests for basic RangeGroupSampler functionality."""
+
+    def test_group_pure_batches(self):
+        """Test that each load request only contains slices from one group."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+            shuffle_within=False,
+        )
+
+        # Each individual load request must contain slices from only one group
+        for load_request in sampler:
+            groups_seen = set()
+            for s in load_request.slices:
+                if s.start < 100:
+                    groups_seen.add("A")
+                else:
+                    groups_seen.add("B")
+            assert len(groups_seen) == 1, f"Load request contains mixed groups: {groups_seen}"
+
+    def test_covers_all_groups(self):
+        """Test that sampler covers all observations in assigned groups."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+            shuffle_within=False,
+        )
+
+        all_indices = set()
+        for load_request in sampler:
+            for s in load_request.slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(200))
+
+    def test_small_group_raises_error(self):
+        """Test that groups smaller than preload_size raise an error."""
+        groups = [
+            GroupRange("small", start=0, end=15, node=0),  # 15 < 10*2 = 20
+        ]
+
+        with pytest.raises(ValueError, match="smaller than"):
+            RangeGroupSampler(
+                groups=groups,
+                rank=0,
+                world_size=1,
+                batch_size=5,
+                chunk_size=10,
+                preload_nchunks=2,
+            )
+
+    def test_non_divisible_preload_raises_error(self):
+        """Test that preload_size not divisible by batch_size raises an error."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+        ]
+
+        with pytest.raises(ValueError, match="divisible by batch_size"):
+            RangeGroupSampler(
+                groups=groups,
+                rank=0,
+                world_size=1,
+                batch_size=7,        # 20 % 7 != 0
+                chunk_size=10,
+                preload_nchunks=2,
+            )
+
+    def test_all_batches_are_batch_size(self):
+        """Test that all yielded full batches are exactly batch_size.
+        
+        Note: splits[-1] may be partial for carry-over to next iteration.
+        Only the final iteration's partial is dropped (drop_last enforced).
+        """
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+        ]
+        batch_size = 10  # 20 % 10 == 0 (preload_size = 10 * 2 = 20)
+
+        sampler = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=batch_size,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+            shuffle_within=False,
+        )
+
+        for load_request in sampler:
+            for split in load_request.splits:
+                assert len(split) == batch_size, f"Expected {batch_size}, got {len(split)}"
+
+    def test_interleaved_batches(self):
+        """Test that interleave=True alternates batches between groups."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+            shuffle_within=False,
+            interleave=True,
+        )
+
+        # Collect first few load requests and check they alternate
+        requests = list(sampler)
+
+        # First request should be from A (slices < 100)
+        # Second request should be from B (slices >= 100)
+        # Third request should be from A again, etc.
+        for i, req in enumerate(requests[:4]):  # Check first 4
+            for s in req.slices:
+                if i % 2 == 0:  # Even indices should be from A
+                    assert s.start < 100, f"Request {i} should be from group A, got slice {s}"
+                else:  # Odd indices should be from B
+                    assert s.start >= 100, f"Request {i} should be from group B, got slice {s}"
+
+    def test_sequential_batches(self):
+        """Test that interleave=False exhausts one group before moving to next."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+            shuffle_within=False,
+            interleave=False,  # Sequential mode
+        )
+
+        requests = list(sampler)
+
+        # First half should be from A, second half from B
+        mid = len(requests) // 2
+        for i, req in enumerate(requests):
+            for s in req.slices:
+                if i < mid:
+                    assert s.start < 100, f"Request {i} should be from group A"
+                else:
+                    assert s.start >= 100, f"Request {i} should be from group B"
+
+
+class TestRangeGroupSamplerDistributed:
+    """Tests for RangeGroupSampler with distributed node assignment."""
+
+    def test_node_filtering(self):
+        """Test that each node only sees its assigned groups."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=1),
+            GroupRange("C", start=200, end=300, node=0),
+        ]
+
+        # Node 0 should see A and C
+        sampler_0 = RangeGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=2,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+        )
+
+        indices_0 = set()
+        for load_request in sampler_0:
+            for s in load_request.slices:
+                indices_0.update(range(s.start, s.stop))
+
+        # Node 0 should have A (0-100) and C (200-300)
+        assert indices_0 == set(range(0, 100)) | set(range(200, 300))
+        assert not indices_0.intersection(set(range(100, 200)))  # No B
+
+        # Node 1 should see only B
+        sampler_1 = RangeGroupSampler(
+            groups=groups,
+            rank=1,
+            world_size=2,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle_groups=False,
+        )
+
+        indices_1 = set()
+        for load_request in sampler_1:
+            for s in load_request.slices:
+                indices_1.update(range(s.start, s.stop))
+
+        assert indices_1 == set(range(100, 200))
+
+
+class TestRangeGroupSamplerWithWorkers:
+    """Tests for RangeGroupSampler with multi-worker support."""
+
+    def test_workers_shard_slices(self):
+        """Test that workers get disjoint subsets of slices."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+        ]
+        num_workers = 2
+
+        all_worker_indices = []
+        for worker_id in range(num_workers):
+            worker_handle = MockWorkerHandle(worker_id, num_workers)
+            sampler = RangeGroupSampler(
+                groups=groups,
+                rank=0,
+                world_size=1,
+                batch_size=10,
+                chunk_size=10,
+                preload_nchunks=2,
+                shuffle_groups=False,
+                shuffle_within=False,
+            )
+            sampler.set_worker_handle(worker_handle)
+
+            worker_indices = set()
+            # No warning since preload_size (20) is divisible by batch_size (10)
+            for load_request in sampler:
+                for s in load_request.slices:
+                    worker_indices.update(range(s.start, s.stop))
+            all_worker_indices.append(worker_indices)
+
+        # Workers should have disjoint slices
+        assert all_worker_indices[0].isdisjoint(all_worker_indices[1])
+        # Together they cover the group
+        assert all_worker_indices[0] | all_worker_indices[1] == set(range(100))
+
+
+class TestRangeGroupSamplerFromObs:
+    """Tests for RangeGroupSampler.from_obs factory method."""
+
+    def test_from_obs_detects_ranges(self):
+        """Test that from_obs correctly detects group boundaries."""
+        import pandas as pd
+
+        obs = pd.DataFrame({
+            "cell_type": ["A"] * 50 + ["B"] * 30 + ["C"] * 20,
+        })
+        node_mapping = {"A": 0, "B": 1, "C": 0}
+
+        sampler = RangeGroupSampler.from_obs(
+            obs=obs,
+            group_col="cell_type",
+            node_mapping=node_mapping,
+            rank=0,
+            world_size=2,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+        )
+
+        # Node 0 should have A (0-50) and C (80-100)
+        indices = set()
+        for load_request in sampler:
+            for s in load_request.slices:
+                indices.update(range(s.start, s.stop))
+
+        assert indices == set(range(0, 50)) | set(range(80, 100))
+

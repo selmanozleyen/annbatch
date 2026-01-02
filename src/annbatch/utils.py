@@ -119,6 +119,13 @@ class WorkerHandle:  # noqa: D101
             # torch default seed is `base_seed + worker_id`. Hence, subtract worker_id to get the base seed
             return np.random.default_rng(self._worker_info.seed - self._worker_info.id)
 
+    @property
+    def num_workers(self) -> int:
+        """Return the number of workers."""
+        if self._worker_info is None:
+            return 1
+        return self._worker_info.num_workers
+
     def shuffle(self, obj: np.typing.ArrayLike) -> None:
         """Perform in-place shuffle.
 
