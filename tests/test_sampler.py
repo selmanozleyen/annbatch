@@ -896,3 +896,148 @@ class TestRangeGroupSamplerFromObs:
 
         assert indices == set(range(0, 50)) | set(range(80, 100))
 
+
+# =============================================================================
+# InterleavedGroupSampler Tests
+# =============================================================================
+
+from annbatch.sampler import InterleavedGroupSampler
+
+
+class TestInterleavedGroupSamplerBasic:
+    """Tests for InterleavedGroupSampler functionality."""
+
+    def test_true_batch_interleaving(self):
+        """Test that splits within a LoadRequest alternate between groups."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = InterleavedGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,  # 1 batch per chunk
+            preload_nchunks=2,  # 2 chunks per group per request
+            shuffle=False,
+        )
+
+        requests = list(sampler)
+        assert len(requests) > 0
+
+        # Check first LoadRequest has interleaved slices
+        first_req = requests[0]
+        # Should have 4 slices: A, B, A, B (preload_nchunks=2 per group)
+        assert len(first_req.slices) == 4
+        assert first_req.slices[0].start < 100  # A
+        assert first_req.slices[1].start >= 100  # B
+        assert first_req.slices[2].start < 100  # A
+        assert first_req.slices[3].start >= 100  # B
+
+        # Each split should be batch_size
+        for split in first_req.splits:
+            assert len(split) == 10
+
+    def test_multiple_batches_per_chunk(self):
+        """Test chunk_size > batch_size with multiple batches per chunk."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = InterleavedGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=20,  # 2 batches per chunk
+            preload_nchunks=1,  # 1 chunk per group per request
+            shuffle=False,
+        )
+
+        requests = list(sampler)
+        first_req = requests[0]
+
+        # Should have 2 slices: one from A (0:20), one from B (100:120)
+        assert len(first_req.slices) == 2
+        # But 4 splits: A, A, B, B (2 batches per chunk)
+        assert len(first_req.splits) == 4
+        for split in first_req.splits:
+            assert len(split) == 10
+
+    def test_covers_all_data(self):
+        """Test that sampler covers all observations from all groups."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+            GroupRange("B", start=100, end=200, node=0),
+        ]
+
+        sampler = InterleavedGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle=False,
+        )
+
+        all_indices = set()
+        for load_request in sampler:
+            for s in load_request.slices:
+                all_indices.update(range(s.start, s.stop))
+
+        assert all_indices == set(range(200))
+
+    def test_small_group_raises_error(self):
+        """Test that groups smaller than batch_size raise an error."""
+        groups = [
+            GroupRange("small", start=0, end=5, node=0),  # 5 < batch_size=10
+        ]
+
+        with pytest.raises(ValueError, match="smaller than"):
+            InterleavedGroupSampler(
+                groups=groups,
+                rank=0,
+                world_size=1,
+                batch_size=10,
+                chunk_size=10,
+                preload_nchunks=2,
+            )
+
+    def test_chunk_not_divisible_raises_error(self):
+        """Test that chunk_size not divisible by batch_size raises an error."""
+        groups = [
+            GroupRange("A", start=0, end=100, node=0),
+        ]
+
+        with pytest.raises(ValueError, match="divisible"):
+            InterleavedGroupSampler(
+                groups=groups,
+                rank=0,
+                world_size=1,
+                batch_size=7,
+                chunk_size=10,  # 10 % 7 != 0
+                preload_nchunks=2,
+            )
+
+    def test_drops_partial_chunks(self):
+        """Test that partial chunks (< chunk_size) are dropped."""
+        groups = [
+            GroupRange("A", start=0, end=95, node=0),  # 95 obs, chunk_size=10 -> 9 full chunks
+        ]
+
+        sampler = InterleavedGroupSampler(
+            groups=groups,
+            rank=0,
+            world_size=1,
+            batch_size=10,
+            chunk_size=10,
+            preload_nchunks=2,
+            shuffle=False,
+        )
+
+        total_batches = sum(len(r.splits) for r in sampler)
+        assert total_batches == 9  # Last 5 obs dropped

@@ -487,3 +487,161 @@ class RangeGroupSampler(Sampler[list[slice]]):
         return self._batch_size
 
 
+class InterleavedGroupSampler(Sampler[list[slice]]):
+    """Sampler yielding true batch-level interleaved groups.
+
+    Each LoadRequest contains slices from multiple groups, with each split
+    (batch) coming from a different group in round-robin fashion.
+
+    Example: with groups A and B, batches are: A, B, A, B, ... within
+    each LoadRequest.
+
+    Parameters
+    ----------
+    groups
+        Sequence of GroupRange objects defining observation ranges and node assignments.
+    rank
+        This node's distributed rank (0 if not using distributed training).
+    world_size
+        Total number of distributed nodes (1 if not using distributed training).
+    batch_size
+        Number of observations per batch.
+    chunk_size
+        Size of each chunk. Must be divisible by batch_size.
+    preload_nchunks
+        Number of chunks to load per group per iteration.
+    shuffle
+        Whether to shuffle within groups.
+    rng
+        Random number generator for shuffling.
+    """
+
+    def __init__(
+        self,
+        *,
+        groups: list[GroupRange],
+        rank: int = 0,
+        world_size: int = 1,
+        batch_size: int,
+        chunk_size: int,
+        preload_nchunks: int,
+        shuffle: bool = True,
+        rng: np.random.Generator | None = None,
+    ):
+        check_lt_1([batch_size, chunk_size, preload_nchunks], ["Batch size", "Chunk size", "Preload chunks"])
+
+        if chunk_size % batch_size != 0:
+            raise ValueError(
+                f"chunk_size must be divisible by batch_size. "
+                f"Got {chunk_size} % {batch_size} = {chunk_size % batch_size}."
+            )
+
+        # Validate group sizes
+        for group in groups:
+            group_size = group.end - group.start
+            if group_size < batch_size:
+                raise ValueError(
+                    f"Group '{group.name}' has size {group_size} which is smaller than "
+                    f"batch_size ({batch_size}). Each group must have at least batch_size observations."
+                )
+
+        self._groups = groups
+        self._rank = rank
+        self._world_size = world_size
+        self._batch_size = batch_size
+        self._chunk_size = chunk_size
+        self._batches_per_chunk = chunk_size // batch_size
+        self._preload_nchunks = preload_nchunks
+        self._shuffle = shuffle
+        self._rng = np.random.default_rng() if rng is None else rng
+        self._worker_handle: WorkerHandle | None = None
+
+        # Filter groups for this node
+        self._my_groups = [g for g in groups if g.node == rank]
+
+        # Precompute slices for each group
+        self._group_slices: list[list[slice]] = []
+        for group in self._my_groups:
+            starts = list(range(group.start, group.end, chunk_size))
+            stops = starts[1:] + [group.end]
+            slices = [slice(s, e) for s, e in zip(starts, stops, strict=False)]
+            # Filter out partial slices (< chunk_size)
+            slices = [s for s in slices if s.stop - s.start == chunk_size]
+            self._group_slices.append(slices)
+
+    def __len__(self) -> int:
+        # Total batches = sum of (chunks * batches_per_chunk) across all groups
+        return sum(len(slices) * self._batches_per_chunk for slices in self._group_slices)
+
+    def __iter__(self) -> Iterator[LoadRequest[list[slice]]]:
+        if not self._my_groups:
+            return
+
+        # Create index arrays for each group's slices
+        group_indices = [np.arange(len(slices)) for slices in self._group_slices]
+
+        # Shuffle within groups if requested
+        if self._shuffle:
+            for indices in group_indices:
+                self._rng.shuffle(indices)
+
+        # Worker sharding: each worker gets a subset of each group's slices
+        if self._worker_handle is not None:
+            group_indices = [
+                self._worker_handle.get_part_for_worker(indices)
+                for indices in group_indices
+            ]
+
+        # Create iterators for each group
+        group_iterators = [iter(indices) for indices in group_indices]
+        n_groups = len(group_iterators)
+
+        # Number of chunks per LoadRequest per group
+        chunks_per_group_per_request = self._preload_nchunks
+
+        while True:
+            # Collect slices from each group for this LoadRequest
+            all_slices: list[slice] = []
+            all_splits: list[np.ndarray] = []
+            current_offset = 0
+
+            # Track which groups still have data
+            groups_exhausted = [False] * n_groups
+
+            # Interleave: for each round, grab one chunk from each group
+            # but split each chunk into batches_per_chunk batches
+            for round_idx in range(chunks_per_group_per_request):
+                for group_idx in range(n_groups):
+                    if groups_exhausted[group_idx]:
+                        continue
+                    try:
+                        slice_idx = next(group_iterators[group_idx])
+                        s = self._group_slices[group_idx][slice_idx]
+                        all_slices.append(s)
+                        # Each chunk produces batches_per_chunk splits
+                        for _ in range(self._batches_per_chunk):
+                            split_start = current_offset
+                            split_end = current_offset + self._batch_size
+                            all_splits.append(np.arange(split_start, split_end))
+                            current_offset = split_end
+                    except StopIteration:
+                        groups_exhausted[group_idx] = True
+
+            if not all_slices:
+                break  # All groups exhausted
+
+            yield LoadRequest(slices=all_slices, splits=all_splits)
+
+    def set_worker_handle(self, worker_handle: WorkerHandle) -> None:
+        """Set the worker handle for multi-worker data loading."""
+        self._worker_handle = worker_handle
+
+    def supports_workers(self) -> bool:
+        return True
+
+    @property
+    def batch_size(self) -> int | None:
+        return self._batch_size
+
+
+
