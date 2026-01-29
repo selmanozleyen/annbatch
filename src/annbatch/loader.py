@@ -143,6 +143,7 @@ class Loader[
     _to_torch: bool = True
     _dataset_elem_cache: dict[int, CSRDatasetElems]
     _batch_sampler: Sampler
+    _dataset_intervals: pd.IntervalIndex | None = None
 
     def __init__(
         self,
@@ -390,7 +391,20 @@ class Loader[
             self._obs += [obs]
         elif obs is not None:  # obs dont exist yet, but are being added for the first time
             self._obs = [obs]
+        # Update the interval index for efficient dataset lookups
+        self._update_dataset_intervals()
         return self
+
+    def _update_dataset_intervals(self) -> None:
+        """Update the IntervalIndex for efficient mapping from global indices to dataset indices."""
+        if len(self._shapes) == 0:
+            self._dataset_intervals = None
+            return
+        # Build intervals [start, end) for each dataset
+        cumsum = list(accumulate(shape[0] for shape in self._shapes))
+        starts = [0] + cumsum[:-1]
+        ends = cumsum
+        self._dataset_intervals = pd.IntervalIndex.from_arrays(starts, ends, closed="left")
 
     def _get_relative_obs_indices(self, index: slice, *, use_original_space: bool = False) -> list[tuple[slice, int]]:
         """Generate a slice relative to a dataset given a global slice index over all datasets.
@@ -413,24 +427,32 @@ class Loader[
         -------
             A slice relative to the dataset it represents as well as the index of said dataset in `sparse_datasets`.
         """
+        if self._dataset_intervals is None:
+            raise ValueError("No datasets added yet")
+
         min_idx = index.start
         max_idx = index.stop
-        curr_pos = 0
+
+        # Use IntervalIndex to find which datasets overlap with the slice
+        # get_indexer_for returns indices of intervals that contain each point
+        # We need to find all datasets that overlap with [min_idx, max_idx)
+        overlapping_mask = (self._dataset_intervals.left < max_idx) & (self._dataset_intervals.right > min_idx)
+        overlapping_indices = np.where(overlapping_mask)[0]
+
         slices = []
-        for idx, (n_obs, _) in enumerate(self._shapes):
-            array_start = curr_pos
-            array_end = curr_pos + n_obs
+        for idx in overlapping_indices:
+            interval = self._dataset_intervals[idx]
+            array_start = interval.left
+            array_end = interval.right
 
             start = max(min_idx, array_start)
             stop = min(max_idx, array_end)
-            if start < stop:
-                if use_original_space:
-                    slices.append((slice(start, stop), idx))
-                else:
-                    relative_start = start - array_start
-                    relative_stop = stop - array_start
-                    slices.append((slice(relative_start, relative_stop), idx))
-            curr_pos += n_obs
+            if use_original_space:
+                slices.append((slice(start, stop), idx))
+            else:
+                relative_start = start - array_start
+                relative_stop = stop - array_start
+                slices.append((slice(relative_start, relative_stop), idx))
         return slices
 
     def _slices_to_slices_with_array_index(
@@ -449,7 +471,7 @@ class Loader[
 
         Returns
         -------
-            A lookup between the dataset and its indexing slices, ordered by keys.
+            A lookup between the dataset and its indexing slices, ordered by dataset index (keys).
         """
         dataset_index_to_slices: defaultdict[int, list[slice]] = defaultdict(list)
         for slice_ in slices:
