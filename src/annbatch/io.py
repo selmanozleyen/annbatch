@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from zarr.abc.codec import BytesBytesCodec
 
 V1_ENCODING = {"encoding-type": "annbatch-preshuffled", "encoding-version": "0.1.0"}
+V1_GROUPED_ENCODING = {"encoding-type": "annbatch-grouped", "encoding-version": "0.1.0"}
+GROUP_INDEX_KEY = "group_index"
 
 
 def _default_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](x: T) -> ad.AnnData:
@@ -694,3 +696,163 @@ class DatasetCollection:
                     adata,
                     dataset_kwargs={"compression": h5ad_compressor},
                 )
+
+
+def _normalize_groupby(groupby: str | Iterable[str]) -> list[str]:
+    keys = [groupby] if isinstance(groupby, str) else list(groupby)
+    if len(keys) == 0:
+        raise ValueError("`groupby` must contain at least one obs column name.")
+    if len(set(keys)) != len(keys):
+        raise ValueError("`groupby` must not contain duplicate column names.")
+    return keys
+
+
+def _normalize_group_values(values: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple("<NA>" if pd.isna(v) else str(v) for v in values)
+
+
+def _group_obs_rows(
+    obs: pd.DataFrame,
+    *,
+    groupby: list[str],
+    shuffle_within_group: bool,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    grouped_obs = obs[groupby]
+    grouped_indices = grouped_obs.groupby(groupby, dropna=False, sort=True, observed=False).indices
+    ordered_positions: list[np.ndarray] = []
+    starts: list[int] = []
+    stops: list[int] = []
+    counts: list[int] = []
+    key_values_by_column: dict[str, list[str]] = {k: [] for k in groupby}
+    offset = 0
+    for key, positions in grouped_indices.items():
+        key_tuple = key if isinstance(key, tuple) else (key,)
+        normalized = _normalize_group_values(key_tuple)
+        for key_name, value in zip(groupby, normalized, strict=True):
+            key_values_by_column[key_name].append(value)
+
+        group_positions = np.asarray(positions, dtype=np.int64)
+        if shuffle_within_group:
+            group_positions = group_positions[rng.permutation(group_positions.shape[0])]
+        ordered_positions.append(group_positions)
+        starts.append(offset)
+        offset += group_positions.shape[0]
+        stops.append(offset)
+        counts.append(group_positions.shape[0])
+
+    group_index = pd.DataFrame(
+        {
+            **key_values_by_column,
+            "start": np.asarray(starts, dtype=np.int64),
+            "stop": np.asarray(stops, dtype=np.int64),
+            "count": np.asarray(counts, dtype=np.int64),
+        }
+    )
+    if len(ordered_positions) == 0:
+        return np.array([], dtype=np.int64), group_index
+    return np.concatenate(ordered_positions), group_index
+
+
+class GroupedCollection:
+    """A grouped zarr collection organized by one or more obs columns."""
+
+    _group: zarr.Group
+
+    def __init__(self, group: zarr.Group | str | Path, *, mode: "a" | "r" | "r+" = "a"):
+        if isinstance(group, zarr.Group):
+            self._group = group
+        elif isinstance(group, str | Path):
+            if not str(group).endswith(".zarr"):
+                warnings.warn(
+                    f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
+                    stacklevel=2,
+                )
+            self._group = zarr.open_group(group, mode=mode)
+        else:
+            raise TypeError("Group must either be a zarr group or a path")
+
+    @property
+    def _dataset_keys(self) -> list[str]:
+        return sorted(
+            [k for k in self._group.keys() if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None],
+            key=lambda x: int(x.split("_")[1]),
+        )
+
+    def __iter__(self) -> Generator[zarr.Group]:
+        for k in self._dataset_keys:
+            yield self._group[k]
+
+    @property
+    def is_empty(self) -> bool:
+        return not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items()) or len(self._dataset_keys) == 0
+
+    @property
+    def group_index(self) -> pd.DataFrame:
+        if GROUP_INDEX_KEY not in self._group:
+            raise ValueError("Grouped collection is missing `group_index` metadata.")
+        return ad.io.read_elem(self._group[GROUP_INDEX_KEY])
+
+    @property
+    def groupby_keys(self) -> list[str]:
+        groupby_keys = self._group.attrs.get("groupby_keys", [])
+        return [str(v) for v in groupby_keys]
+
+    @classmethod
+    @_with_settings
+    def from_adatas(
+        cls,
+        group: zarr.Group | str | Path,
+        *,
+        adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
+        groupby: str | Iterable[str],
+        load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
+        var_subset: Iterable[str] | None = None,
+        zarr_sparse_chunk_size: int = 32768,
+        zarr_sparse_shard_size: int = 134_217_728,
+        zarr_dense_chunk_size: int = 1024,
+        zarr_dense_shard_size: int = 4_194_304,
+        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        n_obs_per_dataset: int = 2_097_152,
+        shuffle_within_group: bool = True,
+        random_seed: int | None = None,
+    ) -> Self:
+        collection = cls(group)
+        if not collection.is_empty:
+            raise RuntimeError("Cannot create a grouped collection at a non-empty location.")
+        groupby_keys = _normalize_groupby(groupby)
+
+        _check_for_mismatched_keys(adata_paths, load_adata=load_adata)
+        adata_concat = _lazy_load_anndatas(adata_paths, load_adata=load_adata)
+        adata_concat.obs_names_make_unique()
+        if var_subset is None:
+            var_subset = adata_concat.var_names
+        missing_group_keys = [k for k in groupby_keys if k not in adata_concat.obs.columns]
+        if len(missing_group_keys) > 0:
+            raise ValueError(f"Could not find groupby key(s) in obs: {missing_group_keys}.")
+
+        obs_for_grouping = adata_concat.obs.to_memory() if isinstance(adata_concat.obs, Dataset2D) else adata_concat.obs
+        ordered_positions, group_index = _group_obs_rows(
+            obs_for_grouping,
+            groupby=groupby_keys,
+            shuffle_within_group=shuffle_within_group,
+            rng=np.random.default_rng(random_seed),
+        )
+        n_obs_per_dataset = min(adata_concat.shape[0], n_obs_per_dataset)
+        var_mask = adata_concat.var_names.isin(var_subset)
+        for i, chunk in enumerate(tqdm(split_given_size(ordered_positions, n_obs_per_dataset), desc="processing chunks")):
+            adata_chunk = adata_concat[chunk, :][:, var_mask].copy()
+            adata_chunk = _persist_adata_in_memory(adata_chunk)
+            write_sharded(
+                collection._group,
+                adata_chunk,
+                sparse_chunk_size=zarr_sparse_chunk_size,
+                sparse_shard_size=zarr_sparse_shard_size,
+                dense_chunk_size=min(adata_chunk.shape[0], zarr_dense_chunk_size),
+                dense_shard_size=min(adata_chunk.shape[0], zarr_dense_shard_size),
+                compressors=zarr_compressor,
+                key=f"{DATASET_PREFIX}_{i}",
+            )
+        ad.io.write_elem(collection._group, GROUP_INDEX_KEY, group_index)
+        collection._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
+        return collection
