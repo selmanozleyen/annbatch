@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from annbatch.abc import Sampler
-    from annbatch.io import DatasetCollection, GroupedCollection
+    from annbatch.io import BaseCollection
 
     # TODO: remove after sphinx 9 - myst compat
     BackingArray = BackingArray_T
@@ -280,7 +280,7 @@ class Loader[
 
     def use_collection(
         self,
-        collection: DatasetCollection | GroupedCollection,
+        collection: BaseCollection,
         *,
         load_adata: Callable[[zarr.Group], ad.AnnData] = load_x_and_obs,
     ) -> Self:

@@ -386,9 +386,8 @@ def test_empty(tmp_path: Path):
 def test_grouped_collection_from_adatas_compound(adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path]):
     paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
     output_path = adata_with_h5_path_different_var_space[1].parent / "grouped_collection_compound.zarr"
-    collection = GroupedCollection.from_adatas(
-        output_path,
-        adata_paths=paths,
+    collection = GroupedCollection(output_path).add_adatas(
+        paths,
         groupby=["label", "store_id"],
         zarr_sparse_chunk_size=10,
         zarr_sparse_shard_size=20,

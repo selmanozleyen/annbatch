@@ -598,9 +598,8 @@ def test_given_batch_sampler_samples_subset_of_combined_datasets(
 
 def test_use_grouped_collection(adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path):
     paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
-    grouped = GroupedCollection.from_adatas(
-        tmp_path / "grouped_for_loader.zarr",
-        adata_paths=paths,
+    grouped = GroupedCollection(tmp_path / "grouped_for_loader.zarr").add_adatas(
+        paths,
         groupby=["label", "store_id"],
         zarr_sparse_chunk_size=10,
         zarr_sparse_shard_size=20,

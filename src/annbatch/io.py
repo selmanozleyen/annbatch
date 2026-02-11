@@ -323,10 +323,91 @@ def _with_settings(func):
     return wrapper
 
 
-class DatasetCollection:
-    """A preshuffled collection object including functionality for creating, adding to, and loading collections shuffled by `annbatch`."""
+class BaseCollection:
+    """Base class for dataset collections.
+
+    Provides shared initialization, iteration, and dataset key management
+    for both :class:`DatasetCollection` and :class:`GroupedCollection`.
+    """
 
     _group: zarr.Group | Path
+
+    def __init__(
+        self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
+    ):
+        if is_collection_h5ad:
+            if isinstance(group, zarr.Group):
+                raise ValueError("Do not set `is_collection_h5ad` to True when also passing in a zarr Group.")
+            warnings.warn(
+                "Loading h5ad is currently not supported and thus we cannot guarantee the funcionality of the ecosystem with h5ad files."
+                "DatasetCollection should be able to handle shuffling but we guarantee little else."
+                "Proceed with caution.",
+                stacklevel=2,
+            )
+            self._group = Path(group)
+            self._group.mkdir(exist_ok=True)
+        elif isinstance(group, zarr.Group):
+            self._group = group
+        elif isinstance(group, str | Path):
+            if not str(group).endswith(".zarr"):
+                warnings.warn(
+                    f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
+                    stacklevel=2,
+                )
+            self._group = zarr.open_group(group, mode=mode)
+        else:
+            raise TypeError("Group must either be a zarr group or a path")
+
+    @property
+    def _dataset_keys(self) -> list[str]:
+        if isinstance(self._group, zarr.Group):
+            return sorted(
+                [k for k in self._group.keys() if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None],
+                key=lambda x: int(x.split("_")[1]),
+            )
+        raise ValueError("Cannot iterate through folder of h5ad files")
+
+    def __iter__(self) -> Generator[zarr.Group]:
+        if isinstance(self._group, zarr.Group):
+            for k in self._dataset_keys:
+                yield self._group[k]
+        else:
+            raise ValueError("Cannot iterate through folder of h5ad files")
+
+    def _write_adata(
+        self,
+        adata: ad.AnnData,
+        *,
+        key: str,
+        zarr_sparse_chunk_size: int,
+        zarr_sparse_shard_size: int,
+        zarr_dense_chunk_size: int,
+        zarr_dense_shard_size: int,
+        zarr_compressor: Iterable[BytesBytesCodec],
+        h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
+    ) -> None:
+        """Persist an in-memory AnnData chunk to the collection's backing store."""
+        if isinstance(self._group, zarr.Group):
+            write_sharded(
+                self._group,
+                adata,
+                sparse_chunk_size=zarr_sparse_chunk_size,
+                sparse_shard_size=zarr_sparse_shard_size,
+                dense_chunk_size=min(adata.shape[0], zarr_dense_chunk_size),
+                dense_shard_size=min(adata.shape[0], zarr_dense_shard_size),
+                compressors=zarr_compressor,
+                key=key,
+            )
+        else:
+            ad.io.write_h5ad(
+                self._group / f"{key}.h5ad",
+                adata,
+                dataset_kwargs={"compression": h5ad_compressor},
+            )
+
+
+class DatasetCollection(BaseCollection):
+    """A preshuffled collection object including functionality for creating, adding to, and loading collections shuffled by `annbatch`."""
 
     def __init__(
         self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
@@ -343,47 +424,7 @@ class DatasetCollection:
                 The base location for a preshuffled collection.
                 A :class:`zarr.Group` or path ending in `.zarr` indicates zarr as the shuffled format and otherwise a directory of `h5ad` files will be created.
         """
-        if not isinstance(group, zarr.Group):
-            if isinstance(group, str | Path):
-                if not is_collection_h5ad:
-                    if not str(group).endswith(".zarr"):
-                        warnings.warn(
-                            f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
-                            stacklevel=2,
-                        )
-                    self._group = zarr.open_group(group, mode=mode)
-                else:
-                    warnings.warn(
-                        "Loading h5ad is currently not supported and thus we cannot guarantee the funcionality of the ecosystem with h5ad files."
-                        "DatasetCollection should be able to handle shuffling but we guarantee little else."
-                        "Proceed with caution.",
-                        stacklevel=2,
-                    )
-                    self._group = Path(group)
-                    self._group.mkdir(exist_ok=True)
-            else:
-                raise TypeError("Group must either be a zarr group or a path")
-        else:
-            if is_collection_h5ad:
-                raise ValueError("Do not set `is_collection_h5ad` to True when also passing in a zarr Group.")
-            self._group = group
-
-    @property
-    def _dataset_keys(self) -> list[str]:
-        if isinstance(self._group, zarr.Group):
-            return sorted(
-                [k for k in self._group.keys() if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None],
-                key=lambda x: int(x.split("_")[1]),
-            )
-        else:
-            raise ValueError("Cannot iterate through folder of h5ad files")
-
-    def __iter__(self) -> Generator[zarr.Group]:
-        if isinstance(self._group, zarr.Group):
-            for k in self._dataset_keys:
-                yield self._group[k]
-        else:
-            raise ValueError("Cannot iterate through folder of h5ad files")
+        super().__init__(group, mode=mode, is_collection_h5ad=is_collection_h5ad)
 
     @property
     def is_empty(self) -> bool:
@@ -583,23 +624,16 @@ class DatasetCollection:
                 # shuffle adata in memory to break up individual chunks
                 idxs = np.random.default_rng().permutation(np.arange(len(adata_chunk)))
                 adata_chunk = adata_chunk[idxs]
-            if isinstance(self._group, zarr.Group):
-                write_sharded(
-                    self._group,
-                    adata_chunk,
-                    sparse_chunk_size=zarr_sparse_chunk_size,
-                    sparse_shard_size=zarr_sparse_shard_size,
-                    dense_chunk_size=min(adata_chunk.shape[0], zarr_dense_chunk_size),
-                    dense_shard_size=min(adata_chunk.shape[0], zarr_dense_shard_size),
-                    compressors=zarr_compressor,
-                    key=f"{DATASET_PREFIX}_{i}",
-                )
-            else:
-                ad.io.write_h5ad(
-                    self._group / f"{DATASET_PREFIX}_{i}.h5ad",
-                    adata_chunk,
-                    dataset_kwargs={"compression": h5ad_compressor},
-                )
+            self._write_adata(
+                adata_chunk,
+                key=f"{DATASET_PREFIX}_{i}",
+                zarr_sparse_chunk_size=zarr_sparse_chunk_size,
+                zarr_sparse_shard_size=zarr_sparse_shard_size,
+                zarr_dense_chunk_size=zarr_dense_chunk_size,
+                zarr_dense_shard_size=zarr_dense_shard_size,
+                zarr_compressor=zarr_compressor,
+                h5ad_compressor=h5ad_compressor,
+            )
         if isinstance(self._group, zarr.Group):
             self._group.update_attributes(V1_ENCODING)
 
@@ -679,36 +713,16 @@ class DatasetCollection:
             else:
                 idxs = np.arange(adata.shape[0])
             adata = _persist_adata_in_memory(adata[idxs, :].copy())
-            if isinstance(self._group, zarr.Group):
-                write_sharded(
-                    self._group,
-                    adata,
-                    sparse_chunk_size=zarr_sparse_chunk_size,
-                    sparse_shard_size=zarr_sparse_shard_size,
-                    dense_chunk_size=min(adata.shape[0], zarr_dense_chunk_size),
-                    dense_shard_size=min(adata.shape[0], zarr_dense_shard_size),
-                    compressors=zarr_compressor,
-                    key=dataset,
-                )
-            else:
-                ad.io.write_h5ad(
-                    self._group / f"{dataset}.h5ad",
-                    adata,
-                    dataset_kwargs={"compression": h5ad_compressor},
-                )
-
-
-def _normalize_groupby(groupby: str | Iterable[str]) -> list[str]:
-    keys = [groupby] if isinstance(groupby, str) else list(groupby)
-    if len(keys) == 0:
-        raise ValueError("`groupby` must contain at least one obs column name.")
-    if len(set(keys)) != len(keys):
-        raise ValueError("`groupby` must not contain duplicate column names.")
-    return keys
-
-
-def _normalize_group_values(values: tuple[object, ...]) -> tuple[str, ...]:
-    return tuple("<NA>" if pd.isna(v) else str(v) for v in values)
+            self._write_adata(
+                adata,
+                key=dataset,
+                zarr_sparse_chunk_size=zarr_sparse_chunk_size,
+                zarr_sparse_shard_size=zarr_sparse_shard_size,
+                zarr_dense_chunk_size=zarr_dense_chunk_size,
+                zarr_dense_shard_size=zarr_dense_shard_size,
+                zarr_compressor=zarr_compressor,
+                h5ad_compressor=h5ad_compressor,
+            )
 
 
 def _group_obs_rows(
@@ -718,70 +732,32 @@ def _group_obs_rows(
     shuffle_within_group: bool,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    grouped_obs = obs[groupby]
-    grouped_indices = grouped_obs.groupby(groupby, dropna=False, sort=True, observed=False).indices
+    """Reorder observation indices so that rows are contiguous by group, and return a group index."""
+    grouped_indices = obs[groupby].groupby(groupby, dropna=False, sort=True, observed=False).indices
     ordered_positions: list[np.ndarray] = []
-    starts: list[int] = []
-    stops: list[int] = []
-    counts: list[int] = []
-    key_values_by_column: dict[str, list[str]] = {k: [] for k in groupby}
-    offset = 0
+    key_rows: list[tuple[str, ...]] = []
     for key, positions in grouped_indices.items():
         key_tuple = key if isinstance(key, tuple) else (key,)
-        normalized = _normalize_group_values(key_tuple)
-        for key_name, value in zip(groupby, normalized, strict=True):
-            key_values_by_column[key_name].append(value)
-
-        group_positions = np.asarray(positions, dtype=np.int64)
+        key_rows.append(tuple("<NA>" if pd.isna(v) else str(v) for v in key_tuple))
+        pos = np.asarray(positions, dtype=np.int64)
         if shuffle_within_group:
-            group_positions = group_positions[rng.permutation(group_positions.shape[0])]
-        ordered_positions.append(group_positions)
-        starts.append(offset)
-        offset += group_positions.shape[0]
-        stops.append(offset)
-        counts.append(group_positions.shape[0])
+            pos = pos[rng.permutation(pos.shape[0])]
+        ordered_positions.append(pos)
 
+    counts = np.asarray([p.shape[0] for p in ordered_positions], dtype=np.int64)
+    stops = np.cumsum(counts)
+    starts = stops - counts
     group_index = pd.DataFrame(
-        {
-            **key_values_by_column,
-            "start": np.asarray(starts, dtype=np.int64),
-            "stop": np.asarray(stops, dtype=np.int64),
-            "count": np.asarray(counts, dtype=np.int64),
-        }
+        {col: [row[i] for row in key_rows] for i, col in enumerate(groupby)}
+        | {"start": starts, "stop": stops, "count": counts}
     )
     if len(ordered_positions) == 0:
         return np.array([], dtype=np.int64), group_index
     return np.concatenate(ordered_positions), group_index
 
 
-class GroupedCollection:
+class GroupedCollection(BaseCollection):
     """A grouped zarr collection organized by one or more obs columns."""
-
-    _group: zarr.Group
-
-    def __init__(self, group: zarr.Group | str | Path, *, mode: "a" | "r" | "r+" = "a"):
-        if isinstance(group, zarr.Group):
-            self._group = group
-        elif isinstance(group, str | Path):
-            if not str(group).endswith(".zarr"):
-                warnings.warn(
-                    f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
-                    stacklevel=2,
-                )
-            self._group = zarr.open_group(group, mode=mode)
-        else:
-            raise TypeError("Group must either be a zarr group or a path")
-
-    @property
-    def _dataset_keys(self) -> list[str]:
-        return sorted(
-            [k for k in self._group.keys() if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None],
-            key=lambda x: int(x.split("_")[1]),
-        )
-
-    def __iter__(self) -> Generator[zarr.Group]:
-        for k in self._dataset_keys:
-            yield self._group[k]
 
     @property
     def is_empty(self) -> bool:
@@ -798,13 +774,11 @@ class GroupedCollection:
         groupby_keys = self._group.attrs.get("groupby_keys", [])
         return [str(v) for v in groupby_keys]
 
-    @classmethod
     @_with_settings
-    def from_adatas(
-        cls,
-        group: zarr.Group | str | Path,
-        *,
+    def add_adatas(
+        self,
         adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
+        *,
         groupby: str | Iterable[str],
         load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
         var_subset: Iterable[str] | None = None,
@@ -817,10 +791,13 @@ class GroupedCollection:
         shuffle_within_group: bool = True,
         random_seed: int | None = None,
     ) -> Self:
-        collection = cls(group)
-        if not collection.is_empty:
+        if not self.is_empty:
             raise RuntimeError("Cannot create a grouped collection at a non-empty location.")
-        groupby_keys = _normalize_groupby(groupby)
+        groupby_keys = [groupby] if isinstance(groupby, str) else list(groupby)
+        if len(groupby_keys) == 0:
+            raise ValueError("`groupby` must contain at least one obs column name.")
+        if len(set(groupby_keys)) != len(groupby_keys):
+            raise ValueError("`groupby` must not contain duplicate column names.")
 
         _check_for_mismatched_keys(adata_paths, load_adata=load_adata)
         adata_concat = _lazy_load_anndatas(adata_paths, load_adata=load_adata)
@@ -843,16 +820,15 @@ class GroupedCollection:
         for i, chunk in enumerate(tqdm(split_given_size(ordered_positions, n_obs_per_dataset), desc="processing chunks")):
             adata_chunk = adata_concat[chunk, :][:, var_mask].copy()
             adata_chunk = _persist_adata_in_memory(adata_chunk)
-            write_sharded(
-                collection._group,
+            self._write_adata(
                 adata_chunk,
-                sparse_chunk_size=zarr_sparse_chunk_size,
-                sparse_shard_size=zarr_sparse_shard_size,
-                dense_chunk_size=min(adata_chunk.shape[0], zarr_dense_chunk_size),
-                dense_shard_size=min(adata_chunk.shape[0], zarr_dense_shard_size),
-                compressors=zarr_compressor,
                 key=f"{DATASET_PREFIX}_{i}",
+                zarr_sparse_chunk_size=zarr_sparse_chunk_size,
+                zarr_sparse_shard_size=zarr_sparse_shard_size,
+                zarr_dense_chunk_size=zarr_dense_chunk_size,
+                zarr_dense_shard_size=zarr_dense_shard_size,
+                zarr_compressor=zarr_compressor,
             )
-        ad.io.write_elem(collection._group, GROUP_INDEX_KEY, group_index)
-        collection._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
-        return collection
+        ad.io.write_elem(self._group, GROUP_INDEX_KEY, group_index)
+        self._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
+        return self
