@@ -182,7 +182,7 @@ class ChunkSampler(Sampler):
         # Last request: may have fewer chunks and/or an incomplete last chunk
         final_starts = starts_per_request[-1]
         final_stops = stops_per_request[-1]
-        total_obs_in_last_batch = int((final_stops - final_starts).sum())
+        total_obs_in_last_batch = (final_stops - final_starts).sum()
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:

@@ -228,7 +228,7 @@ def _create_chunks_for_shuffling(
         rng.shuffle(idxs)
     match shuffle_n_obs_per_dataset is not None, n_chunkings is not None:
         case True, False:
-            n_slices_per_dataset = int(shuffle_n_obs_per_dataset // shuffle_chunk_size)
+            n_slices_per_dataset = shuffle_n_obs_per_dataset // shuffle_chunk_size
             use_single_chunking = n_obs <= shuffle_n_obs_per_dataset or n_slices_per_dataset <= 1
         case False, True:
             n_slices_per_dataset = (n_obs // n_chunkings) // shuffle_chunk_size
@@ -239,7 +239,7 @@ def _create_chunks_for_shuffling(
     if use_single_chunking:
         return [np.concatenate(idxs)]
     # unfortunately, this is the only way to prevent numpy.split from trying to np.array the idxs list, which can have uneven elements.
-    idxs = np.array([slice(int(idx[0]), int(idx[-1] + 1)) for idx in idxs])
+    idxs = np.array([slice(idx[0], idx[-1] + 1) for idx in idxs])
     return [
         np.concatenate([np.arange(s.start, s.stop) for s in idx])
         for idx in (

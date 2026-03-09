@@ -155,25 +155,25 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
-    total_rows = int((stops - starts).sum())
+    total_rows = (stops - starts).sum()
     ndim = len(shape)
     out = np.empty((total_rows, *shape[1:]), dtype=dtype)
 
     inner_row_size = inner_chunk_shape[0]
     shard_row_size = shard_shape[0]
-    inner_chunk_nbytes = int(np.prod(inner_chunk_shape)) * dtype.itemsize
-    row_nbytes = int(np.prod(shape[1:])) * dtype.itemsize if ndim > 1 else dtype.itemsize
+    inner_chunk_nbytes = np.prod(inner_chunk_shape) * dtype.itemsize
+    row_nbytes = np.prod(shape[1:]) * dtype.itemsize if ndim > 1 else dtype.itemsize
     ndim_extra = ndim - 1
     # Flat stride between consecutive axis-0 chunks in the shard index.
     # Index shape is (*chunks_per_shard, 2); axis-0 stride in the
     # flattened view = product(chunks_per_shard[1:]) * 2.
-    idx_stride = int(np.prod(chunks_per_shard[1:])) * 2 if ndim > 1 else 2
+    idx_stride = np.prod(chunks_per_shard[1:]) * 2 if ndim > 1 else 2
 
     cache = _MmapCache()
     try:
         out_offset = 0
         for i in range(len(starts)):
-            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            sel_start, sel_stop = starts[i], stops[i]
             row = sel_start
 
             while row < sel_stop:
@@ -219,8 +219,8 @@ def _dense_python_fallback(
         inner_end = inner_base + inner_row_size
 
         flat_idx = inner_idx * idx_stride
-        offset_val = int(idx_flat[flat_idx])
-        length_val = int(idx_flat[flat_idx + 1])
+        offset_val = idx_flat[flat_idx]
+        length_val = idx_flat[flat_idx + 1]
 
         take_start = max(row, inner_base) - inner_base
         take_end = min(sel_stop, inner_end) - inner_base
@@ -255,7 +255,7 @@ def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
-    total = int((stops - starts).sum())
+    total = (stops - starts).sum()
     out = np.empty(total, dtype=dtype)
 
     inner_size = inner_chunk_shape[0]
@@ -267,7 +267,7 @@ def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     try:
         out_offset = 0
         for i in range(len(starts)):
-            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            sel_start, sel_stop = starts[i], stops[i]
             pos = sel_start
 
             while pos < sel_stop:
@@ -308,8 +308,8 @@ def _1d_python_fallback(
         inner_base = shard_base + inner_idx * inner_size
         inner_end = inner_base + inner_size
 
-        offset_val = int(shard_index[(inner_idx, 0)])
-        length_val = int(shard_index[(inner_idx, 1)])
+        offset_val = shard_index[(inner_idx, 0)]
+        length_val = shard_index[(inner_idx, 1)]
 
         take_start = max(pos, inner_base) - inner_base
         take_end = min(sel_stop, inner_end) - inner_base

@@ -518,21 +518,21 @@ class Loader[
         ds_starts = np.array([iv.left for iv in self._dataset_intervals])
         ds_ends = np.array([iv.right for iv in self._dataset_intervals])
 
-        result_s: defaultdict[int, list[int]] = defaultdict(list)
-        result_e: defaultdict[int, list[int]] = defaultdict(list)
+        result_s: defaultdict = defaultdict(list)
+        result_e: defaultdict = defaultdict(list)
         for ci in range(len(chunk_starts)):
-            c_start, c_stop = int(chunk_starts[ci]), int(chunk_stops[ci])
+            c_start, c_stop = chunk_starts[ci], chunk_stops[ci]
             overlapping = np.flatnonzero((ds_starts < c_stop) & (ds_ends > c_start))
             for di in overlapping:
-                a_start, a_end = int(ds_starts[di]), int(ds_ends[di])
+                a_start, a_end = ds_starts[di], ds_ends[di]
                 s = max(c_start, a_start)
                 e = min(c_stop, a_end)
                 if use_original_space:
-                    result_s[int(di)].append(s)
-                    result_e[int(di)].append(e)
+                    result_s[di].append(s)
+                    result_e[di].append(e)
                 else:
-                    result_s[int(di)].append(s - a_start)
-                    result_e[int(di)].append(e - a_start)
+                    result_s[di].append(s - a_start)
+                    result_e[di].append(e - a_start)
 
         out: OrderedDict[int, np.ndarray] = OrderedDict()
         for k in sorted(result_s.keys()):
@@ -642,11 +642,11 @@ class Loader[
         indptr, indices, data = dataset
         starts, stops = boundaries[::2], boundaries[1::2]
         n = len(starts)
-        indptr_indices = [indptr[int(s):int(e) + 1] for s, e in zip(starts, stops, strict=True)]
+        indptr_indices = [indptr[s:e + 1] for s, e in zip(starts, stops, strict=True)]
 
         # Build an interleaved boundaries array for the 1-D data/indices arrays
-        ip_starts = np.array([int(ip[0]) for ip in indptr_indices])
-        ip_stops = np.array([int(ip[-1]) for ip in indptr_indices])
+        ip_starts = np.array([ip[0] for ip in indptr_indices])
+        ip_stops = np.array([ip[-1] for ip in indptr_indices])
         ip_boundaries = np.empty(2 * n, dtype=np.intp)
         ip_boundaries[::2] = ip_starts
         ip_boundaries[1::2] = ip_stops
@@ -659,8 +659,8 @@ class Loader[
             indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
         )
 
-        gaps = (int(ip_starts[i + 1]) - int(ip_stops[i]) for i in range(n - 1))
-        offsets = accumulate(chain([int(ip_starts[0])], gaps))
+        gaps = (ip_starts[i + 1] - ip_stops[i] for i in range(n - 1))
+        offsets = accumulate(chain([ip_starts[0]], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
         if n < 2:
             return CSRContainer(
@@ -735,10 +735,10 @@ class Loader[
 
         starts, stops = boundaries[::2], boundaries[1::2]
         n = len(starts)
-        indptr_indices = [indptr[int(s):int(e) + 1] for s, e in zip(starts, stops, strict=True)]
+        indptr_indices = [indptr[s:e + 1] for s, e in zip(starts, stops, strict=True)]
 
-        ip_starts = np.array([int(ip[0]) for ip in indptr_indices])
-        ip_stops = np.array([int(ip[-1]) for ip in indptr_indices])
+        ip_starts = np.array([ip[0] for ip in indptr_indices])
+        ip_stops = np.array([ip[-1] for ip in indptr_indices])
         ip_bounds = np.empty(2 * n, dtype=np.intp)
         ip_bounds[::2] = ip_starts
         ip_bounds[1::2] = ip_stops
@@ -746,8 +746,8 @@ class Loader[
         data_np = read_direct_1d(data_arr, ip_bounds)
         indices_np = read_direct_1d(indices_arr, ip_bounds)
 
-        gaps = (int(ip_starts[i + 1]) - int(ip_stops[i]) for i in range(n - 1))
-        offsets = accumulate(chain([int(ip_starts[0])], gaps))
+        gaps = (ip_starts[i + 1] - ip_stops[i] for i in range(n - 1))
+        offsets = accumulate(chain([ip_starts[0]], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
         if n < 2:
             return CSRContainer(
@@ -996,7 +996,7 @@ class Loader[
     @staticmethod
     def _interval_indexer_from_boundaries(boundaries_iter: Iterable[np.ndarray]) -> pd.IntervalIndex:
         """Build an IntervalIndex from per-dataset interleaved boundary arrays."""
-        totals = [int((b[1::2] - b[::2]).sum()) for b in boundaries_iter]
+        totals = [(b[1::2] - b[::2]).sum() for b in boundaries_iter]
         ends = list(accumulate(totals))
         starts = [0] + ends[:-1]
         return pd.IntervalIndex.from_arrays(starts, ends, closed="left")

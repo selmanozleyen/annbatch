@@ -62,7 +62,7 @@ def load_request_total_obs(lr: LoadRequest) -> int:
 def _multi_arange(starts: np.ndarray, stops: np.ndarray) -> np.ndarray:
     """Vectorized multi-range: equivalent to np.concatenate([np.arange(a,b) for a,b in zip(starts,stops)])."""
     lengths = stops - starts
-    total = int(lengths.sum())
+    total = lengths.sum()
     if total == 0:
         return np.empty(0, dtype=starts.dtype)
     ones = np.ones(total, dtype=starts.dtype)

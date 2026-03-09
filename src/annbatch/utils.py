@@ -105,7 +105,7 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
         dimension.
         """
         starts, stops = boundaries[::2], boundaries[1::2]
-        total_rows = int((stops - starts).sum())
+        total_rows = (stops - starts).sum()
         inst = cls.__new__(cls)
         inst._boundaries = boundaries
         inst._arr_shape = shape
@@ -169,8 +169,8 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
         out_offset = 0
 
         for i in range(0, len(boundaries), 2):
-            sel_start = int(boundaries[i])
-            sel_stop = int(boundaries[i + 1])
+            sel_start = boundaries[i]
+            sel_stop = boundaries[i + 1]
             if sel_start >= sel_stop:
                 continue
 
