@@ -16,13 +16,20 @@ from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
 from annbatch.samplers import ChunkSampler
-from annbatch.types import BackingArray_T, InputInMemoryArray_T, LoaderOutput, OutputInMemoryArray_T
+from annbatch.types import (
+    BackingArray_T,
+    InputInMemoryArray_T,
+    LoadRequest,
+    LoaderOutput,
+    OutputInMemoryArray_T,
+    _multi_arange,
+    load_request_stops,
+)
 from annbatch.utils import (
     CSRContainer,
     MultiBasicIndexer,
     check_lt_1,
     check_var_shapes,
-    interval_indexer_from_slices,
     load_x_and_obs_and_var,
     to_torch,
     validate_sampler,
@@ -31,7 +38,7 @@ from annbatch.utils import (
 from .compat import IterableDataset
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from types import ModuleType
 
     from annbatch.abc import Sampler
@@ -480,86 +487,73 @@ class Loader[
         ends = cumsum
         self._dataset_intervals = pd.IntervalIndex.from_arrays(starts, ends, closed="left")
 
-    def _get_relative_obs_indices(self, index: slice, *, use_original_space: bool = False) -> list[tuple[slice, int]]:
-        """Generate a slice relative to a dataset given a global slice index over all datasets.
+    def _load_request_to_dataset_boundaries(
+        self, lr: LoadRequest, *, use_original_space: bool = False
+    ) -> OrderedDict[int, np.ndarray]:
+        """Map a LoadRequest to per-dataset boundary arrays.
 
-        For a given slice indexer of axis 0, return a new slice relative to the on-disk
-        data it represents given the number of total observations as well as the index of
-        the underlying data on disk from the argument `sparse_datasets` to the initializer.
+        Each value is a flat interleaved 1-D int array
+        ``[s0, e0, s1, e1, ...]`` of length ``2 * n_chunks``.
+        Starts are ``arr[::2]``, stops are ``arr[1::2]`` -- zero-copy views,
+        no ``slice`` objects created.
 
-        For example, given slice index (10, 15), for 4 datasets each with size 5 on axis zero,
-        this function returns ((0,5), 2) representing slice (0,5) along axis zero of sparse dataset 2.
-
-        Parameters
-        ----------
-            index
-                The queried slice.
-            use_original_space
-                Whether the slices should be reindexed against the anndata objects.
-
-        Returns
-        -------
-            A slice relative to the dataset it represents as well as the index of said dataset in `sparse_datasets`.
+        For the single-dataset fast path (the common case), all interval
+        overlap checks are skipped entirely.
         """
         if self._dataset_intervals is None:
-            return []
+            return OrderedDict()
 
-        min_idx = index.start
-        max_idx = index.stop
+        chunk_starts = lr["starts"]
+        chunk_stops = load_request_stops(lr)
 
-        slices = []
-        overlapping_mask = self._dataset_intervals.overlaps(pd.Interval(min_idx, max_idx, closed="left"))
-        for (array_start, array_end), dataset_idx in zip(
-            self._dataset_intervals[overlapping_mask].to_tuples(), np.flatnonzero(overlapping_mask), strict=True
-        ):
-            start = max(min_idx, array_start)
-            stop = min(max_idx, array_end)
-            if use_original_space:
-                slices.append((slice(start, stop), dataset_idx))
-            else:
-                relative_start = start - array_start
-                relative_stop = stop - array_start
-                slices.append((slice(relative_start, relative_stop), dataset_idx))
-        return slices
+        # Fast path: single dataset -- every chunk belongs to dataset 0
+        if len(self._shapes) == 1:
+            interleaved = np.empty(2 * len(chunk_starts), dtype=np.intp)
+            interleaved[::2] = chunk_starts
+            interleaved[1::2] = chunk_stops
+            return OrderedDict([(0, interleaved)])
 
-    def _slices_to_slices_with_array_index(
-        self, slices: list[slice], *, use_original_space: bool = False
-    ) -> OrderedDict[int, list[slice]]:
-        """Given a list of slices, give the lookup between on-disk datasets and slices relative to that dataset.
+        # Multi-dataset path
+        ds_starts = np.array([iv.left for iv in self._dataset_intervals])
+        ds_ends = np.array([iv.right for iv in self._dataset_intervals])
 
-        In the codebase we use slice and chunk interchangeably. Not to be confused with the zarr chunking/sharding terminology.
+        result_s: defaultdict[int, list[int]] = defaultdict(list)
+        result_e: defaultdict[int, list[int]] = defaultdict(list)
+        for ci in range(len(chunk_starts)):
+            c_start, c_stop = int(chunk_starts[ci]), int(chunk_stops[ci])
+            overlapping = np.flatnonzero((ds_starts < c_stop) & (ds_ends > c_start))
+            for di in overlapping:
+                a_start, a_end = int(ds_starts[di]), int(ds_ends[di])
+                s = max(c_start, a_start)
+                e = min(c_stop, a_end)
+                if use_original_space:
+                    result_s[int(di)].append(s)
+                    result_e[int(di)].append(e)
+                else:
+                    result_s[int(di)].append(s - a_start)
+                    result_e[int(di)].append(e - a_start)
 
-        Parameters
-        ----------
-            slices
-                Slices to relative to the on-disk datasets.
-            use_original_space
-                Whether the slices should be reindexed against the anndata objects.
-
-        Returns
-        -------
-            A lookup between the dataset and its indexing slices, ordered by keys.
-        """
-        dataset_index_to_slices: defaultdict[int, list[slice]] = defaultdict(list)
-        for slice_ in slices:
-            for relative_obs_indices in self._get_relative_obs_indices(slice_, use_original_space=use_original_space):
-                dataset_index_to_slices[relative_obs_indices[1]] += [relative_obs_indices[0]]
-        keys = sorted(dataset_index_to_slices.keys())
-        dataset_index_to_slices_sorted = OrderedDict()
-        for k in keys:
-            dataset_index_to_slices_sorted[k] = dataset_index_to_slices[k]
-        return dataset_index_to_slices_sorted
+        out: OrderedDict[int, np.ndarray] = OrderedDict()
+        for k in sorted(result_s.keys()):
+            sa = np.array(result_s[k])
+            ea = np.array(result_e[k])
+            interleaved = np.empty(2 * len(sa), dtype=np.intp)
+            interleaved[::2] = sa
+            interleaved[1::2] = ea
+            out[k] = interleaved
+        return out
 
     @singledispatchmethod
-    async def _fetch_data(self, dataset: ZarrArray | CSRDatasetElems, slices: list[slice]) -> InputInMemoryArray:
+    async def _fetch_data(self, dataset: ZarrArray | CSRDatasetElems, boundaries: np.ndarray) -> InputInMemoryArray:
         """Fetch data from an on-disk store.
 
         Parameters
         ----------
         dataset
             The underlying store.
-        slices
-            The slices to fetch
+        boundaries
+            1-D int array of length ``n_chunks + 1``.
+            ``slice`` objects are built only at the zarr API call site.
 
         Returns
         -------
@@ -573,16 +567,9 @@ class Loader[
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
     @_fetch_data.register
-    async def _fetch_data_dense(self, dataset: ZarrArray, slices: list[slice]) -> np.ndarray:
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer(
-                    (s, Ellipsis),
-                    shape=dataset.metadata.shape,
-                    chunk_grid=dataset.metadata.chunk_grid,
-                )
-                for s in slices
-            ]
+    async def _fetch_data_dense(self, dataset: ZarrArray, boundaries: np.ndarray) -> np.ndarray:
+        indexer = MultiBasicIndexer.from_boundaries(
+            boundaries, dataset.metadata.shape, dataset.metadata.chunk_grid
         )
         res = cast(
             "np.ndarray",
@@ -648,17 +635,17 @@ class Loader[
     async def _fetch_data_sparse(
         self,
         dataset: CSRDatasetElems,
-        slices: list[slice],
+        boundaries: np.ndarray,
     ) -> CSRContainer:
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
-        # for the inspiration of this function.
         indptr, indices, data = dataset
-        indptr_indices = [indptr[slice(s.start, s.stop + 1)] for s in slices]
-        indptr_limits = [slice(i[0], i[-1]) for i in indptr_indices]
+        starts, stops = boundaries[::2], boundaries[1::2]
+        indptr_indices = [indptr[int(s):int(e) + 1] for s, e in zip(starts, stops, strict=True)]
+        indptr_limits = [slice(int(ip[0]), int(ip[-1])) for ip in indptr_indices]
         indexer = MultiBasicIndexer(
             [
-                zarr.core.indexing.BasicIndexer((l,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
-                for l in indptr_limits
+                zarr.core.indexing.BasicIndexer((lim,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
+                for lim in indptr_limits
             ]
         )
         data_np, indices_np = await asyncio.gather(
@@ -668,7 +655,7 @@ class Loader[
         gaps = (s1.start - s0.stop for s0, s1 in pairwise(indptr_limits))
         offsets = accumulate(chain([indptr_limits[0].start], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
-        if len(slices) < 2:  # there is only one slice so no need to concatenate
+        if len(starts) < 2:
             return CSRContainer(
                 elems=(data_np, indices_np, start_indptr),
                 shape=(start_indptr.shape[0] - 1, self.n_var),
@@ -684,25 +671,24 @@ class Loader[
 
     async def _index_datasets(
         self,
-        dataset_index_to_slices: OrderedDict[int, list[slice]],
+        dataset_boundaries: OrderedDict[int, np.ndarray],
     ) -> list[InputInMemoryArray]:
-        """Helper function meant to encapsulate asynchronous calls so that we can use the same event loop as zarr.
+        """Fetch data from each dataset using boundary arrays.
 
         Parameters
         ----------
-            dataset_index_to_slices
-                A lookup of the list-placement index of a dataset to the request slices.
-            fetch_data
-                The function to do the fetching for a given slice-dataset index pair.
+            dataset_boundaries
+                Mapping from dataset index to a boundaries array (length
+                ``n_chunks + 1``).
         """
         tasks = []
         if is_sparse := issubclass(self.dataset_type, ad.abc.CSRDataset):
             await self._ensure_sparse_cache()
-        for dataset_idx in dataset_index_to_slices.keys():
+        for dataset_idx, boundaries in dataset_boundaries.items():
             tasks.append(
                 self._fetch_data(
                     self._get_elem_from_cache(dataset_idx) if is_sparse else self._train_datasets[dataset_idx],
-                    dataset_index_to_slices[dataset_idx],
+                    boundaries,
                 )
             )
         return await asyncio.gather(*tasks)
@@ -725,16 +711,12 @@ class Loader[
         )
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
         for load_request in self._batch_sampler.sample(self.n_obs):
-            chunks_to_load = load_request["chunks"]
             splits = load_request["splits"]
-            # Sampler yields a list of slices that sum to batch_size
-            dataset_index_to_slices = self._slices_to_slices_with_array_index(chunks_to_load, use_original_space=False)
-            # Fetch the data over slices
-            chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(dataset_index_to_slices))
+            ds_boundaries = self._load_request_to_dataset_boundaries(load_request, use_original_space=False)
+            chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(ds_boundaries))
             in_memory_data = self._accumulate_chunks(chunks)
-            # Accumulate labels and indices if possible
-            concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_slices)
-            in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(chunks_to_load)
+            concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(load_request, ds_boundaries)
+            in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(load_request)
             if self._concat_strategy == "concat-shuffle":
                 in_memory_data = mod.vstack(in_memory_data)
                 for split in splits:
@@ -746,15 +728,11 @@ class Loader[
                         "index": in_memory_indices[split] if in_memory_indices is not None else None,
                     }
             elif self._concat_strategy == "shuffle-concat":
-                # An IntervalIndexer with start-stop bounds of each chunk's dataset
-                dataset_interval_indexer = interval_indexer_from_slices(dataset_index_to_slices.values())
+                dataset_interval_indexer = self._interval_indexer_from_boundaries(ds_boundaries.values())
                 for split in splits:
                     sorted_split = np.sort(split)
-                    # Get the index of the dataset for the given split relative to the in-memory data
                     dataset_locs = dataset_interval_indexer.get_indexer_for(sorted_split)
-                    # Get the left bound of that dataset relative to the in-memory data
                     offsets = dataset_interval_indexer.left[dataset_locs]
-                    # Stack the chunks in dataset order, offseting each split by its dataset's leftmost in-memory bound
                     data = mod.vstack(
                         [
                             chunk[sorted_split[dataset_locs == i] - offsets[dataset_locs == i]]
@@ -775,6 +753,14 @@ class Loader[
             if self._preload_to_gpu and issubclass(self.dataset_type, ad.abc.CSRDataset):
                 self._np_module.get_default_memory_pool().free_all_blocks()
 
+    @staticmethod
+    def _interval_indexer_from_boundaries(boundaries_iter: Iterable[np.ndarray]) -> pd.IntervalIndex:
+        """Build an IntervalIndex from per-dataset interleaved boundary arrays."""
+        totals = [int((b[1::2] - b[::2]).sum()) for b in boundaries_iter]
+        ends = list(accumulate(totals))
+        starts = [0] + ends[:-1]
+        return pd.IntervalIndex.from_arrays(starts, ends, closed="left")
+
     def _accumulate_chunks(self, chunks: list[InputInMemoryArray]) -> list[OutputInMemoryArray_T]:
         """Convert fetched chunks to output array format (CSR or ndarray)."""
         result: list[OutputInMemoryArray_T] = []
@@ -791,25 +777,32 @@ class Loader[
                 result.append(self._np_module.asarray(chunk))
         return result
 
-    def _maybe_accumulate_obs(self, dataset_index_to_slices: OrderedDict[int, list[slice]]) -> pd.DataFrame | None:
-        """Gather obs labels for the loaded slices if possible."""
+    def _maybe_accumulate_obs(
+        self, lr: LoadRequest, ds_boundaries: OrderedDict[int, np.ndarray]
+    ) -> pd.DataFrame | None:
+        """Gather obs labels for the loaded chunks."""
         if self._obs is None:
             return None
+        if len(self._shapes) == 1:
+            starts = lr["starts"]
+            stops = load_request_stops(lr)
+            return self._obs[0].iloc[_multi_arange(starts, stops)]
         return pd.concat(
             [
-                self._obs[idx].iloc[np.concatenate([np.arange(s.start, s.stop) for s in slices])]
-                for idx, slices in dataset_index_to_slices.items()
+                self._obs[idx].iloc[_multi_arange(b[::2], b[1::2])]
+                for idx, b in ds_boundaries.items()
             ]
         )
 
-    def _maybe_accumulate_indices(self, slices: list[slice]) -> np.ndarray | None:
-        """Gather original indices for the loaded slices if possible."""
+    def _maybe_accumulate_indices(self, lr: LoadRequest) -> np.ndarray | None:
+        """Gather original indices for the loaded chunks."""
         if self._return_index is False:
             return None
-        dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=True)
+        if len(self._shapes) == 1:
+            starts = lr["starts"]
+            stops = load_request_stops(lr)
+            return _multi_arange(starts, stops)
+        ds_boundaries = self._load_request_to_dataset_boundaries(lr, use_original_space=True)
         return np.concatenate(
-            [
-                np.concatenate([np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]])
-                for idx in dataset_index_to_slices
-            ]
+            [_multi_arange(b[::2], b[1::2]) for b in ds_boundaries.values()]
         )

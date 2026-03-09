@@ -12,6 +12,7 @@ import pytest
 from annbatch import ChunkSampler, ChunkSamplerWithReplacement
 from annbatch.abc import Sampler
 from annbatch.samplers._utils import WorkerInfo
+from annbatch.types import load_request_to_slices
 
 
 def collect_indices(sampler: Sampler, n_obs: int) -> list[int]:
@@ -20,7 +21,7 @@ def collect_indices(sampler: Sampler, n_obs: int) -> list[int]:
     for load_request in sampler.sample(n_obs):
         assert len(load_request["splits"]) > 0, "splits must be non-empty"
         assert all(len(s) > 0 for s in load_request["splits"]), "splits must be non-empty"
-        for s in load_request["chunks"]:
+        for s in load_request_to_slices(load_request):
             indices.extend(range(s.start, s.stop))
     return indices
 
@@ -117,18 +118,15 @@ def test_batch_sizes_match_expected_pattern():
     all_requests = list(sampler.sample(n_obs))
     assert len(all_requests) == expected_num_load_requests
     for req_idx, load_request in enumerate(all_requests[:-1]):
-        assert all(chunk.stop - chunk.start == chunk_size for chunk in load_request["chunks"]), (
-            f"chunk size mismatch at request {req_idx}:",
-            f"chunks: {load_request['chunks']}",
-        )
+        assert load_request["chunk_size"] == chunk_size, f"chunk_size mismatch at request {req_idx}"
+        assert load_request["remainder"] == 0, f"unexpected remainder at request {req_idx}"
         assert all(len(split) == batch_size for split in load_request["splits"]), (
             f"batch size mismatch at request {req_idx}:splits: {load_request['splits']}"
         )
     last_request = all_requests[-1]
     assert len(last_request["splits"]) == expected_last_num_splits, "last request num splits mismatch"
-    assert all(chunk.stop - chunk.start == expected_last_chunk_size for chunk in last_request["chunks"]), (
-        "last request chunk size mismatch",
-        f"chunks: {last_request['chunks']}",
+    assert last_request["remainder"] == expected_last_chunk_size, (
+        f"last request remainder mismatch: {last_request['remainder']} != {expected_last_chunk_size}"
     )
     assert all(len(split) == expected_last_batch_size for split in last_request["splits"]), (
         "last request batch size mismatch",
@@ -296,11 +294,13 @@ def test_replacement_invariants(
     )
     count = 0
     for load_request in sampler.sample(n_obs):
-        assert len(load_request["chunks"]) > 0, "Load request must have at least one chunk"
-        for chunk in load_request["chunks"]:
-            assert chunk.stop - chunk.start == chunk_size, f"Non-uniform chunk: {chunk}"
-            assert chunk.start >= start, f"Chunk start {chunk.start} < mask start {start}"
-            assert chunk.stop <= stop, f"Chunk stop {chunk.stop} > mask stop {stop}"
+        lr_starts = load_request["starts"]
+        assert len(lr_starts) > 0, "Load request must have at least one chunk"
+        assert load_request["chunk_size"] == chunk_size, "chunk_size mismatch"
+        assert load_request["remainder"] == 0, "replacement sampler should have no remainder"
+        for s in lr_starts:
+            assert int(s) >= start, f"Chunk start {s} < mask start {start}"
+            assert int(s) + chunk_size <= stop, f"Chunk stop {int(s) + chunk_size} > mask stop {stop}"
         count += len(load_request["splits"])
     assert count == n_iters, f"Expected {n_iters} batches, got {count}"
 
@@ -421,19 +421,27 @@ class SimpleSampler(Sampler):
     def _sample(self, n_obs: int):
         """Yield LoadRequests with or without splits."""
         chunk_size = 10
-        chunks = []
+        all_starts = []
+        remainder = n_obs % chunk_size
         for start in range(0, n_obs, chunk_size):
             stop = min(start + chunk_size, n_obs)
             if self._provide_splits:
-                # Yield one LoadRequest per chunk with splits
-                yield {"chunks": [slice(start, stop)], "splits": [np.arange(stop - start)]}
+                r = (stop - start) if (stop - start) < chunk_size else 0
+                yield {
+                    "chunk_size": chunk_size,
+                    "starts": np.array([start]),
+                    "remainder": r,
+                    "splits": [np.arange(stop - start)],
+                }
             else:
-                # Accumulate chunks
-                chunks.append(slice(start, stop))
+                all_starts.append(start)
 
-        # Yield accumulated chunks without splits
         if not self._provide_splits:
-            yield {"chunks": chunks}
+            yield {
+                "chunk_size": chunk_size,
+                "starts": np.array(all_starts),
+                "remainder": remainder,
+            }
 
 
 @pytest.mark.parametrize(

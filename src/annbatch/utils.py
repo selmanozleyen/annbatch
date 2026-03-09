@@ -84,21 +84,70 @@ class CSRContainer:
 # or make this an "experimental setting" and to use integer indexing for the zarr-python pipeline.
 # See: https://github.com/zarr-developers/zarr-python/issues/3175 for why this is better than simpler alternatives.
 class MultiBasicIndexer(zarr.core.indexing.Indexer):
-    """Custom indexer to enable joint fetching of disparate slices"""
+    """Custom indexer to enable joint fetching of disparate slices.
+
+    Two construction modes:
+
+    1. ``MultiBasicIndexer(indexers)`` -- list of pre-built indexers
+       (used by the sparse path where indptr-derived slices are irregular).
+    2. ``MultiBasicIndexer.from_boundaries(boundaries, shape, chunk_grid)``
+       -- accepts the interleaved boundaries array directly and builds
+       ``BasicIndexer`` objects lazily during iteration so that no
+       ``slice`` or ``BasicIndexer`` is allocated up-front in Python.
+    """
 
     def __init__(self, indexers: list[zarr.core.indexing.Indexer]):
         self.shape = (sum(i.shape[0] for i in indexers), *indexers[0].shape[1:])
         self.drop_axes = indexers[0].drop_axes  # maybe?
         self.indexers = indexers
+        self._boundaries = None
+
+    @classmethod
+    def from_boundaries(
+        cls,
+        boundaries: np.ndarray,
+        shape: tuple[int, ...],
+        chunk_grid: zarr.core.chunk_grids.ChunkGrid,
+    ) -> MultiBasicIndexer:
+        """Build from an interleaved ``[s0, e0, s1, e1, ...]`` array.
+
+        ``BasicIndexer`` objects are created lazily during ``__iter__``,
+        avoiding up-front allocation of ``slice`` + ``BasicIndexer`` per chunk.
+        """
+        starts, stops = boundaries[::2], boundaries[1::2]
+        total_rows = int((stops - starts).sum())
+        inst = cls.__new__(cls)
+        inst._boundaries = boundaries
+        inst._arr_shape = shape
+        inst._chunk_grid = chunk_grid
+        inst.shape = (total_rows, *shape[1:])
+        inst.drop_axes = ()
+        inst.indexers = None
+        return inst
 
     def __iter__(self):
         total = 0
-        for i in self.indexers:
-            for c in i:
-                out_selection = c[2]
-                gap = out_selection[0].stop - out_selection[0].start
-                yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
-                total += gap
+        if self._boundaries is not None:
+            boundaries = self._boundaries
+            arr_shape = self._arr_shape
+            chunk_grid = self._chunk_grid
+            for i in range(0, len(boundaries), 2):
+                s, e = int(boundaries[i]), int(boundaries[i + 1])
+                indexer = zarr.core.indexing.BasicIndexer(
+                    (slice(s, e), Ellipsis), shape=arr_shape, chunk_grid=chunk_grid
+                )
+                for c in indexer:
+                    out_selection = c[2]
+                    gap = out_selection[0].stop - out_selection[0].start
+                    yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
+                    total += gap
+        else:
+            for i in self.indexers:
+                for c in i:
+                    out_selection = c[2]
+                    gap = out_selection[0].stop - out_selection[0].start
+                    yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
+                    total += gap
 
 
 def _spawn_worker_rng(rng: np.random.Generator, worker_id: int) -> np.random.Generator:

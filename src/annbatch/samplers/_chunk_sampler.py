@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from annbatch.samplers._utils import WorkerInfo
     from annbatch.types import LoadRequest
 
+type _ChunkInfo = tuple[np.ndarray, int]
+
 
 class ChunkSampler(Sampler):
     """Chunk-based sampler for batched data access.
@@ -142,31 +144,50 @@ class ChunkSampler(Sampler):
         start, stop = self._resolve_start_stop(n_obs)
         worker_aware_rng = self._rng if worker_info is None else _spawn_worker_rng(self._rng, worker_info.id)
 
-        chunks = self._compute_chunks(start, stop, rng=self._rng)
-        yield from self._iter_from_chunks(chunks, batch_rng=worker_aware_rng, worker_info=worker_info)
+        chunk_info = self._compute_chunks(start, stop, rng=self._rng)
+        yield from self._iter_from_chunks(chunk_info, batch_rng=worker_aware_rng, worker_info=worker_info)
 
     def _iter_from_chunks(
         self,
-        chunks: list[slice],
+        chunk_info: _ChunkInfo,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
+        starts, remainder = chunk_info
         # Worker sharding: each worker gets a disjoint subset of chunks
         if worker_info is not None:
-            chunks = np.array_split(chunks, worker_info.num_workers)[worker_info.id]
-        # Set up the iterator for chunks and the batch indices for splits
-        chunks_per_request = split_given_size(chunks, self._preload_nchunks)
+            parts = np.array_split(np.arange(len(starts)), worker_info.num_workers)
+            worker_idx = parts[worker_info.id]
+            starts = starts[worker_idx]
+            # remainder only applies if this worker has the last chunk overall
+            if len(worker_idx) == 0 or worker_idx[-1] != len(chunk_info[0]) - 1:
+                remainder = 0
+
+        n_chunks = len(starts)
+        if n_chunks == 0:
+            return
+        # Split chunk starts into groups of preload_nchunks
+        starts_per_request = split_given_size(starts, self._preload_nchunks)
+
         batch_indices = np.arange(self._in_memory_size)
         split_batch_indices = split_given_size(batch_indices, self.batch_size)
-        for request_chunks in chunks_per_request[:-1]:
+        for request_starts in starts_per_request[:-1]:
             if self.shuffle:
-                # Avoid copies using in-place shuffling since `self.shuffle` should not change mid-training
                 batch_rng.shuffle(batch_indices)
                 split_batch_indices = split_given_size(batch_indices, self.batch_size)
-            yield {"chunks": request_chunks, "splits": split_batch_indices}
-        # On the last yield, drop the last uneven batch and create new batch_indices since the in-memory size of this last yield could be divisible by batch_size but smaller than preload_nslices * slice_size
-        final_chunks = chunks_per_request[-1]
-        total_obs_in_last_batch = int(sum(s.stop - s.start for s in final_chunks))
+            yield {
+                "chunk_size": self._chunk_size,
+                "starts": request_starts,
+                "remainder": 0,
+                "splits": split_batch_indices,
+            }
+        # Last request: may have fewer chunks and/or an incomplete last chunk
+        final_starts = starts_per_request[-1]
+        n_final = len(final_starts)
+        if remainder > 0:
+            total_obs_in_last_batch = (n_final - 1) * self._chunk_size + remainder
+        else:
+            total_obs_in_last_batch = n_final * self._chunk_size
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:
@@ -175,27 +196,31 @@ class ChunkSampler(Sampler):
             total_obs_in_last_batch -= total_obs_in_last_batch % self.batch_size
         indices = batch_rng.permutation(total_obs_in_last_batch) if self.shuffle else np.arange(total_obs_in_last_batch)
         batch_indices = split_given_size(indices, self.batch_size)
-        yield {"chunks": final_chunks, "splits": batch_indices}
+        yield {
+            "chunk_size": self._chunk_size,
+            "starts": final_starts,
+            "remainder": remainder,
+            "splits": batch_indices,
+        }
 
-    def _compute_chunks(self, start: int, stop: int, rng: np.random.Generator) -> list[slice]:
-        """Compute chunks from start and stop indices.
+    def _compute_chunks(self, start: int, stop: int, rng: np.random.Generator) -> _ChunkInfo:
+        """Compute chunk start offsets and remainder from start and stop indices.
 
-        This function is used to compute the chunks for the data to load.
-        The chunks are computed such that the last chunk is the incomplete chunk if the total number of observations is not divisible by the chunk size.
-        Supposed to also work with shuffled chunk indices so that the last chunk computed isn't always the incomplete chunk.
+        The last chunk is the incomplete one if total observations is not
+        divisible by chunk_size. Shuffling reorders chunk indices so the
+        incomplete chunk is not always at the physical end.
         """
-        # Compute chunks directly from resolved mask range
-        # Create chunk indices for possible shuffling and worker sharding
         chunk_indices = np.arange(math.ceil((stop - start) / self._chunk_size))
         if self.shuffle:
             rng.shuffle(chunk_indices)
         n_chunks, pivot_index = len(chunk_indices), chunk_indices[-1]
+        remainder = (stop - start) % self._chunk_size
         offsets = np.ones(n_chunks + 1, dtype=int) * self._chunk_size
         offsets[0] = start
-        offsets[pivot_index + 1] = incomplete if (incomplete := (stop - start) % self._chunk_size) else self._chunk_size
+        offsets[pivot_index + 1] = remainder if remainder else self._chunk_size
         offsets = np.cumsum(offsets)
-        starts, stops = offsets[:-1][chunk_indices], offsets[1:][chunk_indices]
-        return [slice(int(s), int(e)) for s, e in zip(starts, stops, strict=True)]
+        chunk_starts = offsets[:-1][chunk_indices]
+        return chunk_starts, remainder
 
     def _resolve_start_stop(self, n_obs: int) -> tuple[int, int]:
         return self._mask.start or 0, self._mask.stop or n_obs
@@ -254,24 +279,26 @@ class ChunkSamplerWithReplacement(ChunkSampler):
     def n_iters(self, n_obs: int) -> int:
         return self._n_iters
 
-    def _compute_chunks(self, start: int, stop: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_chunks(self, start: int, stop: int, rng: np.random.Generator) -> _ChunkInfo:
         """Draw random contiguous chunks with replacement from the observation range."""
         # stop - start >= chunk_size is guaranteed by validate()
-        start_indices = rng.integers(
+        chunk_starts = rng.integers(
             start, stop - self._chunk_size + 1, size=math.ceil((self._n_iters * self.batch_size) / self._chunk_size)
         )
-        return [slice(int(s), int(s + self._chunk_size)) for s in start_indices]
+        return chunk_starts, 0
 
     def _iter_from_chunks(
-        self, chunks: list[slice], batch_rng: np.random.Generator, worker_info: WorkerInfo | None
+        self, chunk_info: _ChunkInfo, batch_rng: np.random.Generator, worker_info: WorkerInfo | None
     ) -> Iterator[LoadRequest]:
-        load_requests = super()._iter_from_chunks(chunks, batch_rng, worker_info)
+        load_requests = super()._iter_from_chunks(chunk_info, batch_rng, worker_info)
         batches_per_request = self._in_memory_size // self.batch_size
         n_full, tail = divmod(self._n_iters, batches_per_request)
         yield from itertools.islice(load_requests, n_full)
         if tail > 0:
             load_request = next(load_requests)
             yield {
-                "chunks": load_request["chunks"],
+                "chunk_size": load_request["chunk_size"],
+                "starts": load_request["starts"],
+                "remainder": load_request["remainder"],
                 "splits": load_request["splits"][:tail],
             }
