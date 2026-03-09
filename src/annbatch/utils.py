@@ -91,9 +91,9 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
     1. ``MultiBasicIndexer(indexers)`` -- list of pre-built indexers
        (used by the sparse path where indptr-derived slices are irregular).
     2. ``MultiBasicIndexer.from_boundaries(boundaries, shape, chunk_grid)``
-       -- accepts the interleaved boundaries array directly and builds
-       ``BasicIndexer`` objects lazily during iteration so that no
-       ``slice`` or ``BasicIndexer`` is allocated up-front in Python.
+       -- accepts the interleaved boundaries array and computes
+       ``ChunkProjection`` tuples directly in ``__iter__``, completely
+       bypassing ``BasicIndexer`` / ``SliceDimIndexer`` construction.
     """
 
     def __init__(self, indexers: list[zarr.core.indexing.Indexer]):
@@ -111,8 +111,10 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
     ) -> MultiBasicIndexer:
         """Build from an interleaved ``[s0, e0, s1, e1, ...]`` array.
 
-        ``BasicIndexer`` objects are created lazily during ``__iter__``,
-        avoiding up-front allocation of ``slice`` + ``BasicIndexer`` per chunk.
+        Iteration produces ``ChunkProjection`` tuples via direct arithmetic
+        on the chunk grid -- no ``slice``, ``BasicIndexer``, or
+        ``SliceDimIndexer`` objects are ever created for the axis-0
+        dimension.
         """
         starts, stops = boundaries[::2], boundaries[1::2]
         total_rows = int((stops - starts).sum())
@@ -128,19 +130,7 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
     def __iter__(self):
         total = 0
         if self._boundaries is not None:
-            boundaries = self._boundaries
-            arr_shape = self._arr_shape
-            chunk_grid = self._chunk_grid
-            for i in range(0, len(boundaries), 2):
-                s, e = int(boundaries[i]), int(boundaries[i + 1])
-                indexer = zarr.core.indexing.BasicIndexer(
-                    (slice(s, e), Ellipsis), shape=arr_shape, chunk_grid=chunk_grid
-                )
-                for c in indexer:
-                    out_selection = c[2]
-                    gap = out_selection[0].stop - out_selection[0].start
-                    yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
-                    total += gap
+            yield from self._iter_from_boundaries()
         else:
             for i in self.indexers:
                 for c in i:
@@ -148,6 +138,76 @@ class MultiBasicIndexer(zarr.core.indexing.Indexer):
                     gap = out_selection[0].stop - out_selection[0].start
                     yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
                     total += gap
+
+    def _iter_from_boundaries(self):
+        """Yield ChunkProjection tuples for axis-0 range accesses.
+
+        Reproduces the logic of SliceDimIndexer.__iter__ (step=1 only)
+        inlined into a tight loop over the interleaved boundaries array.
+        Remaining dimensions are assumed to be full-chunk (Ellipsis).
+        """
+        boundaries = self._boundaries
+        arr_shape = self._arr_shape
+        chunk_grid = self._chunk_grid
+
+        chunk_shape = zarr.core.indexing.get_chunk_shape(chunk_grid)
+        dim0_chunk_len = chunk_shape[0]
+        dim0_len = arr_shape[0]
+        ndim = len(arr_shape)
+
+        # Pre-build the "full dim" selections for dims 1..N-1
+        # (these are the same for every projection and reused)
+        if ndim > 1:
+            tail_chunk_coords = []
+            tail_chunk_sels = []
+            tail_out_sels = []
+            tail_is_complete = []
+            for d in range(1, ndim):
+                tail_chunk_coords.append(0)
+                tail_chunk_sels.append(slice(0, chunk_shape[d], 1))
+                tail_out_sels.append(slice(0, arr_shape[d]))
+                tail_is_complete.append(True)
+            tail_chunk_coords_t = tuple(tail_chunk_coords)
+            tail_chunk_sels_t = tuple(tail_chunk_sels)
+            tail_out_sels_t = tuple(tail_out_sels)
+            tail_all_complete = all(tail_is_complete)
+        else:
+            tail_chunk_coords_t = ()
+            tail_chunk_sels_t = ()
+            tail_out_sels_t = ()
+            tail_all_complete = True
+
+        CP = zarr.core.indexing.ChunkProjection
+        out_offset = 0
+
+        for i in range(0, len(boundaries), 2):
+            sel_start = int(boundaries[i])
+            sel_stop = int(boundaries[i + 1])
+            if sel_start >= sel_stop:
+                continue
+
+            cix_from = sel_start // dim0_chunk_len
+            cix_to = -(-sel_stop // dim0_chunk_len)  # ceildiv
+
+            for cix in range(cix_from, cix_to):
+                dim_offset = cix * dim0_chunk_len
+                dim_limit = min(dim0_len, dim_offset + dim0_chunk_len)
+
+                cs_start = max(sel_start - dim_offset, 0)
+                cs_stop = min(sel_stop - dim_offset, dim_limit - dim_offset)
+                nitems = cs_stop - cs_start
+                if nitems <= 0:
+                    continue
+
+                is_complete = cs_start == 0 and sel_stop >= dim_limit
+
+                yield CP(
+                    (cix, *tail_chunk_coords_t),
+                    (slice(cs_start, cs_stop, 1), *tail_chunk_sels_t),
+                    (slice(out_offset, out_offset + nitems), *tail_out_sels_t),
+                    is_complete and tail_all_complete,
+                )
+                out_offset += nitems
 
 
 def _spawn_worker_rng(rng: np.random.Generator, worker_id: int) -> np.random.Generator:

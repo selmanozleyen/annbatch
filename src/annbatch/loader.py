@@ -34,6 +34,7 @@ from annbatch.utils import (
     to_torch,
     validate_sampler,
 )
+from annbatch._direct_read import read_direct_dense, read_direct_1d
 
 from .compat import IterableDataset
 
@@ -217,6 +218,7 @@ class Loader[
         self._train_datasets = []
         self._shapes = []
         self._dataset_elem_cache = {}
+        self._direct_sparse_cache: dict = {}
         self._concat_strategy = concat_strategy
 
     def __len__(self) -> int:
@@ -640,22 +642,28 @@ class Loader[
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
         indptr, indices, data = dataset
         starts, stops = boundaries[::2], boundaries[1::2]
+        n = len(starts)
         indptr_indices = [indptr[int(s):int(e) + 1] for s, e in zip(starts, stops, strict=True)]
-        indptr_limits = [slice(int(ip[0]), int(ip[-1])) for ip in indptr_indices]
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer((lim,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
-                for lim in indptr_limits
-            ]
+
+        # Build an interleaved boundaries array for the 1-D data/indices arrays
+        ip_starts = np.array([int(ip[0]) for ip in indptr_indices])
+        ip_stops = np.array([int(ip[-1]) for ip in indptr_indices])
+        ip_boundaries = np.empty(2 * n, dtype=np.intp)
+        ip_boundaries[::2] = ip_starts
+        ip_boundaries[1::2] = ip_stops
+        indexer = MultiBasicIndexer.from_boundaries(
+            ip_boundaries, data.metadata.shape, data.metadata.chunk_grid
         )
+
         data_np, indices_np = await asyncio.gather(
             data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
             indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
         )
-        gaps = (s1.start - s0.stop for s0, s1 in pairwise(indptr_limits))
-        offsets = accumulate(chain([indptr_limits[0].start], gaps))
+
+        gaps = (int(ip_starts[i + 1]) - int(ip_stops[i]) for i in range(n - 1))
+        offsets = accumulate(chain([int(ip_starts[0])], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
-        if len(starts) < 2:
+        if n < 2:
             return CSRContainer(
                 elems=(data_np, indices_np, start_indptr),
                 shape=(start_indptr.shape[0] - 1, self.n_var),
@@ -693,6 +701,69 @@ class Loader[
             )
         return await asyncio.gather(*tasks)
 
+    def _index_datasets_direct(
+        self,
+        dataset_boundaries: OrderedDict[int, np.ndarray],
+    ) -> list[InputInMemoryArray]:
+        """Synchronous direct-read path for local sharded stores.
+
+        Uses mmap + C extension instead of zarr's async pipeline.
+        Works for both single and multiple datasets.
+        """
+        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        results: list[InputInMemoryArray] = []
+        for dataset_idx, boundaries in dataset_boundaries.items():
+            ds = self._train_datasets[dataset_idx]
+            if is_sparse:
+                results.append(self._fetch_direct_sparse(ds, boundaries))
+            else:
+                results.append(read_direct_dense(ds, boundaries))
+        return results
+
+    def _fetch_direct_sparse(
+        self,
+        dataset: ad.abc.CSRDataset,
+        boundaries: np.ndarray,
+    ) -> CSRContainer:
+        """Synchronous direct-read for a single sparse dataset."""
+        grp = dataset.group
+        if dataset not in self._direct_sparse_cache:
+            indptr = zarr.open(grp.store, path=grp.path + "/indptr")[:]
+            data_arr = zarr.open(grp.store, path=grp.path + "/data")
+            indices_arr = zarr.open(grp.store, path=grp.path + "/indices")
+            self._direct_sparse_cache[dataset] = (indptr, data_arr, indices_arr)
+        indptr, data_arr, indices_arr = self._direct_sparse_cache[dataset]
+
+        starts, stops = boundaries[::2], boundaries[1::2]
+        n = len(starts)
+        indptr_indices = [indptr[int(s):int(e) + 1] for s, e in zip(starts, stops, strict=True)]
+
+        ip_starts = np.array([int(ip[0]) for ip in indptr_indices])
+        ip_stops = np.array([int(ip[-1]) for ip in indptr_indices])
+        ip_bounds = np.empty(2 * n, dtype=np.intp)
+        ip_bounds[::2] = ip_starts
+        ip_bounds[1::2] = ip_stops
+
+        data_np = read_direct_1d(data_arr, ip_bounds)
+        indices_np = read_direct_1d(indices_arr, ip_bounds)
+
+        gaps = (int(ip_starts[i + 1]) - int(ip_stops[i]) for i in range(n - 1))
+        offsets = accumulate(chain([int(ip_starts[0])], gaps))
+        start_indptr = indptr_indices[0] - next(offsets)
+        if n < 2:
+            return CSRContainer(
+                elems=(data_np, indices_np, start_indptr),
+                shape=(start_indptr.shape[0] - 1, self.n_var),
+                dtype=data_np.dtype,
+            )
+        end_indptr = np.concatenate([s[1:] - o for s, o in zip(indptr_indices[1:], offsets, strict=True)])
+        indptr_np = np.concatenate([start_indptr, end_indptr])
+        return CSRContainer(
+            elems=(data_np, indices_np, indptr_np),
+            shape=(indptr_np.shape[0] - 1, self.n_var),
+            dtype=data_np.dtype,
+        )
+
     def __iter__(
         self,
     ) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
@@ -709,11 +780,181 @@ class Loader[
             [len(self._train_datasets), self.n_obs],
             ["Number of datasets", "Number of observations"],
         )
+        all_direct = all(self._can_direct_read(ds) for ds in self._train_datasets)
+        if len(self._shapes) == 1 and all_direct:
+            if isinstance(self._train_datasets[0], ZarrArray):
+                yield from self._iter_direct_dense()
+            else:
+                yield from self._iter_direct_sparse()
+        elif len(self._shapes) == 1 and isinstance(self._train_datasets[0], ZarrArray):
+            yield from self._iter_single_dense()
+        else:
+            yield from self._iter_generic(use_direct=all_direct)
+
+    @staticmethod
+    def _can_direct_read(dataset: BackingArray_T) -> bool:
+        """Check if the dataset is backed by a local sharded zarr store."""
+        try:
+            if isinstance(dataset, ZarrArray):
+                arr = dataset
+            else:
+                arr = dataset.group["data"]
+            store = arr.store
+            if not isinstance(store, zarr.storage.LocalStore):
+                return False
+            m = arr.metadata
+            if not m.codecs or not isinstance(m.codecs[0], zarr.codecs.sharding.ShardingCodec):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _iter_direct_dense(self) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
+        """Fastest path: single dense dataset on local sharded store.
+
+        Bypasses zarr's entire async pipeline -- reads shard files directly,
+        parses indices, decompresses with blosc synchronously.
+        """
+        dataset = self._train_datasets[0]
+        obs0 = self._obs[0] if self._obs is not None else None
+        var = self._var
+        has_obs = obs0 is not None
+        has_idx = self._return_index
+        do_torch = self._to_torch
+        gpu = self._preload_to_gpu
+
+        for load_request in self._batch_sampler.sample(self.n_obs):
+            starts = load_request["starts"]
+            stops = load_request_stops(load_request)
+            interleaved = np.empty(2 * len(starts), dtype=np.intp)
+            interleaved[::2] = starts
+            interleaved[1::2] = stops
+
+            in_memory_data = read_direct_dense(dataset, interleaved)
+
+            if has_obs or has_idx:
+                flat_indices = _multi_arange(starts, stops)
+                concatenated_obs = obs0.iloc[flat_indices] if has_obs else None
+                in_memory_indices = flat_indices if has_idx else None
+            else:
+                concatenated_obs = None
+                in_memory_indices = None
+
+            for split in load_request["splits"]:
+                data = in_memory_data[split]
+                yield {
+                    "X": data if not do_torch else to_torch(data, gpu),
+                    "obs": concatenated_obs.iloc[split] if concatenated_obs is not None else None,
+                    "var": var,
+                    "index": in_memory_indices[split] if in_memory_indices is not None else None,
+                }
+
+    def _iter_direct_sparse(self) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
+        """Fastest path: single sparse dataset on local sharded store.
+
+        Reads indptr from memory, then fetches CSR data/indices via direct
+        shard reads -- no async overhead.
+        """
+        csr_ds = self._train_datasets[0]
+        obs0 = self._obs[0] if self._obs is not None else None
+        var = self._var
+        has_obs = obs0 is not None
+        has_idx = self._return_index
+        do_torch = self._to_torch
+        gpu = self._preload_to_gpu
+        sp_mod = self._sp_module
+        np_mod = self._np_module
+
+        for load_request in self._batch_sampler.sample(self.n_obs):
+            starts = load_request["starts"]
+            stops = load_request_stops(load_request)
+            interleaved = np.empty(2 * len(starts), dtype=np.intp)
+            interleaved[::2] = starts
+            interleaved[1::2] = stops
+
+            csr = self._fetch_direct_sparse(csr_ds, interleaved)
+            in_memory_data = sp_mod.csr_matrix(
+                tuple(np_mod.asarray(e) for e in csr.elems),
+                shape=csr.shape,
+                dtype=csr.dtype,
+            )
+
+            if has_obs or has_idx:
+                flat_indices = _multi_arange(starts, stops)
+                concatenated_obs = obs0.iloc[flat_indices] if has_obs else None
+                in_memory_indices = flat_indices if has_idx else None
+            else:
+                concatenated_obs = None
+                in_memory_indices = None
+
+            for split in load_request["splits"]:
+                data = in_memory_data[split]
+                yield {
+                    "X": data if not do_torch else to_torch(data, gpu),
+                    "obs": concatenated_obs.iloc[split] if concatenated_obs is not None else None,
+                    "var": var,
+                    "index": in_memory_indices[split] if in_memory_indices is not None else None,
+                }
+
+    def _iter_single_dense(self) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
+        """Fast path for single dense dataset (non-local or non-sharded stores).
+
+        Uses MultiBasicIndexer.from_boundaries through zarr's async pipeline.
+        """
+        dataset = self._train_datasets[0]
+        obs0 = self._obs[0] if self._obs is not None else None
+        var = self._var
+        has_obs = obs0 is not None
+        has_idx = self._return_index
+        do_torch = self._to_torch
+        gpu = self._preload_to_gpu
+        shape = dataset.metadata.shape
+        chunk_grid = dataset.metadata.chunk_grid
+
+        for load_request in self._batch_sampler.sample(self.n_obs):
+            starts = load_request["starts"]
+            stops = load_request_stops(load_request)
+            interleaved = np.empty(2 * len(starts), dtype=np.intp)
+            interleaved[::2] = starts
+            interleaved[1::2] = stops
+
+            indexer = MultiBasicIndexer.from_boundaries(interleaved, shape, chunk_grid)
+            in_memory_data = cast(
+                "np.ndarray",
+                zsync.sync(
+                    dataset._async_array._get_selection(
+                        indexer, prototype=zarr.core.buffer.default_buffer_prototype()
+                    )
+                ),
+            )
+
+            if has_obs or has_idx:
+                flat_indices = _multi_arange(starts, stops)
+                concatenated_obs = obs0.iloc[flat_indices] if has_obs else None
+                in_memory_indices = flat_indices if has_idx else None
+            else:
+                concatenated_obs = None
+                in_memory_indices = None
+
+            for split in load_request["splits"]:
+                data = in_memory_data[split]
+                yield {
+                    "X": data if not do_torch else to_torch(data, gpu),
+                    "obs": concatenated_obs.iloc[split] if concatenated_obs is not None else None,
+                    "var": var,
+                    "index": in_memory_indices[split] if in_memory_indices is not None else None,
+                }
+
+    def _iter_generic(self, use_direct: bool = False) -> Iterator[LoaderOutput[OutputInMemoryArray]]:
+        """General path supporting multiple datasets and sparse data."""
         mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
         for load_request in self._batch_sampler.sample(self.n_obs):
             splits = load_request["splits"]
             ds_boundaries = self._load_request_to_dataset_boundaries(load_request, use_original_space=False)
-            chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(ds_boundaries))
+            if use_direct:
+                chunks: list[InputInMemoryArray] = self._index_datasets_direct(ds_boundaries)
+            else:
+                chunks = zsync.sync(self._index_datasets(ds_boundaries))
             in_memory_data = self._accumulate_chunks(chunks)
             concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(load_request, ds_boundaries)
             in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(load_request)
