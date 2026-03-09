@@ -23,7 +23,6 @@ from annbatch.types import (
     LoaderOutput,
     OutputInMemoryArray_T,
     _multi_arange,
-    load_request_stops,
 )
 from annbatch.utils import (
     CSRContainer,
@@ -506,7 +505,7 @@ class Loader[
             return OrderedDict()
 
         chunk_starts = lr["starts"]
-        chunk_stops = load_request_stops(lr)
+        chunk_stops = lr["stops"]
 
         # Fast path: single dataset -- every chunk belongs to dataset 0
         if len(self._shapes) == 1:
@@ -825,7 +824,7 @@ class Loader[
 
         for load_request in self._batch_sampler.sample(self.n_obs):
             starts = load_request["starts"]
-            stops = load_request_stops(load_request)
+            stops = load_request["stops"]
             interleaved = np.empty(2 * len(starts), dtype=np.intp)
             interleaved[::2] = starts
             interleaved[1::2] = stops
@@ -867,7 +866,7 @@ class Loader[
 
         for load_request in self._batch_sampler.sample(self.n_obs):
             starts = load_request["starts"]
-            stops = load_request_stops(load_request)
+            stops = load_request["stops"]
             interleaved = np.empty(2 * len(starts), dtype=np.intp)
             interleaved[::2] = starts
             interleaved[1::2] = stops
@@ -913,7 +912,7 @@ class Loader[
 
         for load_request in self._batch_sampler.sample(self.n_obs):
             starts = load_request["starts"]
-            stops = load_request_stops(load_request)
+            stops = load_request["stops"]
             interleaved = np.empty(2 * len(starts), dtype=np.intp)
             interleaved[::2] = starts
             interleaved[1::2] = stops
@@ -1025,9 +1024,7 @@ class Loader[
         if self._obs is None:
             return None
         if len(self._shapes) == 1:
-            starts = lr["starts"]
-            stops = load_request_stops(lr)
-            return self._obs[0].iloc[_multi_arange(starts, stops)]
+            return self._obs[0].iloc[_multi_arange(lr["starts"], lr["stops"])]
         return pd.concat(
             [
                 self._obs[idx].iloc[_multi_arange(b[::2], b[1::2])]
@@ -1040,9 +1037,7 @@ class Loader[
         if self._return_index is False:
             return None
         if len(self._shapes) == 1:
-            starts = lr["starts"]
-            stops = load_request_stops(lr)
-            return _multi_arange(starts, stops)
+            return _multi_arange(lr["starts"], lr["stops"])
         ds_boundaries = self._load_request_to_dataset_boundaries(lr, use_original_space=True)
         return np.concatenate(
             [_multi_arange(b[::2], b[1::2]) for b in ds_boundaries.values()]

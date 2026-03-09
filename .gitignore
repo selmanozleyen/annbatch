@@ -8,6 +8,9 @@ venv/
 .venv/
 __pycache__/
 .*cache/
+build/
+*.so
+*.o
 
 # Distribution / packaging
 /dist/
