@@ -58,12 +58,6 @@ impl MmapStore {
     }
 
     #[must_use]
-    pub const fn sorted(mut self) -> Self {
-        self.sort = true;
-        self
-    }
-
-    #[must_use]
     pub fn key_to_fspath(&self, key: &StoreKey) -> PathBuf {
         let mut path = self.base_path.clone();
         if !key.as_str().is_empty() {
@@ -91,10 +85,6 @@ impl MmapStore {
         let mut path = self.base_path.clone();
         path.push(prefix.as_str());
         path
-    }
-
-    pub fn clear_cache(&self) {
-        self.cache.write().unwrap().clear();
     }
 
     pub fn get_mmap_direct(&self, key: &StoreKey) -> Result<Option<Arc<Mmap>>, StorageError> {

@@ -14,15 +14,10 @@ import ctypes
 import mmap
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numcodecs
 import numpy as np
 import zarr
-import zarr.core.chunk_grids
-
-if TYPE_CHECKING:
-    pass
 
 # ---------------------------------------------------------------------------
 # Resolve blosc C library and (optionally) our C extension

@@ -4,7 +4,7 @@ import asyncio
 from collections import OrderedDict, defaultdict
 from functools import singledispatchmethod
 from importlib.util import find_spec
-from itertools import accumulate, chain, pairwise
+from itertools import accumulate, chain
 from typing import TYPE_CHECKING, Literal, NamedTuple, Self, cast
 
 import anndata as ad
