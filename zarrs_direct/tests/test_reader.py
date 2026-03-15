@@ -73,16 +73,16 @@ class TestReadDense:
             expected = np.concatenate([arr[0:5], arr[50:60], arr[90:100]])
             np.testing.assert_array_equal(result, expected)
 
-    def test_pread_mode_raises(self):
-        import pytest
+    def test_pread_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             arr = _create_dense_store(Path(tmp))
             starts = np.array([10], dtype=np.int64)
             stops = np.array([30], dtype=np.int64)
 
-            read_dense(arr, starts, stops, use_mmap=True)
-            with pytest.raises(ValueError, match="use_mmap=True"):
-                read_dense(arr, starts, stops, use_mmap=False)
+            result_mmap = read_dense(arr, starts, stops, use_mmap=True)
+            result_pread = read_dense(arr, starts, stops, use_mmap=False)
+
+            np.testing.assert_array_equal(result_mmap, result_pread)
 
     def test_matches_zarr_python(self):
         with tempfile.TemporaryDirectory() as tmp:

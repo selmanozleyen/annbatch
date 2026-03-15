@@ -1,4 +1,5 @@
 mod mmap_store;
+mod pread_store;
 mod reader;
 mod shard_meta;
 
@@ -13,14 +14,20 @@ use zarrs::array::Array;
 use zarrs::storage::{ListableStorageTraits, ReadableStorageTraits};
 
 use mmap_store::MmapStore;
+use pread_store::PreadStore;
 use shard_meta::ShardMeta;
 
 trait Store: ReadableStorageTraits + ListableStorageTraits + Send + Sync {}
 impl<T: ReadableStorageTraits + ListableStorageTraits + Send + Sync> Store for T {}
 
+enum BackingStore {
+    Mmap(Arc<MmapStore>),
+    Pread(Arc<PreadStore>),
+}
+
 #[pyclass]
 struct ShardedArrayReader {
-    store: Arc<MmapStore>,
+    backing: BackingStore,
     meta_cache: Mutex<HashMap<String, Arc<ShardMeta>>>,
     fuse_ranges: bool,
 }
@@ -30,16 +37,15 @@ impl ShardedArrayReader {
     #[new]
     #[pyo3(signature = (store_path, use_mmap = true, fuse_ranges = true))]
     fn new(store_path: String, use_mmap: bool, fuse_ranges: bool) -> PyResult<Self> {
-        if !use_mmap {
-            return Err(PyValueError::new_err(
-                "direct reader requires use_mmap=True (pread mode removed in direct path)",
-            ));
-        }
-        let store = Arc::new(
-            MmapStore::new(&store_path)
-                .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?,
-        );
-        Ok(Self { store, meta_cache: Mutex::new(HashMap::new()), fuse_ranges })
+        let backing = if use_mmap {
+            BackingStore::Mmap(Arc::new(
+                MmapStore::new(&store_path)
+                    .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?,
+            ))
+        } else {
+            BackingStore::Pread(Arc::new(PreadStore::new(&store_path)))
+        };
+        Ok(Self { backing, meta_cache: Mutex::new(HashMap::new()), fuse_ranges })
     }
 
     fn read_raw<'py>(
@@ -56,11 +62,19 @@ impl ShardedArrayReader {
         }
 
         let meta = self.get_or_parse_meta(array_path)?;
-        let store = self.store.clone();
         let (sv, ev) = (s.to_vec(), e.to_vec());
         let fuse = self.fuse_ranges;
 
-        let bytes = py.allow_threads(move || reader::read_direct(&store, &meta, &sv, &ev, fuse))?;
+        let bytes = match &self.backing {
+            BackingStore::Mmap(store) => {
+                let store = store.clone();
+                py.allow_threads(move || reader::read_direct_mmap(&store, &meta, &sv, &ev, fuse))
+            }
+            BackingStore::Pread(store) => {
+                let store = store.clone();
+                py.allow_threads(move || reader::read_direct_pread(&store, &meta, &sv, &ev, fuse))
+            }
+        }?;
 
         let arr = ArrayD::from_shape_vec(numpy::ndarray::IxDyn(&[bytes.len()]), bytes)
             .map_err(|e| PyValueError::new_err(format!("shape error: {e}")))?;
@@ -78,7 +92,17 @@ impl ShardedArrayReader {
         if let Some(m) = cache.get(array_path) {
             return Ok(m.clone());
         }
-        let store_dyn: Arc<dyn Store> = self.store.clone();
+        let store_dyn: Arc<dyn Store> = match &self.backing {
+            BackingStore::Mmap(s) => s.clone(),
+            BackingStore::Pread(_) => {
+                Arc::new(MmapStore::new(
+                    match &self.backing {
+                        BackingStore::Pread(ps) => &ps.base_path,
+                        _ => unreachable!(),
+                    }
+                ).map_err(|e| PyValueError::new_err(format!("meta parse error: {e}")))?)
+            }
+        };
         let array = Array::open(store_dyn, array_path)
             .map_err(|e| PyValueError::new_err(format!("failed to open array: {e}")))?;
         let meta = Arc::new(ShardMeta::from_array(&array, array_path)?);

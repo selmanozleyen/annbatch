@@ -3,12 +3,12 @@ use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
 
 use crate::mmap_store::MmapStore;
+use crate::pread_store::PreadStore;
 use crate::shard_meta::ShardMeta;
 
 struct FusedGroup {
     fused_start: u64,
     fused_stop: u64,
-    // (original_range_index, byte_offset_within_fused_read, byte_length)
     slices: Vec<(usize, usize, usize)>,
 }
 
@@ -38,20 +38,6 @@ fn fuse_sorted_ranges(
     result
 }
 
-fn shard_index<'a>(mmap: &'a Mmap, meta: &ShardMeta) -> &'a [u64] {
-    let len = mmap.len();
-    let bytes = &mmap[len - meta.shard_index_size..len - 4];
-    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, bytes.len() / 8) }
-}
-
-unsafe fn blosc_decompress(src: *const u8, dst: *mut u8, dst_size: usize) {
-    blosc_src::blosc_decompress(
-        src as *const std::ffi::c_void,
-        dst as *mut std::ffi::c_void,
-        dst_size,
-    );
-}
-
 fn identity_groups(starts: &[i64], stops: &[i64], row_bytes: usize) -> Vec<FusedGroup> {
     starts.iter().zip(stops).enumerate().map(|(i, (&s, &e))| {
         let len = (e - s) as usize * row_bytes;
@@ -59,28 +45,43 @@ fn identity_groups(starts: &[i64], stops: &[i64], row_bytes: usize) -> Vec<Fused
     }).collect()
 }
 
-pub fn read_direct(
+fn build_groups(starts: &[i64], stops: &[i64], row_bytes: usize, fuse: bool) -> Vec<FusedGroup> {
+    if fuse {
+        let mut order: Vec<usize> = (0..starts.len()).collect();
+        order.sort_unstable_by_key(|&i| starts[i]);
+        fuse_sorted_ranges(&order, starts, stops, row_bytes)
+    } else {
+        identity_groups(starts, stops, row_bytes)
+    }
+}
+
+// -- mmap path: pointer arithmetic + direct blosc_decompress ----------------
+
+fn shard_index_mmap<'a>(mmap: &'a Mmap, meta: &ShardMeta) -> &'a [u64] {
+    let len = mmap.len();
+    let bytes = &mmap[len - meta.shard_index_size..len - 4];
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, bytes.len() / 8) }
+}
+
+unsafe fn blosc_decompress(src: *const u8, dst: *mut u8, dst_size: usize) {
+    blosc_src::blosc_decompress(
+        src as *const std::ffi::c_void, dst as *mut std::ffi::c_void, dst_size,
+    );
+}
+
+pub fn read_direct_mmap(
     store: &MmapStore, meta: &ShardMeta, starts: &[i64], stops: &[i64], fuse: bool,
 ) -> PyResult<Vec<u8>> {
     let n = starts.len();
     let rb = meta.row_bytes;
-
     let range_bytes: Vec<usize> = starts.iter().zip(stops).map(|(&s, &e)| (e - s) as usize * rb).collect();
     let total: usize = range_bytes.iter().sum();
     let mut out = vec![0u8; total];
-
     let mut out_off = vec![0usize; n];
     let mut acc = 0usize;
     for i in 0..n { out_off[i] = acc; acc += range_bytes[i]; }
 
-    let fused = if fuse {
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_unstable_by_key(|&i| starts[i]);
-        fuse_sorted_ranges(&order, starts, stops, rb)
-    } else {
-        identity_groups(starts, stops, rb)
-    };
-
+    let fused = build_groups(starts, stops, rb, fuse);
     let chunk_rows = meta.chunk_shape[0];
     let shard_rows = meta.shard_shape[0];
     let chunk_bytes = meta.inner_chunk_nbytes();
@@ -97,12 +98,11 @@ pub fn read_direct(
             let si = row / shard_rows;
             let mut idx = vec![si];
             for _ in 0..ndim_extra { idx.push(0); }
-
             let key = meta.shard_key(&idx)?;
             let mmap = store.get_mmap_direct(&key)
                 .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
                 .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
-            let sidx = shard_index(&mmap, meta);
+            let sidx = shard_index_mmap(&mmap, meta);
             let sbase = si * shard_rows;
 
             while row < sel1 && row < sbase + shard_rows {
@@ -110,7 +110,6 @@ pub fn read_direct(
                 let cbase = sbase + ci as u64 * chunk_rows;
                 let cend = cbase + chunk_rows;
                 let off = sidx[ci * meta.idx_stride] as usize;
-
                 let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
                 let t1 = (sel1.min(cend) - cbase) as usize;
                 let nt = t1 - t0;
@@ -128,7 +127,73 @@ pub fn read_direct(
                 row = cbase + t1 as u64;
             }
         }
+        for &(oi, so, sl) in &g.slices {
+            out[out_off[oi]..out_off[oi] + sl].copy_from_slice(&fbuf[so..so + sl]);
+        }
+    }
+    Ok(out)
+}
 
+// -- pread path: read_at + blosc_decompress ---------------------------------
+
+pub fn read_direct_pread(
+    store: &PreadStore, meta: &ShardMeta, starts: &[i64], stops: &[i64], fuse: bool,
+) -> PyResult<Vec<u8>> {
+    let n = starts.len();
+    let rb = meta.row_bytes;
+    let range_bytes: Vec<usize> = starts.iter().zip(stops).map(|(&s, &e)| (e - s) as usize * rb).collect();
+    let total: usize = range_bytes.iter().sum();
+    let mut out = vec![0u8; total];
+    let mut out_off = vec![0usize; n];
+    let mut acc = 0usize;
+    for i in 0..n { out_off[i] = acc; acc += range_bytes[i]; }
+
+    let fused = build_groups(starts, stops, rb, fuse);
+    let chunk_rows = meta.chunk_shape[0];
+    let shard_rows = meta.shard_shape[0];
+    let chunk_bytes = meta.inner_chunk_nbytes();
+    let ndim_extra = meta.ndim - 1;
+    let mut tmp: Option<Vec<u8>> = None;
+
+    for g in &fused {
+        let (sel0, sel1) = (g.fused_start, g.fused_stop);
+        let mut fbuf = vec![0u8; (sel1 - sel0) as usize * rb];
+        let mut row = sel0;
+        let mut boff = 0usize;
+
+        while row < sel1 {
+            let si = row / shard_rows;
+            let mut idx = vec![si];
+            for _ in 0..ndim_extra { idx.push(0); }
+            let key = meta.shard_key(&idx)?;
+            let sf = store.read_shard(&key, meta.shard_index_size)
+                .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
+                .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
+            let sidx = sf.read_index();
+            let sbase = si * shard_rows;
+
+            while row < sel1 && row < sbase + shard_rows {
+                let ci = ((row - sbase) / chunk_rows) as usize;
+                let cbase = sbase + ci as u64 * chunk_rows;
+                let cend = cbase + chunk_rows;
+                let off = sidx[ci * meta.idx_stride] as usize;
+                let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
+                let t1 = (sel1.min(cend) - cbase) as usize;
+                let nt = t1 - t0;
+
+                if t0 == 0 && nt == chunk_rows as usize {
+                    sf.read_chunk(off, &mut fbuf[boff..boff + chunk_bytes]);
+                } else {
+                    let tb = tmp.get_or_insert_with(|| vec![0u8; chunk_bytes]);
+                    if tb.len() < chunk_bytes { tb.resize(chunk_bytes, 0); }
+                    sf.read_chunk(off, tb);
+                    let s = t0 * rb;
+                    fbuf[boff..boff + nt * rb].copy_from_slice(&tb[s..s + nt * rb]);
+                }
+                boff += nt * rb;
+                row = cbase + t1 as u64;
+            }
+        }
         for &(oi, so, sl) in &g.slices {
             out[out_off[oi]..out_off[oi] + sl].copy_from_slice(&fbuf[so..so + sl]);
         }

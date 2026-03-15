@@ -13,11 +13,14 @@ if TYPE_CHECKING:
 
 _reader_cache: dict[tuple[str, bool, bool], ShardedArrayReader] = {}
 _FUSE_DEFAULT: bool = True
+_MMAP_DEFAULT: bool = True
 
 
-def _get_reader(store_root: str, use_mmap: bool, fuse_ranges: bool | None = None) -> ShardedArrayReader:
+def _get_reader(store_root: str, use_mmap: bool | None = None, fuse_ranges: bool | None = None) -> ShardedArrayReader:
     if fuse_ranges is None:
         fuse_ranges = _FUSE_DEFAULT
+    if use_mmap is None:
+        use_mmap = _MMAP_DEFAULT
     key = (store_root, use_mmap, fuse_ranges)
     reader = _reader_cache.get(key)
     if reader is None:
@@ -41,7 +44,7 @@ def read_dense(
     starts: np.ndarray,
     stops: np.ndarray,
     *,
-    use_mmap: bool = True,
+    use_mmap: bool | None = None,
     fuse_ranges: bool | None = None,
 ) -> np.ndarray:
     """Read axis-0 row ranges from a sharded zarr array.
@@ -83,7 +86,7 @@ def read_1d(
     starts: np.ndarray,
     stops: np.ndarray,
     *,
-    use_mmap: bool = True,
+    use_mmap: bool | None = None,
     fuse_ranges: bool | None = None,
 ) -> np.ndarray:
     """Read ranges from a 1-D sharded zarr array (e.g. CSR data/indices).
