@@ -1,10 +1,9 @@
-"""Benchmark: full Loader iteration -- DIRECT (C+mmap) vs ZARR.
+"""Head-to-head benchmark: zarrs (Rust+mmap) vs C ext (mmap) vs zarr-python (async).
 
-Creates temporary zarr stores (dense + sparse) and times complete iteration
-through the Loader at various chunk_size values.
+Uses annbatch's Loader end-to-end with the sync_backend switch.
 
 Run with:
-    python tests/bench_loader.py
+    python tests/bench_backends.py
 """
 
 from __future__ import annotations
@@ -39,7 +38,12 @@ def _create_store(tmp: Path) -> Path:
         var=pd.DataFrame(index=[f"gene_{i}" for i in range(N_VARS)]),
         layers={
             "sparse": sp.random(
-                N_OBS, N_VARS, density=0.1, format="csr", dtype="f4", random_state=np.random.default_rng(0)
+                N_OBS,
+                N_VARS,
+                density=0.1,
+                format="csr",
+                dtype="f4",
+                random_state=np.random.default_rng(0),
             ),
         },
     )
@@ -73,7 +77,7 @@ def _open_sparse(path: Path) -> ad.AnnData:
     )
 
 
-def bench_loader(store_path: Path, chunk_size: int, preload_nchunks: int, batch_size: int, sparse: bool, force_zarr: bool = False) -> dict:
+def bench_loader(store_path, chunk_size, preload_nchunks, batch_size, sparse, sync_backend):
     adata = _open_sparse(store_path) if sparse else _open_dense(store_path)
     sampler = ChunkSampler(
         chunk_size=chunk_size,
@@ -86,11 +90,9 @@ def bench_loader(store_path: Path, chunk_size: int, preload_nchunks: int, batch_
         return_index=True,
         preload_to_gpu=False,
         to_torch=False,
+        sync_backend=sync_backend,
     )
     loader.add_anndata(adata)
-
-    if force_zarr:
-        loader._can_direct_read = staticmethod(lambda _: False)
 
     n_batches = 0
     total_obs = 0
@@ -102,49 +104,70 @@ def bench_loader(store_path: Path, chunk_size: int, preload_nchunks: int, batch_
     return {"elapsed": elapsed, "n_batches": n_batches, "total_obs": total_obs}
 
 
-def run_suite(store_path: Path, label: str, sparse: bool, configs: list[dict]):
-    for mode, force_zarr in [("DIRECT (C+mmap)", False), ("ZARR (async)", True)]:
-        print(f"\n{'=' * 85}")
-        print(f"  {label} [{mode}]")
-        print(f"  {N_OBS} obs x {N_VARS} vars, repeats={REPEATS}, C ext={_HAS_C_EXT}")
-        print(f"{'=' * 85}")
+def run_suite(store_path, label, sparse, configs):
+    backends = [
+        ("zarrs (Rust+mmap)", "zarrs"),
+        ("C ext (mmap)", "c"),
+        ("zarr-python async", None),
+    ]
+
+    print(f"\n{'=' * 110}")
+    print(f"  {label}  --  {N_OBS} obs x {N_VARS} vars, repeats={REPEATS}, C ext={_HAS_C_EXT}")
+    print(f"{'=' * 110}")
+
+    for cfg in configs:
+        cs, pn, bs = cfg["chunk_size"], cfg["preload_nchunks"], cfg["batch_size"]
+        print(f"\n  chunk_size={cs:>3}  preload={pn:>3}  batch={bs:>3}")
+        print(f"  {'-' * 100}")
         print(
-            f"{'chunk_size':>10}  {'preload':>7}  {'batch':>5}  {'n_batches':>9}  "
-            f"{'best (s)':>8}  {'mean (s)':>8}  {'obs/s':>10}"
+            f"  {'Backend':<25}  {'best (s)':>10}  {'mean (s)':>10}  {'obs/s':>12}  {'vs async':>10}  {'vs C ext':>10}"
         )
-        print("-" * 85)
+        print(f"  {'-' * 100}")
 
-        for cfg in configs:
+        results = {}
+        for name, sb in backends:
+            if sb == "c" and not _HAS_C_EXT:
+                results[name] = None
+                continue
             times = []
-            result = None
+            res = None
             for _ in range(REPEATS):
-                result = bench_loader(store_path, sparse=sparse, force_zarr=force_zarr, **cfg)
-                times.append(result["elapsed"])
-
+                res = bench_loader(store_path, sparse=sparse, sync_backend=sb, **cfg)
+                times.append(res["elapsed"])
             best = min(times)
             mean = sum(times) / len(times)
-            obs_per_sec = result["total_obs"] / best
+            obs_per_sec = res["total_obs"] / best
+            results[name] = (best, mean, obs_per_sec, res["total_obs"])
 
-            print(
-                f"{cfg['chunk_size']:>10}  {cfg['preload_nchunks']:>7}  "
-                f"{cfg['batch_size']:>5}  {result['n_batches']:>9}  "
-                f"{best:>8.4f}  {mean:>8.4f}  {obs_per_sec:>10.0f}"
-            )
+        async_best = results.get("zarr-python async")
+        c_best = results.get("C ext (mmap)")
+
+        for name, _ in backends:
+            vals = results.get(name)
+            if vals is None:
+                print(f"  {name:<25}  {'N/A':>10}  {'N/A':>10}  {'N/A':>12}  {'N/A':>10}  {'N/A':>10}")
+                continue
+            best, mean, obs_per_sec, _ = vals
+            vs_async = f"{async_best[0] / best:.2f}x" if async_best else "N/A"
+            vs_c = f"{c_best[0] / best:.2f}x" if c_best else "N/A"
+            print(f"  {name:<25}  {best:>10.4f}  {mean:>10.4f}  {obs_per_sec:>12.0f}  {vs_async:>10}  {vs_c:>10}")
+
+    print()
 
 
 def main():
     configs = [
-        {"chunk_size": 2, "preload_nchunks": 512, "batch_size": 2},
-        {"chunk_size": 4, "preload_nchunks": 256, "batch_size": 4},
-        {"chunk_size": 8, "preload_nchunks": 128, "batch_size": 8},
-        {"chunk_size": 16, "preload_nchunks": 64, "batch_size": 16},
-        {"chunk_size": 32, "preload_nchunks": 32, "batch_size": 32},
+        {"chunk_size": 2, "preload_nchunks": 512, "batch_size": 8},
+        {"chunk_size": 2, "preload_nchunks": 512, "batch_size": 16},
+        {"chunk_size": 2, "preload_nchunks": 512, "batch_size": 32},
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
         store_path = _create_store(Path(tmp))
         run_suite(store_path, "Dense (f32)", sparse=False, configs=configs)
         run_suite(store_path, "Sparse CSR (f32, density=0.1)", sparse=True, configs=configs)
+
+    print("Done.")
 
 
 if __name__ == "__main__":

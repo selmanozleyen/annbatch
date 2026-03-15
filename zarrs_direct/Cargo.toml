@@ -1,0 +1,22 @@
+[package]
+name = "zarrs_direct"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 bindings for fast synchronous Zarr v3 sharded array reads"
+
+[lib]
+name = "_zarrs_direct"
+crate-type = ["cdylib"]
+
+[dependencies]
+zarrs = { version = "0.23", default-features = false, features = ["filesystem", "blosc", "crc32c", "sharding"] }
+zarrs_storage = "0.4"
+zarrs_filesystem = "0.3"
+memmap2 = "0.9"
+bytes = "1"
+walkdir = "2"
+pathdiff = "0.2"
+thiserror = "2"
+blosc-src = "0.3"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"

@@ -33,7 +33,7 @@ from annbatch.utils import (
     to_torch,
     validate_sampler,
 )
-from annbatch._direct_read import read_direct_dense, read_direct_1d
+from annbatch._direct_read import read_direct_dense as _c_read_dense, read_direct_1d as _c_read_1d
 
 from .compat import IterableDataset
 
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     InputInMemoryArray = InputInMemoryArray_T
 
 type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
+type sync_backends = Literal["c", "zarrs", "auto"]
 
 
 class CSRDatasetElems(NamedTuple):
@@ -183,6 +184,7 @@ class Loader[
         to_torch: bool = find_spec("torch") is not None,
         concat_strategy: None | concat_strategies = None,
         rng: np.random.Generator | None = None,
+        sync_backend: sync_backends | None = "auto",
     ):
         sampler_args = {
             "chunk_size": chunk_size,
@@ -219,9 +221,64 @@ class Loader[
         self._dataset_elem_cache = {}
         self._direct_sparse_cache: dict = {}
         self._concat_strategy = concat_strategy
+        self._sync_backend = sync_backend
+        self._sync_read_dense, self._sync_read_1d = self._resolve_sync_backend(sync_backend)
 
     def __len__(self) -> int:
         return self._batch_sampler.n_iters(self.n_obs)
+
+    @staticmethod
+    def _resolve_sync_backend(
+        backend: sync_backends | None,
+    ) -> tuple[Callable | None, Callable | None]:
+        """Return (read_dense_fn, read_1d_fn) for the chosen sync backend.
+
+        Both functions accept ``(arr, starts, stops)`` and return an ndarray.
+        Returns ``(None, None)`` when no sync backend is active.
+        """
+        if backend is None:
+            return None, None
+
+        def _wrap_c(fn):
+            """Wrap the C ext functions to accept (arr, starts, stops) -> ndarray."""
+            def wrapper(arr, starts, stops):
+                interleaved = np.empty(2 * len(starts), dtype=np.intp)
+                interleaved[::2] = starts
+                interleaved[1::2] = stops
+                return fn(arr, interleaved)
+            return wrapper
+
+        if backend == "zarrs":
+            try:
+                from zarr_direct import read_dense, read_1d
+                return read_dense, read_1d
+            except ImportError:
+                raise ImportError(
+                    "sync_backend='zarrs' requires zarr-direct to be installed. "
+                    "Install it with: pip install zarr-direct"
+                ) from None
+
+        if backend == "c":
+            from annbatch._direct_read import _HAS_C_EXT
+            if not _HAS_C_EXT:
+                raise ImportError(
+                    "sync_backend='c' requires the _shard_reader C extension, "
+                    "which was not found."
+                )
+            return _wrap_c(_c_read_dense), _wrap_c(_c_read_1d)
+
+        if backend == "auto":
+            try:
+                from zarr_direct import read_dense, read_1d
+                return read_dense, read_1d
+            except ImportError:
+                pass
+            from annbatch._direct_read import _HAS_C_EXT
+            if _HAS_C_EXT:
+                return _wrap_c(_c_read_dense), _wrap_c(_c_read_1d)
+            return None, None
+
+        raise ValueError(f"Unknown sync_backend: {backend!r}")
 
     @property
     def _sp_module(self) -> ModuleType:
@@ -706,23 +763,25 @@ class Loader[
     ) -> list[InputInMemoryArray]:
         """Synchronous direct-read path for local sharded stores.
 
-        Uses mmap + C extension instead of zarr's async pipeline.
+        Uses the configured sync backend instead of zarr's async pipeline.
         Works for both single and multiple datasets.
         """
         is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
         results: list[InputInMemoryArray] = []
         for dataset_idx, boundaries in dataset_boundaries.items():
             ds = self._train_datasets[dataset_idx]
+            starts, stops = boundaries[::2], boundaries[1::2]
             if is_sparse:
-                results.append(self._fetch_direct_sparse(ds, boundaries))
+                results.append(self._fetch_direct_sparse(ds, starts, stops))
             else:
-                results.append(read_direct_dense(ds, boundaries))
+                results.append(self._sync_read_dense(ds, starts, stops))
         return results
 
     def _fetch_direct_sparse(
         self,
         dataset: ad.abc.CSRDataset,
-        boundaries: np.ndarray,
+        starts: np.ndarray,
+        stops: np.ndarray,
     ) -> CSRContainer:
         """Synchronous direct-read for a single sparse dataset."""
         grp = dataset.group
@@ -733,18 +792,14 @@ class Loader[
             self._direct_sparse_cache[dataset] = (indptr, data_arr, indices_arr)
         indptr, data_arr, indices_arr = self._direct_sparse_cache[dataset]
 
-        starts, stops = boundaries[::2], boundaries[1::2]
         n = len(starts)
         indptr_indices = [indptr[s:e + 1] for s, e in zip(starts, stops, strict=True)]
 
         ip_starts = np.array([ip[0] for ip in indptr_indices])
         ip_stops = np.array([ip[-1] for ip in indptr_indices])
-        ip_bounds = np.empty(2 * n, dtype=np.intp)
-        ip_bounds[::2] = ip_starts
-        ip_bounds[1::2] = ip_stops
 
-        data_np = read_direct_1d(data_arr, ip_bounds)
-        indices_np = read_direct_1d(indices_arr, ip_bounds)
+        data_np = self._sync_read_1d(data_arr, ip_starts, ip_stops)
+        indices_np = self._sync_read_1d(indices_arr, ip_starts, ip_stops)
 
         gaps = (ip_starts[i + 1] - ip_stops[i] for i in range(n - 1))
         offsets = accumulate(chain([ip_starts[0]], gaps))
@@ -779,7 +834,7 @@ class Loader[
             [len(self._train_datasets), self.n_obs],
             ["Number of datasets", "Number of observations"],
         )
-        all_direct = all(self._can_direct_read(ds) for ds in self._train_datasets)
+        all_direct = self._sync_read_dense is not None and all(self._can_direct_read(ds) for ds in self._train_datasets)
         if len(self._shapes) == 1 and all_direct:
             if isinstance(self._train_datasets[0], ZarrArray):
                 yield from self._iter_direct_dense()
@@ -825,11 +880,8 @@ class Loader[
         for load_request in self._batch_sampler.sample(self.n_obs):
             starts = load_request["starts"]
             stops = load_request["stops"]
-            interleaved = np.empty(2 * len(starts), dtype=np.intp)
-            interleaved[::2] = starts
-            interleaved[1::2] = stops
 
-            in_memory_data = read_direct_dense(dataset, interleaved)
+            in_memory_data = self._sync_read_dense(dataset, starts, stops)
 
             if has_obs or has_idx:
                 flat_indices = _multi_arange(starts, stops)
@@ -867,11 +919,8 @@ class Loader[
         for load_request in self._batch_sampler.sample(self.n_obs):
             starts = load_request["starts"]
             stops = load_request["stops"]
-            interleaved = np.empty(2 * len(starts), dtype=np.intp)
-            interleaved[::2] = starts
-            interleaved[1::2] = stops
 
-            csr = self._fetch_direct_sparse(csr_ds, interleaved)
+            csr = self._fetch_direct_sparse(csr_ds, starts, stops)
             in_memory_data = sp_mod.csr_matrix(
                 tuple(np_mod.asarray(e) for e in csr.elems),
                 shape=csr.shape,

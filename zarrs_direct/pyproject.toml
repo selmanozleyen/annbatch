@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zarr-direct"
+version = "0.1.0"
+description = "Fast synchronous Zarr v3 sharded array reader (Rust-backed)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "zarr>=3.0",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "zarr_direct._zarrs_direct"
+manifest-path = "Cargo.toml"
