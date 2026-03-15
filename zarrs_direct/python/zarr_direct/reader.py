@@ -11,14 +11,17 @@ from zarr_direct._zarrs_direct import ShardedArrayReader
 if TYPE_CHECKING:
     import zarr
 
-_reader_cache: dict[tuple[str, bool], ShardedArrayReader] = {}
+_reader_cache: dict[tuple[str, bool, bool], ShardedArrayReader] = {}
+_FUSE_DEFAULT: bool = True
 
 
-def _get_reader(store_root: str, use_mmap: bool) -> ShardedArrayReader:
-    key = (store_root, use_mmap)
+def _get_reader(store_root: str, use_mmap: bool, fuse_ranges: bool | None = None) -> ShardedArrayReader:
+    if fuse_ranges is None:
+        fuse_ranges = _FUSE_DEFAULT
+    key = (store_root, use_mmap, fuse_ranges)
     reader = _reader_cache.get(key)
     if reader is None:
-        reader = ShardedArrayReader(store_root, use_mmap=use_mmap)
+        reader = ShardedArrayReader(store_root, use_mmap=use_mmap, fuse_ranges=fuse_ranges)
         _reader_cache[key] = reader
     return reader
 
@@ -39,6 +42,7 @@ def read_dense(
     stops: np.ndarray,
     *,
     use_mmap: bool = True,
+    fuse_ranges: bool | None = None,
 ) -> np.ndarray:
     """Read axis-0 row ranges from a sharded zarr array.
 
@@ -62,7 +66,7 @@ def read_dense(
     shape = tuple(arr.shape)
     dtype = arr.dtype
 
-    reader = _get_reader(store_root, use_mmap)
+    reader = _get_reader(store_root, use_mmap, fuse_ranges=fuse_ranges)
     raw = reader.read_raw(
         array_path,
         np.ascontiguousarray(starts, dtype=np.int64),
@@ -80,6 +84,7 @@ def read_1d(
     stops: np.ndarray,
     *,
     use_mmap: bool = True,
+    fuse_ranges: bool | None = None,
 ) -> np.ndarray:
     """Read ranges from a 1-D sharded zarr array (e.g. CSR data/indices).
 
@@ -102,7 +107,7 @@ def read_1d(
     store_root, array_path = _parse_store_path(arr)
     dtype = arr.dtype
 
-    reader = _get_reader(store_root, use_mmap)
+    reader = _get_reader(store_root, use_mmap, fuse_ranges=fuse_ranges)
     raw = reader.read_raw(
         array_path,
         np.ascontiguousarray(starts, dtype=np.int64),

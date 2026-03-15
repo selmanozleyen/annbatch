@@ -22,13 +22,14 @@ impl<T: ReadableStorageTraits + ListableStorageTraits + Send + Sync> Store for T
 struct ShardedArrayReader {
     store: Arc<MmapStore>,
     meta_cache: Mutex<HashMap<String, Arc<ShardMeta>>>,
+    fuse_ranges: bool,
 }
 
 #[pymethods]
 impl ShardedArrayReader {
     #[new]
-    #[pyo3(signature = (store_path, use_mmap = true))]
-    fn new(store_path: String, use_mmap: bool) -> PyResult<Self> {
+    #[pyo3(signature = (store_path, use_mmap = true, fuse_ranges = true))]
+    fn new(store_path: String, use_mmap: bool, fuse_ranges: bool) -> PyResult<Self> {
         if !use_mmap {
             return Err(PyValueError::new_err(
                 "direct reader requires use_mmap=True (pread mode removed in direct path)",
@@ -38,7 +39,7 @@ impl ShardedArrayReader {
             MmapStore::new(&store_path)
                 .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?,
         );
-        Ok(Self { store, meta_cache: Mutex::new(HashMap::new()) })
+        Ok(Self { store, meta_cache: Mutex::new(HashMap::new()), fuse_ranges })
     }
 
     fn read_raw<'py>(
@@ -57,8 +58,9 @@ impl ShardedArrayReader {
         let meta = self.get_or_parse_meta(array_path)?;
         let store = self.store.clone();
         let (sv, ev) = (s.to_vec(), e.to_vec());
+        let fuse = self.fuse_ranges;
 
-        let bytes = py.allow_threads(move || reader::read_direct(&store, &meta, &sv, &ev))?;
+        let bytes = py.allow_threads(move || reader::read_direct(&store, &meta, &sv, &ev, fuse))?;
 
         let arr = ArrayD::from_shape_vec(numpy::ndarray::IxDyn(&[bytes.len()]), bytes)
             .map_err(|e| PyValueError::new_err(format!("shape error: {e}")))?;

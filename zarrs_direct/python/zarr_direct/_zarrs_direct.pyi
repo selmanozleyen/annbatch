@@ -2,7 +2,7 @@ import numpy as np
 import numpy.typing as npt
 
 class ShardedArrayReader:
-    def __init__(self, store_path: str, use_mmap: bool = True) -> None: ...
+    def __init__(self, store_path: str, use_mmap: bool = True, fuse_ranges: bool = True) -> None: ...
     def read_raw(
         self,
         array_path: str,

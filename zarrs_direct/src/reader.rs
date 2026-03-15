@@ -52,8 +52,15 @@ unsafe fn blosc_decompress(src: *const u8, dst: *mut u8, dst_size: usize) {
     );
 }
 
+fn identity_groups(starts: &[i64], stops: &[i64], row_bytes: usize) -> Vec<FusedGroup> {
+    starts.iter().zip(stops).enumerate().map(|(i, (&s, &e))| {
+        let len = (e - s) as usize * row_bytes;
+        FusedGroup { fused_start: s as u64, fused_stop: e as u64, slices: vec![(i, 0, len)] }
+    }).collect()
+}
+
 pub fn read_direct(
-    store: &MmapStore, meta: &ShardMeta, starts: &[i64], stops: &[i64],
+    store: &MmapStore, meta: &ShardMeta, starts: &[i64], stops: &[i64], fuse: bool,
 ) -> PyResult<Vec<u8>> {
     let n = starts.len();
     let rb = meta.row_bytes;
@@ -62,14 +69,17 @@ pub fn read_direct(
     let total: usize = range_bytes.iter().sum();
     let mut out = vec![0u8; total];
 
-    // output offset for each original range (in input order)
     let mut out_off = vec![0usize; n];
     let mut acc = 0usize;
     for i in 0..n { out_off[i] = acc; acc += range_bytes[i]; }
 
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_unstable_by_key(|&i| starts[i]);
-    let fused = fuse_sorted_ranges(&order, starts, stops, rb);
+    let fused = if fuse {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&i| starts[i]);
+        fuse_sorted_ranges(&order, starts, stops, rb)
+    } else {
+        identity_groups(starts, stops, rb)
+    };
 
     let chunk_rows = meta.chunk_shape[0];
     let shard_rows = meta.shard_shape[0];

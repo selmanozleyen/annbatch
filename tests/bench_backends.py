@@ -77,7 +77,13 @@ def _open_sparse(path: Path) -> ad.AnnData:
     )
 
 
-def bench_loader(store_path, chunk_size, preload_nchunks, batch_size, sparse, sync_backend):
+def bench_loader(store_path, chunk_size, preload_nchunks, batch_size, sparse,
+                  sync_backend, fuse_ranges=True):
+    if sync_backend == "zarrs":
+        import zarr_direct.reader as _zdr
+        _zdr._reader_cache.clear()
+        _zdr._FUSE_DEFAULT = fuse_ranges
+
     adata = _open_sparse(store_path) if sparse else _open_dense(store_path)
     sampler = ChunkSampler(
         chunk_size=chunk_size,
@@ -106,9 +112,10 @@ def bench_loader(store_path, chunk_size, preload_nchunks, batch_size, sparse, sy
 
 def run_suite(store_path, label, sparse, configs):
     backends = [
-        ("zarrs (Rust+mmap)", "zarrs"),
-        ("C ext (mmap)", "c"),
-        ("zarr-python async", None),
+        ("zarrs (fuse=on)", "zarrs", True),
+        ("zarrs (fuse=off)", "zarrs", False),
+        ("C ext (mmap)", "c", True),
+        ("zarr-python async", None, True),
     ]
 
     print(f"\n{'=' * 110}")
@@ -125,14 +132,15 @@ def run_suite(store_path, label, sparse, configs):
         print(f"  {'-' * 100}")
 
         results = {}
-        for name, sb in backends:
+        for name, sb, fuse in backends:
             if sb == "c" and not _HAS_C_EXT:
                 results[name] = None
                 continue
             times = []
             res = None
             for _ in range(REPEATS):
-                res = bench_loader(store_path, sparse=sparse, sync_backend=sb, **cfg)
+                res = bench_loader(store_path, sparse=sparse, sync_backend=sb,
+                                    fuse_ranges=fuse, **cfg)
                 times.append(res["elapsed"])
             best = min(times)
             mean = sum(times) / len(times)
@@ -142,7 +150,7 @@ def run_suite(store_path, label, sparse, configs):
         async_best = results.get("zarr-python async")
         c_best = results.get("C ext (mmap)")
 
-        for name, _ in backends:
+        for name, _, _ in backends:
             vals = results.get(name)
             if vals is None:
                 print(f"  {name:<25}  {'N/A':>10}  {'N/A':>10}  {'N/A':>12}  {'N/A':>10}  {'N/A':>10}")
