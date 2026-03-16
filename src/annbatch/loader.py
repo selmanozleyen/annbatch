@@ -15,6 +15,7 @@ import zarr.core.sync as zsync
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
+from annbatch._direct_read import IoBackend, get_read_dense
 from annbatch.samplers import ChunkSampler
 from annbatch.types import BackingArray_T, InputInMemoryArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
@@ -122,6 +123,13 @@ class Loader[
             With `shuffle-concat`, preloaded data is first shuffled/subsetted chunk-by-chunk and then concatenated (lower memory usage, potentially faster for dense data)
             The default is automatically chosen - `concat-shuffle` if the data added to the loader is sparse and otherwise `shuffle-concat`.
             See
+        io_backend
+            I/O strategy for reading dense data from local sharded zarr stores.
+            ``"pread"`` (default) reads compressed chunks on demand via pread(2).
+            ``"mmap"`` maps entire shard files into memory for zero-copy access.
+            Both use the C extension when available, falling back to pure Python.
+            Only applies to local sharded zarr arrays; non-local or non-sharded
+            stores always go through zarr's standard async pipeline.
 
 
     Examples
@@ -177,6 +185,7 @@ class Loader[
         to_torch: bool = find_spec("torch") is not None,
         concat_strategy: None | concat_strategies = None,
         rng: np.random.Generator | None = None,
+        io_backend: IoBackend = "pread",
     ):
         sampler_args = {
             "chunk_size": chunk_size,
@@ -212,6 +221,8 @@ class Loader[
         self._shapes = []
         self._dataset_elem_cache = {}
         self._concat_strategy = concat_strategy
+        self._io_backend = io_backend
+        self._read_dense = get_read_dense(io_backend)
 
     def __len__(self) -> int:
         return self._batch_sampler.n_iters(self.n_obs)
@@ -576,8 +587,28 @@ class Loader[
         """
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
+    @staticmethod
+    def _can_direct_read(dataset: ZarrArray) -> bool:
+        """Check if the dataset is backed by a local sharded zarr store."""
+        try:
+            store = dataset.store
+            if not isinstance(store, zarr.storage.LocalStore):
+                return False
+            m = dataset.metadata
+            if not m.codecs or not isinstance(m.codecs[0], zarr.codecs.sharding.ShardingCodec):
+                return False
+            return True
+        except Exception:
+            return False
+
     @_fetch_data.register
     async def _fetch_data_dense(self, dataset: ZarrArray, slices: list[slice]) -> np.ndarray:
+        if self._read_dense is not None and self._can_direct_read(dataset):
+            boundaries = np.array(
+                [v for s in slices for v in (s.start, s.stop)], dtype=np.int64
+            )
+            return self._read_dense(dataset, boundaries)
+
         indexer = MultiBasicIndexer(
             [
                 zarr.core.indexing.BasicIndexer(

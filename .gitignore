@@ -8,6 +8,9 @@ venv/
 .venv/
 __pycache__/
 .*cache/
+build/
+*.so
+*.o
 
 # Distribution / packaging
 /dist/
@@ -20,3 +23,5 @@ __pycache__/
 # docs
 /docs/generated/
 /docs/_build/
+
+*/target/*
