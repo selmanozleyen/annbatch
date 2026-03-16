@@ -23,3 +23,4 @@ build/
 # docs
 /docs/generated/
 /docs/_build/
+zarrs_direct/target/*

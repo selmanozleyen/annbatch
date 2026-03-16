@@ -12,6 +12,12 @@ struct FusedGroup {
     slices: Vec<(usize, usize, usize)>,
 }
 
+impl FusedGroup {
+    fn is_trivial(&self) -> bool {
+        self.slices.len() == 1 && self.slices[0].1 == 0
+    }
+}
+
 fn fuse_sorted_ranges(
     order: &[usize], starts: &[i64], stops: &[i64], row_bytes: usize,
 ) -> Vec<FusedGroup> {
@@ -55,8 +61,6 @@ fn build_groups(starts: &[i64], stops: &[i64], row_bytes: usize, fuse: bool) -> 
     }
 }
 
-// -- mmap path: pointer arithmetic + direct blosc_decompress ----------------
-
 fn shard_index_mmap<'a>(mmap: &'a Mmap, meta: &ShardMeta) -> &'a [u64] {
     let len = mmap.len();
     let bytes = &mmap[len - meta.shard_index_size..len - 4];
@@ -67,6 +71,127 @@ unsafe fn blosc_decompress(src: *const u8, dst: *mut u8, dst_size: usize) {
     blosc_src::blosc_decompress(
         src as *const std::ffi::c_void, dst as *mut std::ffi::c_void, dst_size,
     );
+}
+
+// Decompress chunks for a range [sel0..sel1) into `dst` at byte offset `dst_off`.
+// Uses mmap pointers for I/O. Returns Ok(()) on success.
+fn decompress_range_mmap(
+    store: &MmapStore, meta: &ShardMeta, sel0: u64, sel1: u64,
+    dst: &mut [u8], dst_off: usize, tmp: &mut Option<Vec<u8>>,
+) -> PyResult<()> {
+    let rb = meta.row_bytes;
+    let chunk_rows = meta.chunk_shape[0];
+    let shard_rows = meta.shard_shape[0];
+    let chunk_bytes = meta.inner_chunk_nbytes();
+    let ndim_extra = meta.ndim - 1;
+    let mut row = sel0;
+    let mut boff = dst_off;
+
+    while row < sel1 {
+        let si = row / shard_rows;
+        let mut idx = vec![si];
+        for _ in 0..ndim_extra { idx.push(0); }
+        let key = meta.shard_key(&idx)?;
+        let mmap = store.get_mmap_direct(&key)
+            .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
+            .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
+        let sidx = shard_index_mmap(&mmap, meta);
+        let sbase = si * shard_rows;
+
+        while row < sel1 && row < sbase + shard_rows {
+            let ci = ((row - sbase) / chunk_rows) as usize;
+            let cbase = sbase + ci as u64 * chunk_rows;
+            let cend = cbase + chunk_rows;
+            let off = sidx[ci * meta.idx_stride] as usize;
+            let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
+            let t1 = (sel1.min(cend) - cbase) as usize;
+            let nt = t1 - t0;
+
+            if t0 == 0 && nt == chunk_rows as usize {
+                unsafe { blosc_decompress(mmap.as_ptr().add(off), dst.as_mut_ptr().add(boff), chunk_bytes); }
+            } else {
+                let tb = tmp.get_or_insert_with(|| vec![0u8; chunk_bytes]);
+                if tb.len() < chunk_bytes { tb.resize(chunk_bytes, 0); }
+                unsafe { blosc_decompress(mmap.as_ptr().add(off), tb.as_mut_ptr(), chunk_bytes); }
+                let s = t0 * rb;
+                dst[boff..boff + nt * rb].copy_from_slice(&tb[s..s + nt * rb]);
+            }
+            boff += nt * rb;
+            row = cbase + t1 as u64;
+        }
+    }
+    Ok(())
+}
+
+fn decompress_range_pread(
+    store: &PreadStore, meta: &ShardMeta, sel0: u64, sel1: u64,
+    dst: &mut [u8], dst_off: usize, tmp: &mut Option<Vec<u8>>,
+) -> PyResult<()> {
+    let rb = meta.row_bytes;
+    let chunk_rows = meta.chunk_shape[0];
+    let shard_rows = meta.shard_shape[0];
+    let chunk_bytes = meta.inner_chunk_nbytes();
+    let ndim_extra = meta.ndim - 1;
+    let mut row = sel0;
+    let mut boff = dst_off;
+
+    while row < sel1 {
+        let si = row / shard_rows;
+        let mut idx = vec![si];
+        for _ in 0..ndim_extra { idx.push(0); }
+        let key = meta.shard_key(&idx)?;
+        let sf = store.read_shard(&key, meta.shard_index_size)
+            .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
+            .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
+        let sidx = sf.read_index();
+        let sbase = si * shard_rows;
+
+        while row < sel1 && row < sbase + shard_rows {
+            let ci = ((row - sbase) / chunk_rows) as usize;
+            let cbase = sbase + ci as u64 * chunk_rows;
+            let cend = cbase + chunk_rows;
+            let off = sidx[ci * meta.idx_stride] as usize;
+            let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
+            let t1 = (sel1.min(cend) - cbase) as usize;
+            let nt = t1 - t0;
+
+            if t0 == 0 && nt == chunk_rows as usize {
+                sf.read_chunk(off, &mut dst[boff..boff + chunk_bytes]);
+            } else {
+                let tb = tmp.get_or_insert_with(|| vec![0u8; chunk_bytes]);
+                if tb.len() < chunk_bytes { tb.resize(chunk_bytes, 0); }
+                sf.read_chunk(off, tb);
+                let s = t0 * rb;
+                dst[boff..boff + nt * rb].copy_from_slice(&tb[s..s + nt * rb]);
+            }
+            boff += nt * rb;
+            row = cbase + t1 as u64;
+        }
+    }
+    Ok(())
+}
+
+// Shared group-dispatch logic. For trivial groups (single slice, no merge),
+// decompress directly into `out`, skipping the intermediate buffer entirely.
+macro_rules! dispatch_groups {
+    ($groups:expr, $out:expr, $out_off:expr, $rb:expr, $tmp:expr,
+     $decompress_fn:expr) => {
+        for g in $groups {
+            let (sel0, sel1) = (g.fused_start, g.fused_stop);
+            if g.is_trivial() {
+                let oi = g.slices[0].0;
+                $decompress_fn(sel0, sel1, $out, $out_off[oi], $tmp)?;
+            } else {
+                let fused_bytes = (sel1 - sel0) as usize * $rb;
+                let mut fbuf = vec![0u8; fused_bytes];
+                $decompress_fn(sel0, sel1, &mut fbuf, 0, $tmp)?;
+                for &(oi, so, sl) in &g.slices {
+                    let dst = $out_off[oi];
+                    $out[dst..dst + sl].copy_from_slice(&fbuf[so..so + sl]);
+                }
+            }
+        }
+    };
 }
 
 pub fn read_direct_mmap(
@@ -82,59 +207,14 @@ pub fn read_direct_mmap(
     for i in 0..n { out_off[i] = acc; acc += range_bytes[i]; }
 
     let fused = build_groups(starts, stops, rb, fuse);
-    let chunk_rows = meta.chunk_shape[0];
-    let shard_rows = meta.shard_shape[0];
-    let chunk_bytes = meta.inner_chunk_nbytes();
-    let ndim_extra = meta.ndim - 1;
     let mut tmp: Option<Vec<u8>> = None;
 
-    for g in &fused {
-        let (sel0, sel1) = (g.fused_start, g.fused_stop);
-        let mut fbuf = vec![0u8; (sel1 - sel0) as usize * rb];
-        let mut row = sel0;
-        let mut boff = 0usize;
-
-        while row < sel1 {
-            let si = row / shard_rows;
-            let mut idx = vec![si];
-            for _ in 0..ndim_extra { idx.push(0); }
-            let key = meta.shard_key(&idx)?;
-            let mmap = store.get_mmap_direct(&key)
-                .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
-                .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
-            let sidx = shard_index_mmap(&mmap, meta);
-            let sbase = si * shard_rows;
-
-            while row < sel1 && row < sbase + shard_rows {
-                let ci = ((row - sbase) / chunk_rows) as usize;
-                let cbase = sbase + ci as u64 * chunk_rows;
-                let cend = cbase + chunk_rows;
-                let off = sidx[ci * meta.idx_stride] as usize;
-                let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
-                let t1 = (sel1.min(cend) - cbase) as usize;
-                let nt = t1 - t0;
-
-                if t0 == 0 && nt == chunk_rows as usize {
-                    unsafe { blosc_decompress(mmap.as_ptr().add(off), fbuf.as_mut_ptr().add(boff), chunk_bytes); }
-                } else {
-                    let tb = tmp.get_or_insert_with(|| vec![0u8; chunk_bytes]);
-                    if tb.len() < chunk_bytes { tb.resize(chunk_bytes, 0); }
-                    unsafe { blosc_decompress(mmap.as_ptr().add(off), tb.as_mut_ptr(), chunk_bytes); }
-                    let s = t0 * rb;
-                    fbuf[boff..boff + nt * rb].copy_from_slice(&tb[s..s + nt * rb]);
-                }
-                boff += nt * rb;
-                row = cbase + t1 as u64;
-            }
-        }
-        for &(oi, so, sl) in &g.slices {
-            out[out_off[oi]..out_off[oi] + sl].copy_from_slice(&fbuf[so..so + sl]);
-        }
-    }
+    dispatch_groups!(&fused, &mut out, &out_off, rb, &mut tmp,
+        |sel0, sel1, dst: &mut [u8], dst_off, tmp: &mut Option<Vec<u8>>|
+            decompress_range_mmap(store, meta, sel0, sel1, dst, dst_off, tmp)
+    );
     Ok(out)
 }
-
-// -- pread path: read_at + blosc_decompress ---------------------------------
 
 pub fn read_direct_pread(
     store: &PreadStore, meta: &ShardMeta, starts: &[i64], stops: &[i64], fuse: bool,
@@ -149,54 +229,11 @@ pub fn read_direct_pread(
     for i in 0..n { out_off[i] = acc; acc += range_bytes[i]; }
 
     let fused = build_groups(starts, stops, rb, fuse);
-    let chunk_rows = meta.chunk_shape[0];
-    let shard_rows = meta.shard_shape[0];
-    let chunk_bytes = meta.inner_chunk_nbytes();
-    let ndim_extra = meta.ndim - 1;
     let mut tmp: Option<Vec<u8>> = None;
 
-    for g in &fused {
-        let (sel0, sel1) = (g.fused_start, g.fused_stop);
-        let mut fbuf = vec![0u8; (sel1 - sel0) as usize * rb];
-        let mut row = sel0;
-        let mut boff = 0usize;
-
-        while row < sel1 {
-            let si = row / shard_rows;
-            let mut idx = vec![si];
-            for _ in 0..ndim_extra { idx.push(0); }
-            let key = meta.shard_key(&idx)?;
-            let sf = store.read_shard(&key, meta.shard_index_size)
-                .map_err(|e| PyValueError::new_err(format!("store error: {e}")))?
-                .ok_or_else(|| PyValueError::new_err(format!("shard not found: {}", key.as_str())))?;
-            let sidx = sf.read_index();
-            let sbase = si * shard_rows;
-
-            while row < sel1 && row < sbase + shard_rows {
-                let ci = ((row - sbase) / chunk_rows) as usize;
-                let cbase = sbase + ci as u64 * chunk_rows;
-                let cend = cbase + chunk_rows;
-                let off = sidx[ci * meta.idx_stride] as usize;
-                let t0 = if row > cbase { (row - cbase) as usize } else { 0 };
-                let t1 = (sel1.min(cend) - cbase) as usize;
-                let nt = t1 - t0;
-
-                if t0 == 0 && nt == chunk_rows as usize {
-                    sf.read_chunk(off, &mut fbuf[boff..boff + chunk_bytes]);
-                } else {
-                    let tb = tmp.get_or_insert_with(|| vec![0u8; chunk_bytes]);
-                    if tb.len() < chunk_bytes { tb.resize(chunk_bytes, 0); }
-                    sf.read_chunk(off, tb);
-                    let s = t0 * rb;
-                    fbuf[boff..boff + nt * rb].copy_from_slice(&tb[s..s + nt * rb]);
-                }
-                boff += nt * rb;
-                row = cbase + t1 as u64;
-            }
-        }
-        for &(oi, so, sl) in &g.slices {
-            out[out_off[oi]..out_off[oi] + sl].copy_from_slice(&fbuf[so..so + sl]);
-        }
-    }
+    dispatch_groups!(&fused, &mut out, &out_off, rb, &mut tmp,
+        |sel0, sel1, dst: &mut [u8], dst_off, tmp: &mut Option<Vec<u8>>|
+            decompress_range_pread(store, meta, sel0, sel1, dst, dst_off, tmp)
+    );
     Ok(out)
 }
