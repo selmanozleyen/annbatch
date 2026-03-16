@@ -125,8 +125,8 @@ class Loader[
             See
         io_backend
             I/O strategy for reading dense data from local sharded zarr stores.
-            ``"pread"`` (default) reads compressed chunks on demand via pread(2).
-            ``"mmap"`` maps entire shard files into memory for zero-copy access.
+            ``"mmap"`` (default) maps shard files into memory for zero-copy access.
+            ``"pread"`` reads compressed chunks on demand via pread(2).
             Both use the C extension when available, falling back to pure Python.
             Only applies to local sharded zarr arrays; non-local or non-sharded
             stores always go through zarr's standard async pipeline.
@@ -185,7 +185,7 @@ class Loader[
         to_torch: bool = find_spec("torch") is not None,
         concat_strategy: None | concat_strategies = None,
         rng: np.random.Generator | None = None,
-        io_backend: IoBackend = "pread",
+        io_backend: IoBackend = "mmap",
     ):
         sampler_args = {
             "chunk_size": chunk_size,
