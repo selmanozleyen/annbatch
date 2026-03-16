@@ -2,8 +2,8 @@
 
 Provides two I/O backends selectable via ``io_backend``:
 
-* ``"mmap"`` (default) -- maps shard files into memory for zero-copy access.
-* ``"pread"`` -- reads compressed chunks on demand via pread(2).
+* ``"pread"`` (default) -- reads compressed chunks on demand via pread(2).
+* ``"mmap"``  -- maps shard files into memory for zero-copy access.
 
 Both backends use an optional C extension for the hot inner loop
 (shard index parse + blosc decompress + memcpy) and fall back to a
@@ -687,16 +687,20 @@ _1D_DISPATCH: dict[IoBackend, object] = {
 }
 
 
-def get_read_dense(backend: IoBackend = "mmap"):
-    """Return the dense reader function for the given I/O backend."""
+def get_read_dense(backend: IoBackend | None = "pread"):
+    """Return the dense reader function for the given I/O backend, or None."""
+    if backend is None:
+        return None
     try:
         return _DENSE_DISPATCH[backend]
     except KeyError:
         raise ValueError(f"Unknown io_backend: {backend!r}. Choose from {list(_DENSE_DISPATCH)}") from None
 
 
-def get_read_1d(backend: IoBackend = "mmap"):
-    """Return the 1-D reader function for the given I/O backend."""
+def get_read_1d(backend: IoBackend | None = "pread"):
+    """Return the 1-D reader function for the given I/O backend, or None."""
+    if backend is None:
+        return None
     try:
         return _1D_DISPATCH[backend]
     except KeyError:
