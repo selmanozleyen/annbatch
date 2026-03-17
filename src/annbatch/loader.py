@@ -127,10 +127,14 @@ class Loader[
             I/O strategy for reading dense data from local sharded zarr stores.
             ``"pread"`` (default) reads compressed chunks on demand via pread(2).
             ``"mmap"`` maps shard files into memory for zero-copy access.
+            ``"pread_mt"`` uses multi-threaded pread with concurrent I/O and
+            decompression via pthreads (requires the C extension).
             ``None`` disables the direct reader and uses zarr's default async pipeline.
-            Both ``"pread"`` and ``"mmap"`` use the C extension when available,
-            falling back to pure Python. Only applies to local sharded zarr
-            arrays; non-local or non-sharded stores always use the async pipeline.
+            ``"pread"``, ``"mmap"``, and ``"pread_mt"`` use the C extension when
+            available, falling back to pure Python (except ``"pread_mt"`` which
+            falls back to single-threaded ``"pread"``). Only applies to local
+            sharded zarr arrays; non-local or non-sharded stores always use
+            the async pipeline.
 
 
     Examples

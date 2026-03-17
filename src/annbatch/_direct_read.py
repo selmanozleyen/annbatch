@@ -43,13 +43,22 @@ def _find_blosc_lib() -> ctypes.CDLL:
 _blosc_lib = _find_blosc_lib()
 
 try:
-    from annbatch._shard_reader import _init_blosc, pread_into_1d, pread_into_dense, read_into_1d, read_into_dense
-
-    _addr = ctypes.cast(_blosc_lib.blosc_decompress, ctypes.c_void_p).value
-    _init_blosc(_addr)
+    from annbatch._shard_reader import (
+        _init_blosc,
+        read_into_dense, read_into_1d,
+        pread_into_dense, pread_into_1d,
+        pread_mt_into_dense, pread_mt_into_1d,
+    )
+    _decompress_addr = ctypes.cast(_blosc_lib.blosc_decompress, ctypes.c_void_p).value
+    _set_nthreads_addr = ctypes.cast(_blosc_lib.blosc_set_nthreads, ctypes.c_void_p).value
+    _init_blosc(_decompress_addr, _set_nthreads_addr)
     _HAS_C_EXT = True
+    print("[annbatch] C extension _shard_reader loaded (mmap, pread, pread_mt available)")
 except ImportError:
     _HAS_C_EXT = False
+    print("[annbatch] C extension not found; falling back to pure-Python readers")
+
+DEFAULT_IO_THREADS = min(os.cpu_count() or 4, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -672,18 +681,127 @@ def _pread_1d_python_fallback(
 
 
 # ---------------------------------------------------------------------------
+# Multi-threaded pread dense reader
+# ---------------------------------------------------------------------------
+def read_pread_mt_dense(arr: zarr.Array, boundaries: np.ndarray, n_threads: int = DEFAULT_IO_THREADS) -> np.ndarray:
+    """Like read_pread_dense but with concurrent I/O + decompression threads."""
+    if not _HAS_C_EXT:
+        return read_pread_dense(arr, boundaries)
+
+    (
+        disk_root, shape, shard_shape, inner_chunk_shape,
+        chunks_per_shard, shard_index_size, dtype, blosc_codec,
+    ) = _parse_sharding_metadata(arr)
+
+    starts = boundaries[::2]
+    stops = boundaries[1::2]
+    total_rows = (stops - starts).sum()
+    ndim = len(shape)
+    out = np.empty((total_rows, *shape[1:]), dtype=dtype)
+
+    inner_row_size = inner_chunk_shape[0]
+    shard_row_size = shard_shape[0]
+    inner_chunk_nbytes = int(np.prod(inner_chunk_shape) * dtype.itemsize)
+    row_nbytes = int(np.prod(shape[1:]) * dtype.itemsize) if ndim > 1 else dtype.itemsize
+    ndim_extra = ndim - 1
+    idx_stride = int(np.prod(chunks_per_shard[1:]) * 2) if ndim > 1 else 2
+
+    cache = _PreadCache()
+    try:
+        out_offset = 0
+        for i in range(len(starts)):
+            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            row = sel_start
+
+            while row < sel_stop:
+                shard_row_idx = row // shard_row_size
+                shard_key = (shard_row_idx,) + (0,) * ndim_extra
+                parts = "/".join(str(k) for k in shard_key)
+                shard_path = disk_root / "c" / parts
+
+                fd, shard_index, file_size = cache.get(shard_path, shard_index_size, chunks_per_shard)
+                shard_base = shard_row_idx * shard_row_size
+                idx_flat = shard_index.ravel()
+
+                rows_written, row = pread_mt_into_dense(
+                    fd, idx_flat, out,
+                    inner_chunk_nbytes, inner_row_size, shard_row_size,
+                    shard_base, row, sel_stop, out_offset,
+                    row_nbytes, idx_stride, n_threads,
+                )
+                out_offset += rows_written
+    finally:
+        cache.clear()
+
+    return out
+
+
+def read_pread_mt_1d(arr: zarr.Array, boundaries: np.ndarray, n_threads: int = DEFAULT_IO_THREADS) -> np.ndarray:
+    """Like read_pread_1d but with concurrent I/O + decompression threads."""
+    if not _HAS_C_EXT:
+        return read_pread_1d(arr, boundaries)
+
+    if isinstance(arr, zarr.AsyncArray):
+        arr = zarr.Array(arr)
+
+    (
+        disk_root, shape, shard_shape, inner_chunk_shape,
+        chunks_per_shard, shard_index_size, dtype, blosc_codec,
+    ) = _parse_sharding_metadata(arr)
+
+    starts = boundaries[::2]
+    stops = boundaries[1::2]
+    total = (stops - starts).sum()
+    out = np.empty(total, dtype=dtype)
+
+    inner_size = inner_chunk_shape[0]
+    shard_size = shard_shape[0]
+    inner_chunk_nbytes = inner_size * dtype.itemsize
+    elem_nbytes = dtype.itemsize
+
+    cache = _PreadCache()
+    try:
+        out_offset = 0
+        for i in range(len(starts)):
+            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            pos = sel_start
+
+            while pos < sel_stop:
+                shard_idx = pos // shard_size
+                shard_path = disk_root / "c" / str(shard_idx)
+
+                fd, shard_index, file_size = cache.get(shard_path, shard_index_size, chunks_per_shard)
+                shard_base = shard_idx * shard_size
+                idx_flat = shard_index.ravel()
+
+                elems_written, pos = pread_mt_into_1d(
+                    fd, idx_flat, out,
+                    inner_chunk_nbytes, inner_size, shard_size,
+                    shard_base, pos, sel_stop, out_offset,
+                    elem_nbytes, n_threads,
+                )
+                out_offset += elems_written
+    finally:
+        cache.clear()
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
-IoBackend = Literal["pread", "mmap"]
+IoBackend = Literal["pread", "mmap", "pread_mt"]
 
 _DENSE_DISPATCH: dict[IoBackend, object] = {
     "pread": read_pread_dense,
     "mmap": read_direct_dense,
+    "pread_mt": read_pread_mt_dense,
 }
 
 _1D_DISPATCH: dict[IoBackend, object] = {
     "pread": read_pread_1d,
     "mmap": read_direct_1d,
+    "pread_mt": read_pread_mt_1d,
 }
 
 
