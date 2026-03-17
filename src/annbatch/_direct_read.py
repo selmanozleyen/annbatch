@@ -481,7 +481,9 @@ def read_pread_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                 fd, shard_index, file_size = cache.get(shard_path, shard_index_size, chunks_per_shard)
                 shard_base = shard_row_idx * shard_row_size
                 idx_flat = shard_index.ravel()
-                max_compressed = int(idx_flat[1::2].max())
+                lengths = idx_flat[1::2]
+                valid = lengths[lengths != np.iinfo(np.uint64).max]
+                max_compressed = int(valid.max()) if len(valid) else inner_chunk_nbytes
 
                 if _HAS_C_EXT:
                     rows_written, row = pread_into_dense(
@@ -583,13 +585,13 @@ def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
-    total = (stops - starts).sum()
+    total = int((stops - starts).sum())
     out = np.empty(total, dtype=dtype)
 
-    inner_size = inner_chunk_shape[0]
-    shard_size = shard_shape[0]
-    inner_chunk_nbytes = inner_size * dtype.itemsize
-    elem_nbytes = dtype.itemsize
+    inner_size = int(inner_chunk_shape[0])
+    shard_size = int(shard_shape[0])
+    inner_chunk_nbytes = int(inner_size * dtype.itemsize)
+    elem_nbytes = int(dtype.itemsize)
 
     cache = _PreadCache()
     try:
@@ -603,26 +605,28 @@ def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                 shard_path = disk_root / "c" / str(shard_idx)
 
                 fd, shard_index, file_size = cache.get(shard_path, shard_index_size, chunks_per_shard)
-                shard_base = shard_idx * shard_size
+                shard_base = int(shard_idx * shard_size)
                 idx_flat = shard_index.ravel()
-                max_compressed = int(idx_flat[1::2].max())
+                lengths = idx_flat[1::2]
+                valid = lengths[lengths != np.iinfo(np.uint64).max]
+                max_compressed = int(valid.max()) if len(valid) else inner_chunk_nbytes
 
                 if _HAS_C_EXT:
                     elems_written, pos = pread_into_1d(
                         fd,
                         idx_flat,
                         out,
-                        inner_chunk_nbytes,
-                        inner_size,
-                        shard_size,
-                        shard_base,
-                        pos,
-                        sel_stop,
-                        out_offset,
-                        elem_nbytes,
-                        max_compressed,
+                        int(inner_chunk_nbytes),
+                        int(inner_size),
+                        int(shard_size),
+                        int(shard_base),
+                        int(pos),
+                        int(sel_stop),
+                        int(out_offset),
+                        int(elem_nbytes),
+                        int(max_compressed),
                     )
-                    out_offset += elems_written
+                    out_offset += int(elems_written)
                 else:
                     pos, out_offset = _pread_1d_python_fallback(
                         fd,
@@ -754,10 +758,10 @@ def read_pread_mt_1d(arr: zarr.Array, boundaries: np.ndarray, n_threads: int = D
     total = (stops - starts).sum()
     out = np.empty(total, dtype=dtype)
 
-    inner_size = inner_chunk_shape[0]
-    shard_size = shard_shape[0]
-    inner_chunk_nbytes = inner_size * dtype.itemsize
-    elem_nbytes = dtype.itemsize
+    inner_size = int(inner_chunk_shape[0])
+    shard_size = int(shard_shape[0])
+    inner_chunk_nbytes = int(inner_size * dtype.itemsize)
+    elem_nbytes = int(dtype.itemsize)
 
     cache = _PreadCache()
     try:
@@ -771,7 +775,7 @@ def read_pread_mt_1d(arr: zarr.Array, boundaries: np.ndarray, n_threads: int = D
                 shard_path = disk_root / "c" / str(shard_idx)
 
                 fd, shard_index, file_size = cache.get(shard_path, shard_index_size, chunks_per_shard)
-                shard_base = shard_idx * shard_size
+                shard_base = int(shard_idx * shard_size)
                 idx_flat = shard_index.ravel()
 
                 elems_written, pos = pread_mt_into_1d(

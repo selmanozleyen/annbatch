@@ -15,7 +15,7 @@ import zarr.core.sync as zsync
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
-from annbatch._direct_read import IoBackend, get_read_dense
+from annbatch._direct_read import IoBackend, get_read_dense, get_read_1d
 from annbatch.samplers import ChunkSampler
 from annbatch.types import BackingArray_T, InputInMemoryArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
@@ -228,6 +228,7 @@ class Loader[
         self._concat_strategy = concat_strategy
         self._io_backend = io_backend
         self._read_dense = get_read_dense(io_backend)
+        self._read_1d = get_read_1d(io_backend)
 
     def __len__(self) -> int:
         return self._batch_sampler.n_iters(self.n_obs)
@@ -695,16 +696,32 @@ class Loader[
         indptr, indices, data = dataset
         indptr_indices = [indptr[slice(s.start, s.stop + 1)] for s in slices]
         indptr_limits = [slice(i[0], i[-1]) for i in indptr_indices]
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer((l,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
-                for l in indptr_limits
-            ]
+
+        use_direct = (
+            self._read_1d is not None
+            and self._can_direct_read(data)
+            and self._can_direct_read(indices)
         )
-        data_np, indices_np = await asyncio.gather(
-            data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
-            indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
-        )
+
+        if use_direct:
+            boundaries = np.array(
+                [v for lim in indptr_limits for v in (lim.start, lim.stop)],
+                dtype=np.int64,
+            )
+            data_np = self._read_1d(data, boundaries)
+            indices_np = self._read_1d(indices, boundaries)
+        else:
+            indexer = MultiBasicIndexer(
+                [
+                    zarr.core.indexing.BasicIndexer((l,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
+                    for l in indptr_limits
+                ]
+            )
+            data_np, indices_np = await asyncio.gather(
+                data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
+                indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
+            )
+
         gaps = (s1.start - s0.stop for s0, s1 in pairwise(indptr_limits))
         offsets = accumulate(chain([indptr_limits[0].start], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
