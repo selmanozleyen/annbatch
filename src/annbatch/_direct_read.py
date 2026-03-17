@@ -132,9 +132,23 @@ class _MmapCache:
 
 
 # ---------------------------------------------------------------------------
+# Metadata cache (avoids re-parsing zarr metadata on every call)
+# ---------------------------------------------------------------------------
+_metadata_cache: dict[int, tuple] = {}
+
+def _get_sharding_metadata(arr: zarr.Array) -> tuple:
+    key = id(arr)
+    if key not in _metadata_cache:
+        _metadata_cache[key] = _parse_sharding_metadata(arr)
+    return _metadata_cache[key]
+
+
+# ---------------------------------------------------------------------------
 # Dense reader
 # ---------------------------------------------------------------------------
-def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+def read_direct_dense(
+    arr: zarr.Array, boundaries: np.ndarray, cache: _MmapCache | None = None,
+) -> np.ndarray:
     """Read axis-0 ranges from a sharded zarr array, bypassing async machinery.
 
     Parameters
@@ -143,6 +157,9 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
         A zarr v3 ``Array`` backed by ``LocalStore`` with ``ShardingCodec``.
     boundaries
         Interleaved ``[s0, e0, s1, e1, ...]`` int array of axis-0 ranges.
+    cache
+        Persistent ``_MmapCache``.  When *None* a temporary one is created
+        and torn down after the call (slow on networked filesystems).
 
     Returns
     -------
@@ -151,7 +168,7 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     (
         disk_root, shape, shard_shape, inner_chunk_shape,
         chunks_per_shard, shard_index_size, dtype, blosc_codec,
-    ) = _parse_sharding_metadata(arr)
+    ) = _get_sharding_metadata(arr)
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
@@ -164,12 +181,11 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     inner_chunk_nbytes = np.prod(inner_chunk_shape) * dtype.itemsize
     row_nbytes = np.prod(shape[1:]) * dtype.itemsize if ndim > 1 else dtype.itemsize
     ndim_extra = ndim - 1
-    # Flat stride between consecutive axis-0 chunks in the shard index.
-    # Index shape is (*chunks_per_shard, 2); axis-0 stride in the
-    # flattened view = product(chunks_per_shard[1:]) * 2.
     idx_stride = np.prod(chunks_per_shard[1:]) * 2 if ndim > 1 else 2
 
-    cache = _MmapCache()
+    own_cache = cache is None
+    if own_cache:
+        cache = _MmapCache()
     try:
         out_offset = 0
         for i in range(len(starts)):
@@ -184,7 +200,6 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
 
                 shard_np, shard_index = cache.get(shard_path, shard_index_size, chunks_per_shard)
                 shard_base = shard_row_idx * shard_row_size
-                # Flatten the index once for this shard
                 idx_flat = shard_index.ravel()
 
                 if _HAS_C_EXT:
@@ -202,7 +217,8 @@ def read_direct_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                         shard_base, row, sel_stop, out_offset, idx_stride,
                     )
     finally:
-        cache.clear()
+        if own_cache:
+            cache.clear()
 
     return out
 
@@ -240,7 +256,9 @@ def _dense_python_fallback(
 # ---------------------------------------------------------------------------
 # 1-D reader (for CSR data/indices arrays)
 # ---------------------------------------------------------------------------
-def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+def read_direct_1d(
+    arr: zarr.Array, boundaries: np.ndarray, cache: _MmapCache | None = None,
+) -> np.ndarray:
     """Read ranges from a 1-D sharded zarr array (e.g. CSR data/indices).
 
     Same as ``read_direct_dense`` but specialized for 1-D arrays.
@@ -251,7 +269,7 @@ def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     (
         disk_root, shape, shard_shape, inner_chunk_shape,
         chunks_per_shard, shard_index_size, dtype, blosc_codec,
-    ) = _parse_sharding_metadata(arr)
+    ) = _get_sharding_metadata(arr)
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
@@ -263,7 +281,9 @@ def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     inner_chunk_nbytes = inner_size * dtype.itemsize
     elem_nbytes = dtype.itemsize
 
-    cache = _MmapCache()
+    own_cache = cache is None
+    if own_cache:
+        cache = _MmapCache()
     try:
         out_offset = 0
         for i in range(len(starts)):
@@ -292,7 +312,8 @@ def read_direct_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                         shard_base, pos, sel_stop, out_offset,
                     )
     finally:
-        cache.clear()
+        if own_cache:
+            cache.clear()
 
     return out
 
@@ -363,12 +384,14 @@ class _PreadCache:
 # ---------------------------------------------------------------------------
 # pread-based readers
 # ---------------------------------------------------------------------------
-def read_pread_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+def read_pread_dense(
+    arr: zarr.Array, boundaries: np.ndarray, cache: _PreadCache | None = None,
+) -> np.ndarray:
     """Read axis-0 ranges via pread, bypassing mmap and zarr async."""
     (
         disk_root, shape, shard_shape, inner_chunk_shape,
         chunks_per_shard, shard_index_size, dtype, _blosc_codec,
-    ) = _parse_sharding_metadata(arr)
+    ) = _get_sharding_metadata(arr)
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
@@ -383,7 +406,9 @@ def read_pread_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     ndim_extra = ndim - 1
     idx_stride = int(np.prod(chunks_per_shard[1:]) * 2) if ndim > 1 else 2
 
-    cache = _PreadCache()
+    own_cache = cache is None
+    if own_cache:
+        cache = _PreadCache()
     try:
         out_offset = 0
         for i in range(len(starts)):
@@ -405,11 +430,14 @@ def read_pread_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                 )
                 out_offset += rows_written
     finally:
-        cache.clear()
+        if own_cache:
+            cache.clear()
     return out
 
 
-def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+def read_pread_1d(
+    arr: zarr.Array, boundaries: np.ndarray, cache: _PreadCache | None = None,
+) -> np.ndarray:
     """Read ranges from a 1-D sharded zarr array via pread."""
     if isinstance(arr, zarr.AsyncArray):
         arr = zarr.Array(arr)
@@ -417,7 +445,7 @@ def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     (
         disk_root, shape, shard_shape, inner_chunk_shape,
         chunks_per_shard, shard_index_size, dtype, _blosc_codec,
-    ) = _parse_sharding_metadata(arr)
+    ) = _get_sharding_metadata(arr)
 
     starts = boundaries[::2]
     stops = boundaries[1::2]
@@ -429,7 +457,9 @@ def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
     inner_chunk_nbytes = int(inner_size * dtype.itemsize)
     elem_nbytes = int(dtype.itemsize)
 
-    cache = _PreadCache()
+    own_cache = cache is None
+    if own_cache:
+        cache = _PreadCache()
     try:
         out_offset = 0
         for i in range(len(starts)):
@@ -449,5 +479,6 @@ def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
                 )
                 out_offset += elems_written
     finally:
-        cache.clear()
+        if own_cache:
+            cache.clear()
     return out

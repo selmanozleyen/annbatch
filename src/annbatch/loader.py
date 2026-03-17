@@ -36,6 +36,7 @@ from annbatch.utils import (
 from annbatch._direct_read import (
     read_direct_dense as _c_read_dense, read_direct_1d as _c_read_1d,
     read_pread_dense as _c_pread_dense, read_pread_1d as _c_pread_1d,
+    _MmapCache, _PreadCache,
 )
 
 from .compat import IterableDataset
@@ -243,6 +244,8 @@ class Loader[
 
         Both functions accept ``(arr, starts, stops)`` and return an ndarray.
         Returns ``(None, None)`` when no direct backend is active (zarr async).
+        The returned closures hold a persistent cache (mmap handles or fds)
+        that lives for the lifetime of the Loader.
         """
         if backend is None:
             print("[annbatch] Using zarr async backend")
@@ -255,23 +258,27 @@ class Loader[
                 "Build it with: python build_ext.py"
             )
 
+        if backend == "mmap":
+            cache = _MmapCache()
+            print("[annbatch] Using C extension with mmap backend")
+        elif backend == "pread":
+            cache = _PreadCache()
+            print("[annbatch] Using C extension with pread backend")
+        else:
+            raise ValueError(f"Unknown backend: {backend!r}. Choose 'mmap', 'pread', or None.")
+
+        read_dense = _c_read_dense if backend == "mmap" else _c_pread_dense
+        read_1d = _c_read_1d if backend == "mmap" else _c_pread_1d
+
         def _wrap(fn):
             def wrapper(arr, starts, stops):
                 interleaved = np.empty(2 * len(starts), dtype=np.intp)
                 interleaved[::2] = starts
                 interleaved[1::2] = stops
-                return fn(arr, interleaved)
+                return fn(arr, interleaved, cache=cache)
             return wrapper
 
-        if backend == "mmap":
-            print("[annbatch] Using C extension with mmap backend")
-            return _wrap(_c_read_dense), _wrap(_c_read_1d)
-
-        if backend == "pread":
-            print("[annbatch] Using C extension with pread backend")
-            return _wrap(_c_pread_dense), _wrap(_c_pread_1d)
-
-        raise ValueError(f"Unknown backend: {backend!r}. Choose 'mmap', 'pread', or None.")
+        return _wrap(read_dense), _wrap(read_1d)
 
     @property
     def _sp_module(self) -> ModuleType:
