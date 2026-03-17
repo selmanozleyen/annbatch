@@ -52,6 +52,7 @@ class CSRDatasetElems(NamedTuple):
     indptr: np.ndarray
     indices: zarr.AsyncArray
     data: zarr.AsyncArray
+    can_direct_read: bool = False
 
 
 def _cupy_dtype(dtype: np.dtype) -> np.dtype:
@@ -609,12 +610,6 @@ class Loader[
 
     @_fetch_data.register
     async def _fetch_data_dense(self, dataset: ZarrArray, slices: list[slice]) -> np.ndarray:
-        if self._read_dense is not None and self._can_direct_read(dataset):
-            boundaries = np.array(
-                [v for s in slices for v in (s.start, s.stop)], dtype=np.int64
-            )
-            return self._read_dense(dataset, boundaries)
-
         indexer = MultiBasicIndexer(
             [
                 zarr.core.indexing.BasicIndexer(
@@ -645,16 +640,18 @@ class Loader[
         """
         if isinstance(ds := self._train_datasets[idx], ZarrArray):
             raise ValueError(f"Requested sparse dataset at idx {idx} of {self._train_datasets} but found dense array")
-        indptr = await ds.group._async_group.getitem("indptr")
-        return CSRDatasetElems(
-            *(
-                await asyncio.gather(
-                    indptr.getitem(Ellipsis),
-                    ds.group._async_group.getitem("indices"),
-                    ds.group._async_group.getitem("data"),
-                )
-            )
+        indptr_arr = await ds.group._async_group.getitem("indptr")
+        indptr_np, indices_arr, data_arr = await asyncio.gather(
+            indptr_arr.getitem(Ellipsis),
+            ds.group._async_group.getitem("indices"),
+            ds.group._async_group.getitem("data"),
         )
+        direct = (
+            self._read_1d is not None
+            and self._can_direct_read(data_arr)
+            and self._can_direct_read(indices_arr)
+        )
+        return CSRDatasetElems(indptr_np, indices_arr, data_arr, direct)
 
     async def _ensure_sparse_cache(self) -> None:
         """Build up the cache of datasets i.e., in-memory indptr, and backed indices and data."""
@@ -693,65 +690,95 @@ class Loader[
     ) -> CSRContainer:
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
         # for the inspiration of this function.
-        indptr, indices, data = dataset
+        indptr, indices, data, _use_direct = dataset
         indptr_indices = [indptr[slice(s.start, s.stop + 1)] for s in slices]
         indptr_limits = [slice(i[0], i[-1]) for i in indptr_indices]
 
-        use_direct = (
-            self._read_1d is not None
-            and self._can_direct_read(data)
-            and self._can_direct_read(indices)
+        indexer = MultiBasicIndexer(
+            [
+                zarr.core.indexing.BasicIndexer((l,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
+                for l in indptr_limits
+            ]
+        )
+        data_np, indices_np = await asyncio.gather(
+            data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
+            indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
         )
 
-        if use_direct:
-            boundaries = np.array(
-                [v for lim in indptr_limits for v in (lim.start, lim.stop)],
-                dtype=np.int64,
-            )
-            data_np = self._read_1d(data, boundaries)
-            indices_np = self._read_1d(indices, boundaries)
-        else:
-            indexer = MultiBasicIndexer(
-                [
-                    zarr.core.indexing.BasicIndexer((l,), shape=data.metadata.shape, chunk_grid=data.metadata.chunk_grid)
-                    for l in indptr_limits
-                ]
-            )
-            data_np, indices_np = await asyncio.gather(
-                data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
-                indices._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
-            )
+        return self._assemble_csr(data_np, indices_np, indptr_indices, indptr_limits, slices, self.n_var)
 
+    @staticmethod
+    def _assemble_csr(
+        data_np: np.ndarray,
+        indices_np: np.ndarray,
+        indptr_indices: list[np.ndarray],
+        indptr_limits: list[slice],
+        slices: list[slice],
+        n_var: int,
+    ) -> CSRContainer:
         gaps = (s1.start - s0.stop for s0, s1 in pairwise(indptr_limits))
         offsets = accumulate(chain([indptr_limits[0].start], gaps))
         start_indptr = indptr_indices[0] - next(offsets)
-        if len(slices) < 2:  # there is only one slice so no need to concatenate
+        if len(slices) < 2:
             return CSRContainer(
                 elems=(data_np, indices_np, start_indptr),
-                shape=(start_indptr.shape[0] - 1, self.n_var),
+                shape=(start_indptr.shape[0] - 1, n_var),
                 dtype=data_np.dtype,
             )
         end_indptr = np.concatenate([s[1:] - o for s, o in zip(indptr_indices[1:], offsets, strict=True)])
         indptr_np = np.concatenate([start_indptr, end_indptr])
         return CSRContainer(
             elems=(data_np, indices_np, indptr_np),
-            shape=(indptr_np.shape[0] - 1, self.n_var),
+            shape=(indptr_np.shape[0] - 1, n_var),
             dtype=data_np.dtype,
         )
+
+    def _fetch_direct_sparse(self, dataset: CSRDatasetElems, slices: list[slice]) -> CSRContainer:
+        """Synchronous direct-read path for sparse data (no async overhead)."""
+        indptr, indices, data, _use_direct = dataset
+        indptr_indices = [indptr[slice(s.start, s.stop + 1)] for s in slices]
+        indptr_limits = [slice(i[0], i[-1]) for i in indptr_indices]
+
+        n = len(indptr_limits)
+        boundaries = np.empty(n * 2, dtype=np.int64)
+        for j, lim in enumerate(indptr_limits):
+            boundaries[j * 2] = lim.start
+            boundaries[j * 2 + 1] = lim.stop
+
+        data_np = self._read_1d(data, boundaries)
+        indices_np = self._read_1d(indices, boundaries)
+
+        return self._assemble_csr(data_np, indices_np, indptr_indices, indptr_limits, slices, self.n_var)
+
+    def _fetch_direct_dense(self, dataset: ZarrArray, slices: list[slice]) -> np.ndarray:
+        """Synchronous direct-read path for dense data (no async overhead)."""
+        boundaries = np.array(
+            [v for s in slices for v in (s.start, s.stop)], dtype=np.int64
+        )
+        return self._read_dense(dataset, boundaries)
+
+    def _index_datasets_direct(
+        self,
+        dataset_index_to_slices: OrderedDict[int, list[slice]],
+    ) -> list[InputInMemoryArray]:
+        """Synchronous fetch path using the direct C reader -- no async/event-loop overhead."""
+        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        if is_sparse:
+            zsync.sync(self._ensure_sparse_cache())
+
+        results = []
+        for dataset_idx, slices in dataset_index_to_slices.items():
+            if is_sparse:
+                results.append(self._fetch_direct_sparse(self._get_elem_from_cache(dataset_idx), slices))
+            else:
+                results.append(self._fetch_direct_dense(self._train_datasets[dataset_idx], slices))
+        return results
 
     async def _index_datasets(
         self,
         dataset_index_to_slices: OrderedDict[int, list[slice]],
     ) -> list[InputInMemoryArray]:
-        """Helper function meant to encapsulate asynchronous calls so that we can use the same event loop as zarr.
-
-        Parameters
-        ----------
-            dataset_index_to_slices
-                A lookup of the list-placement index of a dataset to the request slices.
-            fetch_data
-                The function to do the fetching for a given slice-dataset index pair.
-        """
+        """Async fetch path using zarr's event loop (fallback when direct reader is unavailable)."""
         tasks = []
         if is_sparse := issubclass(self.dataset_type, ad.abc.CSRDataset):
             await self._ensure_sparse_cache()
@@ -780,14 +807,27 @@ class Loader[
             [len(self._train_datasets), self.n_obs],
             ["Number of datasets", "Number of observations"],
         )
-        mod = self._sp_module if issubclass(self.dataset_type, ad.abc.CSRDataset) else np
+        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        mod = self._sp_module if is_sparse else np
+
+        if is_sparse:
+            zsync.sync(self._ensure_sparse_cache())
+            use_direct = all(e.can_direct_read for e in self._dataset_elem_cache.values())
+        else:
+            use_direct = self._read_dense is not None and all(
+                self._can_direct_read(ds) for ds in self._train_datasets
+            )
+
         for load_request in self._batch_sampler.sample(self.n_obs):
             chunks_to_load = load_request["chunks"]
             splits = load_request["splits"]
             # Sampler yields a list of slices that sum to batch_size
             dataset_index_to_slices = self._slices_to_slices_with_array_index(chunks_to_load, use_original_space=False)
             # Fetch the data over slices
-            chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(dataset_index_to_slices))
+            if use_direct:
+                chunks: list[InputInMemoryArray] = self._index_datasets_direct(dataset_index_to_slices)
+            else:
+                chunks: list[InputInMemoryArray] = zsync.sync(self._index_datasets(dataset_index_to_slices))
             in_memory_data = self._accumulate_chunks(chunks)
             # Accumulate labels and indices if possible
             concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_slices)
