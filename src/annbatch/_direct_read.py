@@ -35,12 +35,17 @@ def _find_blosc_lib() -> ctypes.CDLL:
 _blosc_lib = _find_blosc_lib()
 
 try:
-    from annbatch._shard_reader import _init_blosc, read_into_dense, read_into_1d
+    from annbatch._shard_reader import (
+        _init_blosc, read_into_dense, read_into_1d,
+        pread_into_dense, pread_into_1d,
+    )
     _addr = ctypes.cast(_blosc_lib.blosc_decompress, ctypes.c_void_p).value
     _init_blosc(_addr)
     _HAS_C_EXT = True
+    print("[annbatch] C extension _shard_reader loaded")
 except ImportError:
     _HAS_C_EXT = False
+    print("[annbatch] C extension not found; falling back to Python")
 
 
 # ---------------------------------------------------------------------------
@@ -319,3 +324,130 @@ def _1d_python_fallback(
         pos = inner_base + take_end
 
     return pos, out_offset
+
+
+# ---------------------------------------------------------------------------
+# pread cache (fd + shard index, persistent across calls)
+# ---------------------------------------------------------------------------
+class _PreadCache:
+    """Cache of open file descriptors and parsed shard indices for pread."""
+
+    __slots__ = ("_cache",)
+
+    def __init__(self) -> None:
+        self._cache: dict[str, tuple[int, np.ndarray]] = {}
+
+    def get(
+        self, shard_path: Path, shard_index_size: int, chunks_per_shard: tuple[int, ...]
+    ) -> tuple[int, np.ndarray]:
+        """Return (fd, shard_index_flat) for the given shard file."""
+        key = str(shard_path)
+        if key not in self._cache:
+            fd = os.open(key, os.O_RDONLY)
+            file_size = os.fstat(fd).st_size
+            idx_nbytes = shard_index_size - 4
+            idx_buf = os.pread(fd, idx_nbytes, file_size - shard_index_size)
+            idx_flat = np.frombuffer(idx_buf, dtype="<u8")
+            self._cache[key] = (fd, idx_flat)
+        return self._cache[key]
+
+    def clear(self) -> None:
+        for fd, _ in self._cache.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# pread-based readers
+# ---------------------------------------------------------------------------
+def read_pread_dense(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+    """Read axis-0 ranges via pread, bypassing mmap and zarr async."""
+    (
+        disk_root, shape, shard_shape, inner_chunk_shape,
+        chunks_per_shard, shard_index_size, dtype, _blosc_codec,
+    ) = _parse_sharding_metadata(arr)
+
+    starts = boundaries[::2]
+    stops = boundaries[1::2]
+    total_rows = int((stops - starts).sum())
+    out = np.empty((total_rows, *shape[1:]), dtype=dtype)
+
+    inner_row_size = int(inner_chunk_shape[0])
+    shard_row_size = int(shard_shape[0])
+    inner_chunk_nbytes = int(np.prod(inner_chunk_shape) * dtype.itemsize)
+    ndim = len(shape)
+    row_nbytes = int(np.prod(shape[1:]) * dtype.itemsize) if ndim > 1 else int(dtype.itemsize)
+    ndim_extra = ndim - 1
+    idx_stride = int(np.prod(chunks_per_shard[1:]) * 2) if ndim > 1 else 2
+
+    cache = _PreadCache()
+    try:
+        out_offset = 0
+        for i in range(len(starts)):
+            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            row = sel_start
+            while row < sel_stop:
+                shard_row_idx = row // shard_row_size
+                shard_key = (shard_row_idx,) + (0,) * ndim_extra
+                parts = "/".join(str(k) for k in shard_key)
+                shard_path = disk_root / "c" / parts
+
+                fd, idx_flat = cache.get(shard_path, shard_index_size, chunks_per_shard)
+
+                rows_written, row = pread_into_dense(
+                    fd, idx_flat, out,
+                    inner_chunk_nbytes, inner_row_size, shard_row_size,
+                    shard_row_idx * shard_row_size, row, sel_stop, out_offset,
+                    row_nbytes, idx_stride,
+                )
+                out_offset += rows_written
+    finally:
+        cache.clear()
+    return out
+
+
+def read_pread_1d(arr: zarr.Array, boundaries: np.ndarray) -> np.ndarray:
+    """Read ranges from a 1-D sharded zarr array via pread."""
+    if isinstance(arr, zarr.AsyncArray):
+        arr = zarr.Array(arr)
+
+    (
+        disk_root, shape, shard_shape, inner_chunk_shape,
+        chunks_per_shard, shard_index_size, dtype, _blosc_codec,
+    ) = _parse_sharding_metadata(arr)
+
+    starts = boundaries[::2]
+    stops = boundaries[1::2]
+    total = int((stops - starts).sum())
+    out = np.empty(total, dtype=dtype)
+
+    inner_size = int(inner_chunk_shape[0])
+    shard_size = int(shard_shape[0])
+    inner_chunk_nbytes = int(inner_size * dtype.itemsize)
+    elem_nbytes = int(dtype.itemsize)
+
+    cache = _PreadCache()
+    try:
+        out_offset = 0
+        for i in range(len(starts)):
+            sel_start, sel_stop = int(starts[i]), int(stops[i])
+            pos = sel_start
+            while pos < sel_stop:
+                shard_idx = pos // shard_size
+                shard_path = disk_root / "c" / str(shard_idx)
+
+                fd, idx_flat = cache.get(shard_path, shard_index_size, chunks_per_shard)
+
+                elems_written, pos = pread_into_1d(
+                    fd, idx_flat, out,
+                    inner_chunk_nbytes, inner_size, shard_size,
+                    shard_idx * shard_size, pos, sel_stop, out_offset,
+                    elem_nbytes,
+                )
+                out_offset += elems_written
+    finally:
+        cache.clear()
+    return out

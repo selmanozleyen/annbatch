@@ -208,10 +208,9 @@ def run_loader_suite(tmp):
     write_sharded(g, adata, dense_chunk_size=64, dense_shard_size=128)
 
     backends = [
-        ("zarrs mmap+fuse", "zarrs", True, True),
-        ("zarrs pread+fuse", "zarrs", True, False),
-        ("C ext (mmap)", "c", True, True),
-        ("zarr-python async", None, True, True),
+        ("mmap", "mmap"),
+        ("pread", "pread"),
+        ("zarr-python async", None),
     ]
 
     print(f"\n{'=' * 115}")
@@ -220,15 +219,10 @@ def run_loader_suite(tmp):
     print(f"  {'Backend':<25}  {'best (s)':>10}  {'mean (s)':>10}")
     print(f"  {'-' * 50}")
 
-    for name, sb, fuse, mmap in backends:
-        if sb == "c" and not _HAS_C_EXT:
+    for name, sb in backends:
+        if sb is not None and not _HAS_C_EXT:
             print(f"  {name:<25}  {'N/A':>10}")
             continue
-        if sb == "zarrs":
-            import zarr_direct.reader as _zdr
-            _zdr._reader_cache.clear()
-            _zdr._FUSE_DEFAULT = fuse
-            _zdr._MMAP_DEFAULT = mmap
 
         times = []
         for _ in range(3):
@@ -239,7 +233,7 @@ def run_loader_suite(tmp):
             )
             sampler = ChunkSampler(chunk_size=2, preload_nchunks=512, batch_size=32, shuffle=False)
             loader = Loader(batch_sampler=sampler, return_index=True,
-                            preload_to_gpu=False, to_torch=False, sync_backend=sb)
+                            preload_to_gpu=False, to_torch=False, backend=sb)
             loader.add_anndata(adata_open)
             t0 = time.perf_counter()
             for batch in loader:

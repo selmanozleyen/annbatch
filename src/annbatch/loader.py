@@ -33,7 +33,10 @@ from annbatch.utils import (
     to_torch,
     validate_sampler,
 )
-from annbatch._direct_read import read_direct_dense as _c_read_dense, read_direct_1d as _c_read_1d
+from annbatch._direct_read import (
+    read_direct_dense as _c_read_dense, read_direct_1d as _c_read_1d,
+    read_pread_dense as _c_pread_dense, read_pread_1d as _c_pread_1d,
+)
 
 from .compat import IterableDataset
 
@@ -50,7 +53,7 @@ if TYPE_CHECKING:
     InputInMemoryArray = InputInMemoryArray_T
 
 type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
-type sync_backends = Literal["c", "zarrs", "auto"]
+type io_backends = Literal["mmap", "pread"]
 
 
 class CSRDatasetElems(NamedTuple):
@@ -129,7 +132,12 @@ class Loader[
             With `concat-shuffle`, preloaded data is concatenated and then subsetted/shuffled (higher memory usage, but faster, at least for sparse data)
             With `shuffle-concat`, preloaded data is first shuffled/subsetted chunk-by-chunk and then concatenated (lower memory usage, potentially faster for dense data)
             The default is automatically chosen - `concat-shuffle` if the data added to the loader is sparse and otherwise `shuffle-concat`.
-            See
+        backend
+            I/O backend for reading sharded data.
+            ``'pread'`` uses pread() syscalls with cached file descriptors.
+            ``'mmap'`` uses memory-mapped shard files.
+            Both bypass zarr's async pipeline and require the C extension (``python build_ext.py``).
+            ``None`` (default) uses zarr's built-in async I/O.
 
 
     Examples
@@ -184,7 +192,7 @@ class Loader[
         to_torch: bool = find_spec("torch") is not None,
         concat_strategy: None | concat_strategies = None,
         rng: np.random.Generator | None = None,
-        sync_backend: sync_backends | None = "auto",
+        backend: io_backends | None = None,
     ):
         sampler_args = {
             "chunk_size": chunk_size,
@@ -221,26 +229,33 @@ class Loader[
         self._dataset_elem_cache = {}
         self._direct_sparse_cache: dict = {}
         self._concat_strategy = concat_strategy
-        self._sync_backend = sync_backend
-        self._sync_read_dense, self._sync_read_1d = self._resolve_sync_backend(sync_backend)
+        self._backend = backend
+        self._sync_read_dense, self._sync_read_1d = self._resolve_backend(backend)
 
     def __len__(self) -> int:
         return self._batch_sampler.n_iters(self.n_obs)
 
     @staticmethod
-    def _resolve_sync_backend(
-        backend: sync_backends | None,
+    def _resolve_backend(
+        backend: io_backends | None,
     ) -> tuple[Callable | None, Callable | None]:
-        """Return (read_dense_fn, read_1d_fn) for the chosen sync backend.
+        """Return (read_dense_fn, read_1d_fn) for the chosen backend.
 
         Both functions accept ``(arr, starts, stops)`` and return an ndarray.
-        Returns ``(None, None)`` when no sync backend is active.
+        Returns ``(None, None)`` when no direct backend is active (zarr async).
         """
         if backend is None:
+            print("[annbatch] Using zarr async backend")
             return None, None
 
-        def _wrap_c(fn):
-            """Wrap the C ext functions to accept (arr, starts, stops) -> ndarray."""
+        from annbatch._direct_read import _HAS_C_EXT
+        if not _HAS_C_EXT:
+            raise ImportError(
+                f"backend={backend!r} requires the _shard_reader C extension. "
+                "Build it with: python build_ext.py"
+            )
+
+        def _wrap(fn):
             def wrapper(arr, starts, stops):
                 interleaved = np.empty(2 * len(starts), dtype=np.intp)
                 interleaved[::2] = starts
@@ -248,37 +263,15 @@ class Loader[
                 return fn(arr, interleaved)
             return wrapper
 
-        if backend == "zarrs":
-            try:
-                from zarr_direct import read_dense, read_1d
-                return read_dense, read_1d
-            except ImportError:
-                raise ImportError(
-                    "sync_backend='zarrs' requires zarr-direct to be installed. "
-                    "Install it with: pip install zarr-direct"
-                ) from None
+        if backend == "mmap":
+            print("[annbatch] Using C extension with mmap backend")
+            return _wrap(_c_read_dense), _wrap(_c_read_1d)
 
-        if backend == "c":
-            from annbatch._direct_read import _HAS_C_EXT
-            if not _HAS_C_EXT:
-                raise ImportError(
-                    "sync_backend='c' requires the _shard_reader C extension, "
-                    "which was not found."
-                )
-            return _wrap_c(_c_read_dense), _wrap_c(_c_read_1d)
+        if backend == "pread":
+            print("[annbatch] Using C extension with pread backend")
+            return _wrap(_c_pread_dense), _wrap(_c_pread_1d)
 
-        if backend == "auto":
-            try:
-                from zarr_direct import read_dense, read_1d
-                return read_dense, read_1d
-            except ImportError:
-                pass
-            from annbatch._direct_read import _HAS_C_EXT
-            if _HAS_C_EXT:
-                return _wrap_c(_c_read_dense), _wrap_c(_c_read_1d)
-            return None, None
-
-        raise ValueError(f"Unknown sync_backend: {backend!r}")
+        raise ValueError(f"Unknown backend: {backend!r}. Choose 'mmap', 'pread', or None.")
 
     @property
     def _sp_module(self) -> ModuleType:
