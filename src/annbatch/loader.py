@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import singledispatchmethod
 from importlib.util import find_spec
 from itertools import accumulate, chain
@@ -15,12 +16,17 @@ import zarr.core.sync as zsync
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
+from annbatch._direct_read import _MmapCache, _PreadCache
+from annbatch._direct_read import read_direct_1d as _c_read_1d
+from annbatch._direct_read import read_direct_dense as _c_read_dense
+from annbatch._direct_read import read_pread_1d as _c_pread_1d
+from annbatch._direct_read import read_pread_dense as _c_pread_dense
 from annbatch.samplers import ChunkSampler
 from annbatch.types import (
     BackingArray_T,
     InputInMemoryArray_T,
-    LoadRequest,
     LoaderOutput,
+    LoadRequest,
     OutputInMemoryArray_T,
     _multi_arange,
 )
@@ -32,11 +38,6 @@ from annbatch.utils import (
     load_x_and_obs_and_var,
     to_torch,
     validate_sampler,
-)
-from annbatch._direct_read import (
-    read_direct_dense as _c_read_dense, read_direct_1d as _c_read_1d,
-    read_pread_dense as _c_pread_dense, read_pread_1d as _c_pread_1d,
-    _MmapCache, _PreadCache,
 )
 
 from .compat import IterableDataset
@@ -252,10 +253,10 @@ class Loader[
             return None, None
 
         from annbatch._direct_read import _HAS_C_EXT
+
         if not _HAS_C_EXT:
             raise ImportError(
-                f"backend={backend!r} requires the _shard_reader C extension. "
-                "Build it with: python build_ext.py"
+                f"backend={backend!r} requires the _shard_reader C extension. Build it with: python build_ext.py"
             )
 
         if backend == "mmap":
@@ -276,6 +277,7 @@ class Loader[
                 interleaved[::2] = starts
                 interleaved[1::2] = stops
                 return fn(arr, interleaved, cache=cache)
+
             return wrapper
 
         return _wrap(read_dense), _wrap(read_1d)
@@ -626,9 +628,7 @@ class Loader[
 
     @_fetch_data.register
     async def _fetch_data_dense(self, dataset: ZarrArray, boundaries: np.ndarray) -> np.ndarray:
-        indexer = MultiBasicIndexer.from_boundaries(
-            boundaries, dataset.metadata.shape, dataset.metadata.chunk_grid
-        )
+        indexer = MultiBasicIndexer.from_boundaries(boundaries, dataset.metadata.shape, dataset.metadata.chunk_grid)
         res = cast(
             "np.ndarray",
             await dataset._async_array._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
@@ -699,7 +699,7 @@ class Loader[
         indptr, indices, data = dataset
         starts, stops = boundaries[::2], boundaries[1::2]
         n = len(starts)
-        indptr_indices = [indptr[s:e + 1] for s, e in zip(starts, stops, strict=True)]
+        indptr_indices = [indptr[s : e + 1] for s, e in zip(starts, stops, strict=True)]
 
         # Build an interleaved boundaries array for the 1-D data/indices arrays
         ip_starts = np.array([ip[0] for ip in indptr_indices])
@@ -707,9 +707,7 @@ class Loader[
         ip_boundaries = np.empty(2 * n, dtype=np.intp)
         ip_boundaries[::2] = ip_starts
         ip_boundaries[1::2] = ip_stops
-        indexer = MultiBasicIndexer.from_boundaries(
-            ip_boundaries, data.metadata.shape, data.metadata.chunk_grid
-        )
+        indexer = MultiBasicIndexer.from_boundaries(ip_boundaries, data.metadata.shape, data.metadata.chunk_grid)
 
         data_np, indices_np = await asyncio.gather(
             data._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype()),
@@ -783,7 +781,12 @@ class Loader[
         starts: np.ndarray,
         stops: np.ndarray,
     ) -> CSRContainer:
-        """Synchronous direct-read for a single sparse dataset."""
+        """Synchronous direct-read for a single sparse dataset.
+
+        When using the pread backend the data and indices arrays are read
+        concurrently via a ThreadPoolExecutor so that I/O latency for the
+        two arrays overlaps.
+        """
         grp = dataset.group
         if dataset not in self._direct_sparse_cache:
             indptr = zarr.open(grp.store, path=grp.path + "/indptr")[:]
@@ -793,13 +796,16 @@ class Loader[
         indptr, data_arr, indices_arr = self._direct_sparse_cache[dataset]
 
         n = len(starts)
-        indptr_indices = [indptr[s:e + 1] for s, e in zip(starts, stops, strict=True)]
+        indptr_indices = [indptr[s : e + 1] for s, e in zip(starts, stops, strict=True)]
 
         ip_starts = np.array([ip[0] for ip in indptr_indices])
         ip_stops = np.array([ip[-1] for ip in indptr_indices])
 
-        data_np = self._sync_read_1d(data_arr, ip_starts, ip_stops)
-        indices_np = self._sync_read_1d(indices_arr, ip_starts, ip_stops)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_data = pool.submit(self._sync_read_1d, data_arr, ip_starts, ip_stops)
+            fut_idx = pool.submit(self._sync_read_1d, indices_arr, ip_starts, ip_stops)
+            data_np = fut_data.result()
+            indices_np = fut_idx.result()
 
         gaps = (ip_starts[i + 1] - ip_stops[i] for i in range(n - 1))
         offsets = accumulate(chain([ip_starts[0]], gaps))
@@ -970,9 +976,7 @@ class Loader[
             in_memory_data = cast(
                 "np.ndarray",
                 zsync.sync(
-                    dataset._async_array._get_selection(
-                        indexer, prototype=zarr.core.buffer.default_buffer_prototype()
-                    )
+                    dataset._async_array._get_selection(indexer, prototype=zarr.core.buffer.default_buffer_prototype())
                 ),
             )
 
@@ -1074,12 +1078,7 @@ class Loader[
             return None
         if len(self._shapes) == 1:
             return self._obs[0].iloc[_multi_arange(lr["starts"], lr["stops"])]
-        return pd.concat(
-            [
-                self._obs[idx].iloc[_multi_arange(b[::2], b[1::2])]
-                for idx, b in ds_boundaries.items()
-            ]
-        )
+        return pd.concat([self._obs[idx].iloc[_multi_arange(b[::2], b[1::2])] for idx, b in ds_boundaries.items()])
 
     def _maybe_accumulate_indices(self, lr: LoadRequest) -> np.ndarray | None:
         """Gather original indices for the loaded chunks."""
@@ -1088,6 +1087,4 @@ class Loader[
         if len(self._shapes) == 1:
             return _multi_arange(lr["starts"], lr["stops"])
         ds_boundaries = self._load_request_to_dataset_boundaries(lr, use_original_space=True)
-        return np.concatenate(
-            [_multi_arange(b[::2], b[1::2]) for b in ds_boundaries.values()]
-        )
+        return np.concatenate([_multi_arange(b[::2], b[1::2]) for b in ds_boundaries.values()])

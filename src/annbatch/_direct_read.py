@@ -19,6 +19,8 @@ import numcodecs
 import numpy as np
 import zarr
 
+DEFAULT_NTHREADS = 4
+
 # ---------------------------------------------------------------------------
 # Resolve blosc C library and (optionally) our C extension
 # ---------------------------------------------------------------------------
@@ -385,7 +387,8 @@ class _PreadCache:
 # pread-based readers
 # ---------------------------------------------------------------------------
 def read_pread_dense(
-    arr: zarr.Array, boundaries: np.ndarray, cache: _PreadCache | None = None,
+    arr: zarr.Array, boundaries: np.ndarray,
+    cache: _PreadCache | None = None, nthreads: int = DEFAULT_NTHREADS,
 ) -> np.ndarray:
     """Read axis-0 ranges via pread, bypassing mmap and zarr async."""
     (
@@ -426,7 +429,7 @@ def read_pread_dense(
                     fd, idx_flat, out,
                     inner_chunk_nbytes, inner_row_size, shard_row_size,
                     shard_row_idx * shard_row_size, row, sel_stop, out_offset,
-                    row_nbytes, idx_stride,
+                    row_nbytes, idx_stride, nthreads,
                 )
                 out_offset += rows_written
     finally:
@@ -436,7 +439,8 @@ def read_pread_dense(
 
 
 def read_pread_1d(
-    arr: zarr.Array, boundaries: np.ndarray, cache: _PreadCache | None = None,
+    arr: zarr.Array, boundaries: np.ndarray,
+    cache: _PreadCache | None = None, nthreads: int = DEFAULT_NTHREADS,
 ) -> np.ndarray:
     """Read ranges from a 1-D sharded zarr array via pread."""
     if isinstance(arr, zarr.AsyncArray):
@@ -475,7 +479,7 @@ def read_pread_1d(
                     fd, idx_flat, out,
                     inner_chunk_nbytes, inner_size, shard_size,
                     shard_idx * shard_size, pos, sel_stop, out_offset,
-                    elem_nbytes,
+                    elem_nbytes, nthreads,
                 )
                 out_offset += elems_written
     finally:
