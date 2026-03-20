@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
     from annbatch.types import LoadRequest
 
-from annbatch.samplers._batch_sampler import ChunkBatchSampler
+from annbatch.samplers._chunk_sampler import ChunkBatchSampler
 
 
 def _get_dist_info_torch() -> tuple[int, int]:

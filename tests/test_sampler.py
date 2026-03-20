@@ -196,7 +196,7 @@ def test_workers_cover_full_dataset_without_overlap(
             chunk_size, preload_nchunks, batch_size, drop_last=drop_last,
         )
         with patch(
-            "annbatch.samplers._batch_sampler.get_torch_worker_info",
+            "annbatch.samplers._chunk_sampler.get_torch_worker_info",
             return_value=WorkerInfo(id=worker_id, num_workers=num_workers),
         ):
             all_worker_indices.append(collect_indices(sampler, n_obs))
@@ -350,7 +350,7 @@ def test_replacement_with_multiple_workers_raises():
     )
     with (
         patch(
-            "annbatch.samplers._batch_sampler.get_torch_worker_info",
+            "annbatch.samplers._chunk_sampler.get_torch_worker_info",
             return_value=WorkerInfo(id=0, num_workers=2),
         ),
         pytest.raises(ValueError, match="Multiple workers are not supported with replacement"),
