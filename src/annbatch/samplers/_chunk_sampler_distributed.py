@@ -1,4 +1,4 @@
-"""Sampler classes for efficient chunk-based data access."""
+"""Distributed chunk-based sampler."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from annbatch.utils import _spawn_worker_rng
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    import numpy as np
-
     from annbatch.types import LoadRequest
+
+from annbatch.samplers._chunk_sampler import ChunkBatchSampler
 
 
 def _get_dist_info_torch() -> tuple[int, int]:
@@ -45,72 +45,40 @@ DISTRIBUTED_BACKENDS: dict[str, Callable[[], tuple[int, int]]] = {
 }
 
 
-class MaskableSampler(Sampler):
-    """A sampler whose observation range can be restricted via a mask.
-
-    Subclass this to create chunk-based samplers that can be wrapped
-    by :class:`~annbatch.ChunkSamplerDistributed`.
-    """
-
-    _mask: slice
-    _rng: np.random.Generator
-
-    @property
-    def mask(self) -> slice:
-        """The observation range this sampler operates on."""
-        return self._mask
-
-    @mask.setter
-    def mask(self, value: slice) -> None:
-        self._mask = value
-
-    @property
-    def rng(self) -> np.random.Generator:
-        """The random number generator used by this sampler."""
-        return self._rng
-
-    @rng.setter
-    def rng(self, value: np.random.Generator) -> None:
-        self._rng = value
-
-
 class ChunkSamplerDistributed(Sampler):
-    """Distributed chunk-based sampler that shards data across distributed processes.
+    """Distributed chunk-based sampler that shards data across processes.
 
-    Wraps any chunk-based sampler (e.g. :class:`ChunkSampler` or
-    :class:`ChunkSamplerWithReplacement`) and partitions the observation
+    Wraps a :class:`ChunkBatchSampler` and partitions the observation
     range across ``world_size`` processes.  Each rank receives a
     non-overlapping slice of the data.
 
-    When ``enforce_equal_batches`` is *True* (the default), the per-rank observation
-    count is rounded down to the nearest multiple of ``batch_size``,
-    guaranteeing that every rank yields exactly the same number of complete
-    batches.
-
-    Rank and world size are obtained from ``dist_info`` at construction time.
-    The corresponding distributed framework must already be initialized.
+    When ``enforce_equal_batches`` is *True* (the default), the per-rank
+    observation count is rounded down to the nearest multiple of
+    ``batch_size``, guaranteeing that every rank yields exactly the same
+    number of complete batches.
 
     Parameters
     ----------
     sampler
-        The base chunk sampler to distribute.
+        The batch sampler to distribute.
     dist_info
         How to obtain rank and world size.
-        Either a string naming a distributed backend (``"torch"`` or ``"jax"``),
-        or a callable that returns ``(rank, world_size)``.
+        Either ``"torch"`` / ``"jax"``, or a callable returning
+        ``(rank, world_size)``.
     enforce_equal_batches
-        If *True*, round each rank's observation count down to a multiple of ``batch_size`` so that all workers (ranks) yield the same number of batches.
-        Set to *False* to use the raw ``n_obs // world_size`` split, which may result in an uneven number of batches per worker.
+        If *True*, round each rank's observation count down to a
+        multiple of ``batch_size`` so all ranks yield the same
+        number of batches.
     """
 
     _rank: int
     _world_size: int
     _enforce_equal_batches: bool
-    _sampler: MaskableSampler
+    _sampler: ChunkBatchSampler
 
     def __init__(
         self,
-        sampler: MaskableSampler,
+        sampler: ChunkBatchSampler,
         *,
         dist_info: Literal["torch", "jax"] | Callable[[], tuple[int, int]],
         enforce_equal_batches: bool = True,
@@ -123,7 +91,7 @@ class ChunkSamplerDistributed(Sampler):
             raise ValueError(f"Unknown dist_info {dist_info!r}. Supported backends: {sorted(DISTRIBUTED_BACKENDS)}")
         self._enforce_equal_batches = enforce_equal_batches
         self._sampler = sampler
-        sampler.rng = _spawn_worker_rng(sampler.rng, self._rank)
+        sampler.chunk_sampler.rng = _spawn_worker_rng(sampler.chunk_sampler.rng, self._rank)
 
     @property
     def batch_size(self) -> int:
@@ -143,13 +111,13 @@ class ChunkSamplerDistributed(Sampler):
         return slice(rank_start, rank_stop)
 
     def n_iters(self, n_obs: int) -> int:
-        self._sampler.mask = self._shard_mask(n_obs)
+        self._sampler.chunk_sampler.mask = self._shard_mask(n_obs)
         return self._sampler.n_iters(n_obs)
 
     def validate(self, n_obs: int) -> None:
-        self._sampler.mask = self._shard_mask(n_obs)
+        self._sampler.chunk_sampler.mask = self._shard_mask(n_obs)
         self._sampler.validate(n_obs)
 
     def _sample(self, n_obs: int) -> Iterator[LoadRequest]:
-        self._sampler.mask = self._shard_mask(n_obs)
+        self._sampler.chunk_sampler.mask = self._shard_mask(n_obs)
         yield from self._sampler._sample(n_obs)
