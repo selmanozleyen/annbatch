@@ -15,7 +15,7 @@ import zarr.core.sync as zsync
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
-from annbatch.samplers import ChunkSampler
+from annbatch.samplers import ChunkBatchSampler, RandomChunkSampler, SequentialChunkSampler
 from annbatch.types import BackingArray_T, InputInMemoryArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
     CSRContainer,
@@ -138,17 +138,13 @@ class Loader[
                 do_fit(batch)
     """
 
-    _COMMON_SAMPLER_ARGS = {
+    _DEFAULTS = {
         "chunk_size": 512,
         "preload_nchunks": 32,
         "batch_size": 1,
         "shuffle": False,
         "drop_last": False,
-        "rng": np.random.default_rng(),
     }
-    # TODO(selmanozleyen): these should be also presented in the documentation
-    # but this is not ideal since they are hardcoded into the docstrings
-    # maybe we should make _COMMON_SAMPLER_ARGS a public class field?
 
     _train_datasets: list[BackingArray]
     _obs: list[pd.DataFrame] | None = None
@@ -195,10 +191,20 @@ class Loader[
                 )
             self._batch_sampler = batch_sampler
         else:
-            sampler_args_processed = {
-                k: (v if v is not None else Loader._COMMON_SAMPLER_ARGS[k]) for k, v in sampler_args.items()
-            }
-            self._batch_sampler = ChunkSampler(**sampler_args_processed)
+            cs = chunk_size if chunk_size is not None else self._DEFAULTS["chunk_size"]
+            pn = preload_nchunks if preload_nchunks is not None else self._DEFAULTS["preload_nchunks"]
+            bs = batch_size if batch_size is not None else self._DEFAULTS["batch_size"]
+            shuf = shuffle if shuffle is not None else self._DEFAULTS["shuffle"]
+            dl = drop_last if drop_last is not None else self._DEFAULTS["drop_last"]
+            r = rng or np.random.default_rng()
+
+            if shuf:
+                chunk_sampler = RandomChunkSampler(cs, pn, rng=r)
+            else:
+                chunk_sampler = SequentialChunkSampler(cs, pn, rng=r)
+            self._batch_sampler = ChunkBatchSampler(
+                chunk_sampler, bs, drop_last=dl, shuffle=shuf, rng=r,
+            )
 
         if to_torch and not find_spec("torch"):
             raise ImportError("Could not find torch dependency. Try `pip install torch`.")

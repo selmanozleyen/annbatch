@@ -25,9 +25,10 @@
    :toctree: generated/
 
     ChunkSampler
+    SequentialChunkSampler
+    RandomChunkSampler
+    ChunkBatchSampler
     ChunkSamplerDistributed
-    ChunkSamplerWithReplacement
-    samplers.MaskableSampler
 ```
 
 (io-helpers)=
