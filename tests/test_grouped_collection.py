@@ -98,6 +98,158 @@ def test_grouped_data_is_contiguous_by_group(
         assert (sliced["store_id"] == str(row.store_id)).all()
 
 
+def test_dataset_groupby_single_column(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """dataset_groupby='label' produces one dataset per unique label value."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    output = tmp_path / "grouped_ds_by_label.zarr"
+    collection = GroupedCollection(output).add_adatas(
+        paths,
+        groupby=["label", "store_id"],
+        dataset_groupby="label",
+        n_obs_per_chunk=2,
+        zarr_shard_size=10,
+        shuffle=False,
+    )
+    assert not collection.is_empty
+
+    concat_adata = ad.concat([ad.read_h5ad(p) for p in paths], join="outer")
+    n_unique_labels = concat_adata.obs["label"].nunique()
+    assert len(collection._dataset_keys) == n_unique_labels
+
+    adata_grouped = ad.concat([ad.io.read_elem(g) for g in collection], join="outer")
+    n_obs_total = sum(ad.read_h5ad(p).n_obs for p in paths)
+    assert adata_grouped.n_obs == n_obs_total
+
+    group_index = collection.group_index
+    assert int(group_index["count"].sum()) == n_obs_total
+    for row in group_index.itertuples():
+        sliced = adata_grouped.obs.iloc[int(row.start) : int(row.stop)]
+        assert (sliced["label"].astype(str) == str(row.label)).all()
+        assert (sliced["store_id"].astype(str) == str(row.store_id)).all()
+
+
+def test_dataset_groupby_compound(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """dataset_groupby=['label', 'store_id'] produces one dataset per (label, store_id) combo."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    output = tmp_path / "grouped_ds_compound.zarr"
+    collection = GroupedCollection(output).add_adatas(
+        paths,
+        groupby=["label", "store_id"],
+        dataset_groupby=["label", "store_id"],
+        n_obs_per_chunk=2,
+        zarr_shard_size=10,
+        shuffle=False,
+    )
+    concat_adata = ad.concat([ad.read_h5ad(p) for p in paths], join="outer")
+    n_unique_combos = concat_adata.obs.groupby(["label", "store_id"], observed=True).ngroups
+    assert len(collection._dataset_keys) == n_unique_combos
+
+    group_index = collection.group_index
+    n_obs_total = sum(ad.read_h5ad(p).n_obs for p in paths)
+    assert int(group_index["count"].sum()) == n_obs_total
+
+
+def test_dataset_groupby_equals_groupby(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """dataset_groupby equal to groupby gives one dataset per group."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    output = tmp_path / "grouped_ds_eq.zarr"
+    collection = GroupedCollection(output).add_adatas(
+        paths,
+        groupby="label",
+        dataset_groupby="label",
+        n_obs_per_chunk=2,
+        zarr_shard_size=10,
+        shuffle=False,
+    )
+    group_index = collection.group_index
+    assert len(collection._dataset_keys) == len(group_index)
+
+    adata_grouped = ad.concat([ad.io.read_elem(g) for g in collection], join="outer")
+    for row in group_index.itertuples():
+        sliced = adata_grouped.obs.iloc[int(row.start) : int(row.stop)]
+        assert len(sliced["label"].unique()) == 1
+
+
+def test_dataset_groupby_bad_subset_raises(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    output = tmp_path / "grouped_ds_bad.zarr"
+    with pytest.raises(ValueError, match="subset"):
+        GroupedCollection(output).add_adatas(
+            paths,
+            groupby="label",
+            dataset_groupby="nonexistent",
+            n_obs_per_chunk=2,
+            zarr_shard_size=10,
+        )
+
+
+def test_dataset_groupby_bad_prefix_raises(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    output = tmp_path / "grouped_ds_bad_prefix.zarr"
+    with pytest.raises(ValueError, match="prefix"):
+        GroupedCollection(output).add_adatas(
+            paths,
+            groupby=["label", "store_id"],
+            dataset_groupby="store_id",
+            n_obs_per_chunk=2,
+            zarr_shard_size=10,
+        )
+
+
+def test_dataset_groupby_with_categorical_sampler(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """CategoricalSampler.from_collection works with dataset_groupby collections."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    grouped = GroupedCollection(tmp_path / "grouped_ds_catsampler.zarr").add_adatas(
+        paths,
+        groupby="label",
+        dataset_groupby="label",
+        n_obs_per_chunk=2,
+        zarr_shard_size=10,
+        shuffle=False,
+    )
+    group_index = grouped.group_index
+    min_cat_size = int(group_index["count"].min())
+    chunk_size = min(min_cat_size, 2)
+    batch_size = chunk_size
+    sampler = CategoricalSampler.from_collection(
+        grouped,
+        chunk_size=chunk_size,
+        preload_nchunks=2,
+        batch_size=batch_size,
+        num_samples=20 * batch_size,
+        rng=np.random.default_rng(0),
+    )
+    assert sampler.n_categories == len(group_index)
+
+    loader = Loader(
+        batch_sampler=sampler,
+        return_index=False,
+        preload_to_gpu=False,
+        to_torch=False,
+    ).use_collection(grouped)
+
+    batch_count = 0
+    for batch in loader:
+        obs = batch["obs"]
+        assert obs is not None
+        labels_in_batch = obs["label"].unique()
+        assert len(labels_in_batch) == 1
+        batch_count += 1
+    assert batch_count == 20
+
+
 def test_grouped_collection_non_empty_raises(
     adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
 ):

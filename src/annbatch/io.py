@@ -900,6 +900,29 @@ def _group_obs_rows(
     return ordered_positions, group_index
 
 
+def _split_positions_by_dataset_groupby(
+    ordered_positions: np.ndarray,
+    group_index: pd.DataFrame,
+    *,
+    dataset_groupby_keys: list[str],
+) -> list[np.ndarray]:
+    """Split already-ordered positions into one chunk per unique ``dataset_groupby_keys`` combination.
+
+    ``group_index`` is produced by ``_group_obs_rows`` and has ``start``/``stop``
+    columns describing contiguous ranges in ``ordered_positions``.  Groups that
+    share the same ``dataset_groupby_keys`` values are consecutive (because
+    ``_group_obs_rows`` sorts by all ``groupby`` columns and
+    ``dataset_groupby_keys`` is a prefix), so we merge adjacent ranges.
+    """
+    dataset_groups = group_index.groupby(dataset_groupby_keys, dropna=False, sort=True, observed=False)
+    chunks: list[np.ndarray] = []
+    for _, df in dataset_groups:
+        start = int(df["start"].iloc[0])
+        stop = int(df["stop"].iloc[-1])
+        chunks.append(ordered_positions[start:stop])
+    return chunks
+
+
 class GroupedCollection(BaseCollection):
     """A grouped zarr collection where data is written sequentially with group boundaries stored as metadata.
 
@@ -939,6 +962,7 @@ class GroupedCollection(BaseCollection):
         adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
         *,
         groupby: str | Iterable[str],
+        dataset_groupby: str | Iterable[str] | None = None,
         load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
         var_subset: Iterable[str] | None = None,
         n_obs_per_chunk: int = 64,
@@ -959,9 +983,29 @@ class GroupedCollection(BaseCollection):
         Parameters
         ----------
         groupby
-            One or more obs column names to group by.
+            One or more obs column names to group by.  The full set of
+            columns defines the finest-grained groups whose boundaries
+            are recorded in ``group_index``.
+        dataset_groupby
+            A subset (prefix) of ``groupby`` columns that determines on-disk
+            dataset boundaries.  Each unique combination of these columns
+            becomes its own ``dataset_i`` on disk instead of splitting by
+            ``n_obs_per_dataset``.
+
+            For example, with ``groupby=["cell_line", "drug"]``:
+
+            * ``dataset_groupby=None`` (default) -- datasets are split
+              by ``n_obs_per_dataset`` (current behavior).
+            * ``dataset_groupby="cell_line"`` -- one dataset per cell
+              line; within each dataset, observations are still
+              contiguous by ``(cell_line, drug)`` pair.
+            * ``dataset_groupby=["cell_line", "drug"]`` -- one dataset
+              per ``(cell_line, drug)`` combination.
+
+            When set, ``n_obs_per_dataset`` is ignored.
         n_obs_per_dataset
-            Maximum number of observations per dataset.
+            Maximum number of observations per dataset.  Ignored when
+            ``dataset_groupby`` is set.
         shuffle
             Whether to shuffle observations within each group.
         random_seed
@@ -976,6 +1020,23 @@ class GroupedCollection(BaseCollection):
             raise ValueError("`groupby` must contain at least one obs column name.")
         if len(set(groupby_keys)) != len(groupby_keys):
             raise ValueError("`groupby` must not contain duplicate column names.")
+
+        if dataset_groupby is not None:
+            dataset_groupby_keys = [dataset_groupby] if isinstance(dataset_groupby, str) else list(dataset_groupby)
+            if len(dataset_groupby_keys) == 0:
+                raise ValueError("`dataset_groupby` must contain at least one obs column name when set.")
+            if not all(k in groupby_keys for k in dataset_groupby_keys):
+                raise ValueError(
+                    f"`dataset_groupby` columns {dataset_groupby_keys} must be a subset of "
+                    f"`groupby` columns {groupby_keys}."
+                )
+            if dataset_groupby_keys != groupby_keys[: len(dataset_groupby_keys)]:
+                raise ValueError(
+                    f"`dataset_groupby` columns {dataset_groupby_keys} must be a prefix of "
+                    f"`groupby` columns {groupby_keys} to preserve contiguous group ordering."
+                )
+        else:
+            dataset_groupby_keys = None
 
         adata_concat, var_mask = _load_and_check(adata_paths, load_adata=load_adata, var_subset=var_subset)
         missing_group_keys = [k for k in groupby_keys if k not in adata_concat.obs.columns]
@@ -993,7 +1054,13 @@ class GroupedCollection(BaseCollection):
             rng=rng,
         )
 
-        chunks = split_given_size(ordered_positions, n_obs_per_dataset)
+        if dataset_groupby_keys is not None:
+            chunks = _split_positions_by_dataset_groupby(
+                ordered_positions, group_index, dataset_groupby_keys=dataset_groupby_keys
+            )
+        else:
+            chunks = split_given_size(ordered_positions, n_obs_per_dataset)
+
         for i, chunk in enumerate(tqdm(chunks, desc="processing chunks")):
             sort_order = np.argsort(chunk)
             adata_chunk = adata_concat[chunk[sort_order], :][:, var_mask].copy()
