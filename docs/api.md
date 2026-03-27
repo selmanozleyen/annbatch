@@ -28,6 +28,7 @@
 
     RandomSampler
     SequentialSampler
+    CategoricalSampler
     DistributedSampler
 ```
 
@@ -51,6 +52,7 @@
 
     write_sharded
     DatasetCollection
+    GroupedCollection
 ```
 
 (abc)=

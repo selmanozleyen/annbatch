@@ -20,16 +20,19 @@ if find_spec("cupy") and find_spec("cuda-toolkit"):
         raise RuntimeError(msg)
 
 from . import abc, samplers, types
-from .io import DatasetCollection, write_sharded
+from .io import BaseCollection, DatasetCollection, GroupedCollection, write_sharded
 from .loader import Loader
-from .samplers import ChunkSampler
+from .samplers import CategoricalSampler, ChunkSampler
 
 __version__ = version("annbatch")
 
 __all__ = [
     "Loader",
+    "BaseCollection",
+    "CategoricalSampler",
     "ChunkSampler",
     "DatasetCollection",
+    "GroupedCollection",
     "samplers",
     "types",
     "write_sharded",

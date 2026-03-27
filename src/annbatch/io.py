@@ -25,13 +25,15 @@ from zarr.codecs import BloscCodec, BloscShuffle
 from annbatch.utils import split_given_size
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Mapping
+    from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
     from os import PathLike
     from typing import Any, Literal
 
     from zarr.abc.codec import BytesBytesCodec
 
 V1_ENCODING = {"encoding-type": "annbatch-preshuffled", "encoding-version": "0.1.0"}
+V1_GROUPED_ENCODING = {"encoding-type": "annbatch-grouped", "encoding-version": "0.1.0"}
+GROUP_INDEX_KEY = "group_index"
 
 
 def _default_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](x: T) -> ad.AnnData:
@@ -444,6 +446,22 @@ def _persist_adata_in_memory(adata: ad.AnnData) -> ad.AnnData:
 DATASET_PREFIX = "dataset"
 
 
+def _load_and_check(
+    adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
+    *,
+    load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData],
+    var_subset: Iterable[str] | None,
+) -> tuple[ad.AnnData, pd.Index]:
+    """Validate keys, lazy-load, make unique, resolve var_subset."""
+    _validate_anndatas_and_maybe_get_bytes_per_row(adata_paths, load_adata=load_adata)
+    adata_concat = _lazy_load_adata(adata_paths, load_adata=load_adata)
+    adata_concat.obs_names_make_unique()
+    if var_subset is None:
+        var_subset = adata_concat.var_names
+    var_mask = adata_concat.var_names.isin(var_subset)
+    return adata_concat, var_mask
+
+
 def _with_settings(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -453,10 +471,40 @@ def _with_settings(func):
     return wrapper
 
 
-class DatasetCollection:
-    """A preshuffled collection object including functionality for creating, adding to, and loading collections shuffled by `annbatch`."""
+class BaseCollection:
+    """Base class providing shared initialization for collection types."""
 
     _group: zarr.Group | Path
+
+    def __init__(
+        self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
+    ):
+        if is_collection_h5ad:
+            if isinstance(group, zarr.Group):
+                raise ValueError("Do not set `is_collection_h5ad` to True when also passing in a zarr Group.")
+            warnings.warn(
+                "Loading h5ad is currently not supported and thus we cannot guarantee the funcionality of the ecosystem with h5ad files."
+                "DatasetCollection should be able to handle shuffling but we guarantee little else."
+                "Proceed with caution.",
+                stacklevel=2,
+            )
+            self._group = Path(group)
+            self._group.mkdir(exist_ok=True)
+        elif isinstance(group, zarr.Group):
+            self._group = group
+        elif isinstance(group, str | Path):
+            if not str(group).endswith(".zarr"):
+                warnings.warn(
+                    f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
+                    stacklevel=2,
+                )
+            self._group = zarr.open_group(group, mode=mode)
+        else:
+            raise TypeError("Group must either be a zarr group or a path")
+
+
+class DatasetCollection(BaseCollection):
+    """A preshuffled collection object including functionality for creating, adding to, and loading collections shuffled by `annbatch`."""
 
     def __init__(
         self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
@@ -473,30 +521,7 @@ class DatasetCollection:
                 The base location for a preshuffled collection.
                 A :class:`zarr.Group` or path ending in `.zarr` indicates zarr as the shuffled format and otherwise a directory of `h5ad` files will be created.
         """
-        if not isinstance(group, zarr.Group):
-            if isinstance(group, str | Path):
-                if not is_collection_h5ad:
-                    if not str(group).endswith(".zarr"):
-                        warnings.warn(
-                            f"It is highly recommended to make your collections have the `.zarr` suffix, got: {group}.",
-                            stacklevel=2,
-                        )
-                    self._group = zarr.open_group(group, mode=mode)
-                else:
-                    warnings.warn(
-                        "Loading h5ad is currently not supported and thus we cannot guarantee the funcionality of the ecosystem with h5ad files."
-                        "DatasetCollection should be able to handle shuffling but we guarantee little else."
-                        "Proceed with caution.",
-                        stacklevel=2,
-                    )
-                    self._group = Path(group)
-                    self._group.mkdir(exist_ok=True)
-            else:
-                raise TypeError("Group must either be a zarr group or a path")
-        else:
-            if is_collection_h5ad:
-                raise ValueError("Do not set `is_collection_h5ad` to True when also passing in a zarr Group.")
-            self._group = group
+        super().__init__(group, mode=mode, is_collection_h5ad=is_collection_h5ad)
 
     @property
     def _dataset_keys(self) -> list[str]:
@@ -846,3 +871,154 @@ class DatasetCollection:
                     adata,
                     dataset_kwargs={"compression": h5ad_compressor},
                 )
+
+
+def _group_obs_rows(
+    obs: pd.DataFrame,
+    *,
+    groupby: list[str],
+    shuffle: bool,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Reorder observation indices so that rows are contiguous by group, and return a group index."""
+    g = obs[groupby].groupby(groupby, dropna=False, sort=True, observed=False)
+    group_ids = g.ngroup().to_numpy(dtype=np.int64)
+
+    if shuffle:
+        order = np.lexsort((rng.random(len(obs)), group_ids))
+    else:
+        order = np.argsort(group_ids, kind="stable")
+
+    ordered_positions = np.arange(len(obs), dtype=np.int64)[order]
+
+    group_index = g.size().reset_index(name="count")
+    for col in groupby:
+        group_index[col] = group_index[col].fillna("<NA>").astype(str)
+    counts = group_index["count"].to_numpy(dtype=np.int64)
+    stops = np.cumsum(counts)
+    group_index["stop"] = stops
+    group_index["start"] = stops - counts
+
+    return ordered_positions, group_index
+
+
+class GroupedCollection(BaseCollection):
+    """A grouped zarr collection where data is written sequentially with group boundaries stored as metadata.
+
+    Observations are reordered so that each group is contiguous on disk.
+    A ``group_index`` DataFrame records the ``start``/``stop``/``count``
+    per group, allowing a :class:`~annbatch.CategoricalSampler` to be
+    constructed via :meth:`~annbatch.CategoricalSampler.from_collection`.
+    """
+
+    @property
+    def _dataset_keys(self) -> list[str]:
+        if isinstance(self._group, zarr.Group):
+            return sorted(
+                [k for k in self._group.keys() if re.fullmatch(rf"{DATASET_PREFIX}_([0-9]+)", k) is not None],
+                key=lambda x: int(x.split("_")[1]),
+            )
+        raise ValueError("Cannot list dataset keys for a folder-based collection")
+
+    @property
+    def is_empty(self) -> bool:
+        return not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items()) or len(self._dataset_keys) == 0
+
+    def __iter__(self) -> Generator[zarr.Group]:
+        for k in self._dataset_keys:
+            yield self._group[k]
+
+    @property
+    def group_index(self) -> pd.DataFrame:
+        """The group boundary metadata for this collection."""
+        if GROUP_INDEX_KEY not in self._group:
+            raise ValueError("Grouped collection is missing `group_index` metadata.")
+        return ad.io.read_elem(self._group[GROUP_INDEX_KEY])
+
+    @_with_settings
+    def add_adatas(
+        self,
+        adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
+        *,
+        groupby: str | Iterable[str],
+        load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
+        var_subset: Iterable[str] | None = None,
+        n_obs_per_chunk: int = 64,
+        zarr_shard_size: int | str = "1GB",
+        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
+        n_obs_per_dataset: int = 2_097_152,
+        shuffle: bool = True,
+        random_seed: int | None = None,
+    ) -> Self:
+        """Create a grouped collection from AnnData paths.
+
+        Observations are reordered so that each group is contiguous, then
+        written sequentially as a flat series of datasets.  A
+        ``group_index`` DataFrame is persisted as metadata to record per-group
+        boundaries.
+
+        Parameters
+        ----------
+        groupby
+            One or more obs column names to group by.
+        n_obs_per_dataset
+            Maximum number of observations per dataset.
+        shuffle
+            Whether to shuffle observations within each group.
+        random_seed
+            Seed for the random number generator used when ``shuffle=True``.
+        """
+        if not shuffle and random_seed is not None:
+            raise ValueError("`random_seed` must be None when `shuffle` is False.")
+        if not self.is_empty:
+            raise RuntimeError("Cannot create a grouped collection at a non-empty location.")
+        groupby_keys = [groupby] if isinstance(groupby, str) else list(groupby)
+        if len(groupby_keys) == 0:
+            raise ValueError("`groupby` must contain at least one obs column name.")
+        if len(set(groupby_keys)) != len(groupby_keys):
+            raise ValueError("`groupby` must not contain duplicate column names.")
+
+        adata_concat, var_mask = _load_and_check(adata_paths, load_adata=load_adata, var_subset=var_subset)
+        missing_group_keys = [k for k in groupby_keys if k not in adata_concat.obs.columns]
+        if len(missing_group_keys) > 0:
+            raise ValueError(f"Could not find groupby key(s) in obs: {missing_group_keys}.")
+
+        obs_for_grouping = adata_concat.obs[groupby_keys]
+        if isinstance(obs_for_grouping, Dataset2D):
+            obs_for_grouping = obs_for_grouping.to_memory()
+        rng = np.random.default_rng(random_seed)
+        ordered_positions, group_index = _group_obs_rows(
+            obs_for_grouping,
+            groupby=groupby_keys,
+            shuffle=shuffle,
+            rng=rng,
+        )
+
+        chunks = split_given_size(ordered_positions, n_obs_per_dataset)
+        for i, chunk in enumerate(tqdm(chunks, desc="processing chunks")):
+            sort_order = np.argsort(chunk)
+            adata_chunk = adata_concat[chunk[sort_order], :][:, var_mask].copy()
+            adata_chunk = _persist_adata_in_memory(adata_chunk)
+            unsort_order = np.argsort(sort_order)
+            adata_chunk = adata_chunk[unsort_order]
+            key = f"{DATASET_PREFIX}_{i}"
+            if isinstance(self._group, zarr.Group):
+                write_sharded(
+                    self._group,
+                    adata_chunk,
+                    n_obs_per_chunk=n_obs_per_chunk,
+                    shard_size=zarr_shard_size,
+                    compressors=zarr_compressor,
+                    key=key,
+                )
+            else:
+                ad.io.write_h5ad(
+                    self._group / f"{key}.h5ad",
+                    adata_chunk,
+                    dataset_kwargs={"compression": h5ad_compressor},
+                )
+
+        ad.io.write_elem(self._group, GROUP_INDEX_KEY, group_index)
+        self._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
+        return self
