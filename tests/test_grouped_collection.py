@@ -193,3 +193,148 @@ def test_categorical_sampler_from_collection(
     for lr in sampler.sample(int(group_index["stop"].iloc[-1])):
         total_batches += len(lr["splits"])
     assert total_batches == 20
+
+
+# =============================================================================
+# End-to-end: batch purity
+# =============================================================================
+
+
+def _build_grouped_collection(paths, tmp_path, name, groupby="label"):
+    return GroupedCollection(tmp_path / f"{name}.zarr").add_adatas(
+        paths,
+        groupby=groupby,
+        n_obs_per_chunk=2,
+        zarr_shard_size=10,
+        n_obs_per_dataset=2_000_000,
+        shuffle=False,
+    )
+
+
+def test_e2e_each_batch_is_pure_category(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """Every batch yielded by Loader+CategoricalSampler contains obs from exactly one label group."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    grouped = _build_grouped_collection(paths, tmp_path, "e2e_pure")
+    group_index = grouped.group_index
+
+    min_cat_size = int(group_index["count"].min())
+    chunk_size = min(min_cat_size, 2)
+    batch_size = chunk_size
+    n_batches = 30
+
+    sampler = CategoricalSampler.from_collection(
+        grouped,
+        chunk_size=chunk_size,
+        preload_nchunks=2,
+        batch_size=batch_size,
+        num_samples=n_batches * batch_size,
+        rng=np.random.default_rng(42),
+    )
+    loader = Loader(
+        batch_sampler=sampler,
+        return_index=False,
+        preload_to_gpu=False,
+        to_torch=False,
+    ).use_collection(grouped)
+
+    batch_count = 0
+    for batch in loader:
+        obs = batch["obs"]
+        assert obs is not None
+        labels_in_batch = obs["label"].unique()
+        assert len(labels_in_batch) == 1, f"Batch has multiple labels: {labels_in_batch.tolist()}"
+        batch_count += 1
+    assert batch_count == n_batches
+
+
+def test_e2e_batch_larger_than_category(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """batch_size > smallest category works via with-replacement sampling."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    grouped = _build_grouped_collection(paths, tmp_path, "e2e_big_batch")
+    group_index = grouped.group_index
+
+    min_cat_size = int(group_index["count"].min())
+    chunk_size = min(min_cat_size, 2)
+    batch_size = min_cat_size * 2
+    # preload_nchunks must satisfy: chunk_size * preload_nchunks >= batch_size
+    # and (chunk_size * preload_nchunks) % batch_size == 0
+    preload_nchunks = batch_size // chunk_size
+    n_batches = 10
+
+    sampler = CategoricalSampler.from_collection(
+        grouped,
+        chunk_size=chunk_size,
+        preload_nchunks=preload_nchunks,
+        batch_size=batch_size,
+        num_samples=n_batches * batch_size,
+        rng=np.random.default_rng(7),
+    )
+    loader = Loader(
+        batch_sampler=sampler,
+        return_index=False,
+        preload_to_gpu=False,
+        to_torch=False,
+    ).use_collection(grouped)
+
+    batch_count = 0
+    for batch in loader:
+        obs = batch["obs"]
+        assert obs is not None
+        labels_in_batch = obs["label"].unique()
+        assert len(labels_in_batch) == 1, (
+            f"Batch has mixed labels: {labels_in_batch.tolist()}"
+        )
+        assert batch["X"].shape[0] == batch_size
+        batch_count += 1
+    assert batch_count == n_batches
+
+
+def test_e2e_weighted_categories_bias(
+    adata_with_h5_path_different_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    """Heavily weighted category appears in most batches."""
+    paths = sorted(p for p in adata_with_h5_path_different_var_space[1].iterdir() if p.suffix == ".h5ad")[:3]
+    grouped = _build_grouped_collection(paths, tmp_path, "e2e_weighted")
+    group_index = grouped.group_index
+    n_categories = len(group_index)
+
+    min_cat_size = int(group_index["count"].min())
+    chunk_size = min(min_cat_size, 2)
+    batch_size = chunk_size
+    n_batches = 100
+
+    weights = np.zeros(n_categories)
+    weights[0] = 1.0
+
+    sampler = CategoricalSampler.from_collection(
+        grouped,
+        chunk_size=chunk_size,
+        preload_nchunks=2,
+        batch_size=batch_size,
+        num_samples=n_batches * batch_size,
+        weights=weights,
+        rng=np.random.default_rng(0),
+    )
+    loader = Loader(
+        batch_sampler=sampler,
+        return_index=False,
+        preload_to_gpu=False,
+        to_torch=False,
+    ).use_collection(grouped)
+
+    dominant_label = str(group_index.iloc[0]["label"])
+    dominant_count = 0
+    total = 0
+    for batch in loader:
+        label = batch["obs"]["label"].iloc[0]
+        if str(label) == dominant_label:
+            dominant_count += 1
+        total += 1
+
+    assert dominant_count == total, (
+        f"Expected all {total} batches to be label={dominant_label!r}, got {dominant_count}"
+    )

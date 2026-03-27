@@ -893,7 +893,7 @@ def _group_obs_rows(
 
     group_index = g.size().reset_index(name="count")
     for col in groupby:
-        group_index[col] = group_index[col].fillna("<NA>").astype(str)
+        group_index[col] = group_index[col].astype(object).fillna("<NA>").astype(str)
     counts = group_index["count"].to_numpy(dtype=np.int64)
     stops = np.cumsum(counts)
     group_index["stop"] = stops
