@@ -25,7 +25,7 @@ from zarr.codecs import BloscCodec, BloscShuffle
 from annbatch.utils import split_given_size
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+    from collections.abc import Callable, Generator, Iterable, Mapping
     from os import PathLike
     from typing import Any, Literal
 
@@ -36,7 +36,9 @@ V1_GROUPED_ENCODING = {"encoding-type": "annbatch-grouped", "encoding-version": 
 GROUP_INDEX_KEY = "group_index"
 
 
-def _default_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](x: T) -> ad.AnnData:
+def _default_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](
+    x: T,
+) -> ad.AnnData:
     adata = ad.experimental.read_lazy(x, load_annotation_index=False)
     if not isinstance(x, zarr.Group | h5py.Group):
         group = (
@@ -51,10 +53,18 @@ def _default_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](x: T) 
     for attr in ["obs", "var"]:
         # Only one column at a time will be loaded so we will hopefully pick up the benefit of loading into memory by the cache without having memory pressure.
         if len(getattr(adata, attr).columns) > 0:
-            setattr(adata, attr, ad.experimental.read_elem_lazy(group[attr], chunks=(-1,), use_range_index=True))
+            setattr(
+                adata,
+                attr,
+                ad.experimental.read_elem_lazy(
+                    group[attr], chunks=(-1,), use_range_index=True
+                ),
+            )
             for col in getattr(adata, attr).columns:
                 # Nullables / categoricals have bad perforamnce characteristics when concatenating using dask
-                if pd.api.types.is_extension_array_dtype(getattr(adata, attr)[col].dtype):
+                if pd.api.types.is_extension_array_dtype(
+                    getattr(adata, attr)[col].dtype
+                ):
                     getattr(adata, attr)[col] = getattr(adata, attr)[col].data
     return adata
 
@@ -100,7 +110,9 @@ def write_sharded(
     *,
     n_obs_per_chunk: int = 64,
     shard_size: int | str = "1GB",
-    compressors: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+    compressors: Iterable[BytesBytesCodec] = (
+        BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
+    ),
     key: str | None = None,
 ):
     """Write a sharded zarr store from a single AnnData object.
@@ -124,7 +136,9 @@ def write_sharded(
         key
             The key to which this object should be written - by default the root, in which case the *entire* store (not just the group) is cleared first.
     """
-    with ad.settings.override(zarr_write_format=3, write_csr_csc_indices_with_min_possible_dtype=True):
+    with ad.settings.override(
+        zarr_write_format=3, write_csr_csc_indices_with_min_possible_dtype=True
+    ):
 
         def callback(
             write_func: ad.experimental.Write,
@@ -138,32 +152,41 @@ def write_sharded(
             # Ensure we're not overriding anything here
             dataset_kwargs = dict(dataset_kwargs)
             if iospec.encoding_type in {"array"} and (
-                any(n in store.name for n in {"obsm", "layers", "obsp"}) or "X" == elem_name
+                any(n in store.name for n in {"obsm", "layers", "obsp"})
+                or "X" == elem_name
             ):
                 obs_per_shard = _shard_size_param_to_n_obs(shard_size, elem)
                 # Clamp chunk/shard to the element size for small datasets
                 dense_chunk = min(n_obs_per_chunk, elem.shape[0])
                 if dense_chunk == 0:
-                    raise ValueError(f"Cannot write sharded array {elem_name!r} with 0 observations.")
+                    raise ValueError(
+                        f"Cannot write sharded array {elem_name!r} with 0 observations."
+                    )
                 dense_shard = min(obs_per_shard, elem.shape[0])
                 dense_shard = max(dense_chunk, _round_down(dense_shard, dense_chunk))
                 dataset_kwargs = {
                     **dataset_kwargs,
-                    "shards": (dense_shard,) + elem.shape[1:],  # only shard over 1st dim
-                    "chunks": (dense_chunk,) + elem.shape[1:],  # only chunk over 1st dim
+                    "shards": (dense_shard,)
+                    + elem.shape[1:],  # only shard over 1st dim
+                    "chunks": (dense_chunk,)
+                    + elem.shape[1:],  # only chunk over 1st dim
                     "compressors": compressors,
                 }
             elif iospec.encoding_type in {"csr_matrix", "csc_matrix"}:
                 obs_per_shard = _shard_size_param_to_n_obs(shard_size, elem)
                 nnz = elem.nnz
                 if elem.shape[0] == 0:
-                    raise ValueError(f"Cannot write sharded sparse matrix {elem_name!r} with 0 observations.")
+                    raise ValueError(
+                        f"Cannot write sharded sparse matrix {elem_name!r} with 0 observations."
+                    )
                 avg_nnz_per_obs = nnz / elem.shape[0]
                 sparse_chunk = max(1, int(n_obs_per_chunk * avg_nnz_per_obs))
                 sparse_chunk = min(sparse_chunk, nnz) if nnz > 0 else sparse_chunk
                 sparse_shard = max(1, int(obs_per_shard * avg_nnz_per_obs))
                 sparse_shard = min(sparse_shard, nnz) if nnz > 0 else sparse_shard
-                sparse_shard = max(sparse_chunk, _round_down(sparse_shard, sparse_chunk))
+                sparse_shard = max(
+                    sparse_chunk, _round_down(sparse_shard, sparse_chunk)
+                )
                 dataset_kwargs = {
                     **dataset_kwargs,
                     "shards": (sparse_shard,),
@@ -172,7 +195,9 @@ def write_sharded(
                 }
             write_func(store, elem_name, elem, dataset_kwargs=dataset_kwargs)
 
-        ad.experimental.write_dispatched(group, "/" if key is None else key, adata, callback=callback)
+        ad.experimental.write_dispatched(
+            group, "/" if key is None else key, adata, callback=callback
+        )
         zarr.consolidate_metadata(group.store)
 
 
@@ -202,13 +227,16 @@ def _estimate_bytes_per_obs_row(
     mean_bytes_per_row = 0.0
     for elem_path in elem_paths:
         if elem_path not in backing:
-            raise KeyError(f"Could not find {elem_path} on AnnData object in backing store")
+            raise KeyError(
+                f"Could not find {elem_path} on AnnData object in backing store"
+            )
         node = backing[elem_path]
         encoding = dict(node.attrs).get("encoding-type", "")
         if encoding in {"csr_matrix", "csc_matrix"}:
             data, indices, indptr = node["data"], node["indices"], node["indptr"]
             mean_bytes_per_row += (
-                data.shape[0] * (data.dtype.itemsize + indices.dtype.itemsize) + indptr.shape[0] * indptr.dtype.itemsize
+                data.shape[0] * (data.dtype.itemsize + indices.dtype.itemsize)
+                + indptr.shape[0] * indptr.dtype.itemsize
             ) / n_obs
         elif encoding in {"array", ""}:
             mean_bytes_per_row += int(np.prod(node.shape[1:])) * node.dtype.itemsize
@@ -221,7 +249,9 @@ def _estimate_bytes_per_obs_row(
                 if col_encoding == "categorical":
                     col_node = col_node["codes"]
                 if hasattr(col_node, "shape") and hasattr(col_node, "dtype"):
-                    mean_bytes_per_row += col_node.shape[0] * col_node.dtype.itemsize / n_obs
+                    mean_bytes_per_row += (
+                        col_node.shape[0] * col_node.dtype.itemsize / n_obs
+                    )
         elif encoding == "awkward-array":
             for buf_key in node:
                 buf = node[buf_key]
@@ -235,10 +265,14 @@ def _estimate_bytes_per_obs_row(
     return mean_bytes_per_row
 
 
-def _validate_anndatas_and_maybe_get_bytes_per_row[T: zarr.Group | h5py.Group | PathLike[str] | str](
+def _validate_anndatas_and_maybe_get_bytes_per_row[
+    T: zarr.Group | h5py.Group | PathLike[str] | str
+](
     paths_or_anndatas: Iterable[T | ad.AnnData],
     *,
-    load_adata: Callable[[T], ad.AnnData] = lambda x: ad.experimental.read_lazy(x, load_annotation_index=False),
+    load_adata: Callable[[T], ad.AnnData] = lambda x: ad.experimental.read_lazy(
+        x, load_annotation_index=False
+    ),
     estimate_bytes_per_obs_row: bool = False,
 ) -> float | None:
     """Validate that all datasets share the same keys and optionally estimate bytes per observation row.
@@ -272,8 +306,14 @@ def _validate_anndatas_and_maybe_get_bytes_per_row[T: zarr.Group | h5py.Group | 
                     backing = path_or_anndata
                 else:
                     p = Path(str(path_or_anndata))
-                    backing = h5py.File(str(p), "r") if p.is_file() else zarr.open_group(str(p), mode="r")
-                bytes_per_obs_samples.append(_estimate_bytes_per_obs_row(adata, backing=backing))
+                    backing = (
+                        h5py.File(str(p), "r")
+                        if p.is_file()
+                        else zarr.open_group(str(p), mode="r")
+                    )
+                bytes_per_obs_samples.append(
+                    _estimate_bytes_per_obs_row(adata, backing=backing)
+                )
         else:
             if estimate_bytes_per_obs_row:
                 raise NotImplementedError(
@@ -288,13 +328,20 @@ def _validate_anndatas_and_maybe_get_bytes_per_row[T: zarr.Group | h5py.Group | 
                     key_count[key] += 1
         if adata.raw is not None:
             num_raw_in_adata += 1
-    if num_raw_in_adata != (num_anndatas := len(list(paths_or_anndatas))) and num_raw_in_adata != 0:
+    if (
+        num_raw_in_adata != (num_anndatas := len(list(paths_or_anndatas)))
+        and num_raw_in_adata != 0
+    ):
         warnings.warn(
             f"Found raw keys not present in all anndatas {paths_or_anndatas}, consider deleting raw or moving it to a shared layer/X location via `load_adata`",
             stacklevel=2,
         )
     for elem_name, key_count in found_keys.items():
-        elem_keys_mismatched = [key for key, count in key_count.items() if (count != num_anndatas and count != 0)]
+        elem_keys_mismatched = [
+            key
+            for key, count in key_count.items()
+            if (count != num_anndatas and count != 0)
+        ]
         if len(elem_keys_mismatched) > 0:
             warnings.warn(
                 f"Found {elem_name} keys {elem_keys_mismatched} not present in all anndatas {paths_or_anndatas}, consider stopping and using the `load_adata` argument to alter {elem_name} accordingly.",
@@ -309,16 +356,21 @@ def _lazy_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](
 ):
     adatas = []
     categoricals_in_all_adatas: dict[str, pd.Index] = {}
-    for i, path in tqdm(enumerate(paths), total=len(paths), desc="Lazy loading anndatas"):
+    for i, path in tqdm(
+        enumerate(paths), total=len(paths), desc="Lazy loading anndatas"
+    ):
         adata = load_adata(path)
         # Track the source file for this given anndata object
         adata.obs["src_path"] = pd.Categorical.from_codes(
-            np.ones((adata.shape[0],), dtype="int") * i, categories=pd.Index([str(p) for p in paths])
+            np.ones((adata.shape[0],), dtype="int") * i,
+            categories=pd.Index([str(p) for p in paths]),
         )
         # Concatenating Dataset2D drops categoricals so we need to track them
         if isinstance(adata.obs, Dataset2D):
             categorical_cols_in_this_adata = {
-                col: adata.obs[col].dtype.categories for col in adata.obs.columns if adata.obs[col].dtype == "category"
+                col: adata.obs[col].dtype.categories
+                for col in adata.obs.columns
+                if adata.obs[col].dtype == "category"
             }
             if not categoricals_in_all_adatas:
                 categoricals_in_all_adatas = {
@@ -326,7 +378,10 @@ def _lazy_load_adata[T: zarr.Group | h5py.Group | PathLike[str] | str](
                     "src_path": adata.obs["src_path"].dtype.categories,
                 }
             else:
-                for k in categoricals_in_all_adatas.keys() & categorical_cols_in_this_adata.keys():
+                for k in (
+                    categoricals_in_all_adatas.keys()
+                    & categorical_cols_in_this_adata.keys()
+                ):
                     categoricals_in_all_adatas[k] = categoricals_in_all_adatas[k].union(
                         categorical_cols_in_this_adata[k]
                     )
@@ -361,12 +416,16 @@ def _create_chunks_for_shuffling(
     match shuffle_n_obs_per_dataset is not None, n_chunkings is not None:
         case True, False:
             n_slices_per_dataset = int(shuffle_n_obs_per_dataset // shuffle_chunk_size)
-            use_single_chunking = n_obs <= shuffle_n_obs_per_dataset or n_slices_per_dataset <= 1
+            use_single_chunking = (
+                n_obs <= shuffle_n_obs_per_dataset or n_slices_per_dataset <= 1
+            )
         case False, True:
             n_slices_per_dataset = (n_obs // n_chunkings) // shuffle_chunk_size
             use_single_chunking = n_chunkings == 1
         case _, _:
-            raise ValueError("Cannot provide both shuffle_n_obs_per_dataset and n_chunkings or neither")
+            raise ValueError(
+                "Cannot provide both shuffle_n_obs_per_dataset and n_chunkings or neither"
+            )
     # In this case `shuffle_n_obs_per_dataset` is bigger than the size of the dataset or the slice size is probably too big.
     if use_single_chunking:
         return [np.concatenate(idxs)]
@@ -393,7 +452,9 @@ def _to_categorical_obs(adata: ad.AnnData) -> ad.AnnData:
     """Convert columns marked as categorical in `uns` to categories, accounting for `concat` on `Dataset2D` lost dtypes"""
     if "dataset2d_categoricals_to_convert" in adata.uns:
         for col, categories in adata.uns["dataset2d_categoricals_to_convert"].items():
-            adata.obs[col] = pd.Categorical(np.array(adata.obs[col]), categories=categories)
+            adata.obs[col] = pd.Categorical(
+                np.array(adata.obs[col]), categories=categories
+            )
         del adata.uns["dataset2d_categoricals_to_convert"]
     return adata
 
@@ -477,11 +538,17 @@ class BaseCollection:
     _group: zarr.Group | Path
 
     def __init__(
-        self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
+        self,
+        group: zarr.Group | str | Path,
+        *,
+        mode: Literal["a", "r", "r+"] = "a",
+        is_collection_h5ad: bool = False,
     ):
         if is_collection_h5ad:
             if isinstance(group, zarr.Group):
-                raise ValueError("Do not set `is_collection_h5ad` to True when also passing in a zarr Group.")
+                raise ValueError(
+                    "Do not set `is_collection_h5ad` to True when also passing in a zarr Group."
+                )
             warnings.warn(
                 "Loading h5ad is currently not supported and thus we cannot guarantee the funcionality of the ecosystem with h5ad files."
                 "DatasetCollection should be able to handle shuffling but we guarantee little else."
@@ -507,7 +574,11 @@ class DatasetCollection(BaseCollection):
     """A preshuffled collection object including functionality for creating, adding to, and loading collections shuffled by `annbatch`."""
 
     def __init__(
-        self, group: zarr.Group | str | Path, *, mode: Literal["a", "r", "r+"] = "a", is_collection_h5ad: bool = False
+        self,
+        group: zarr.Group | str | Path,
+        *,
+        mode: Literal["a", "r", "r+"] = "a",
+        is_collection_h5ad: bool = False,
     ):
         """Initialization of the object at a given location.
 
@@ -527,7 +598,11 @@ class DatasetCollection(BaseCollection):
     def _dataset_keys(self) -> list[str]:
         if isinstance(self._group, zarr.Group):
             return sorted(
-                [k for k in self._group.keys() if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None],
+                [
+                    k
+                    for k in self._group.keys()
+                    if re.match(rf"{DATASET_PREFIX}_([0-9]*)", k) is not None
+                ],
                 key=lambda x: int(x.split("_")[1]),
             )
         else:
@@ -544,7 +619,10 @@ class DatasetCollection(BaseCollection):
     def is_empty(self) -> bool:
         """Whether or not there is an existing store at the group location."""
         return (
-            (not (V1_ENCODING.items() <= self._group.attrs.items()) or len(self._dataset_keys) == 0)
+            (
+                not (V1_ENCODING.items() <= self._group.attrs.items())
+                or len(self._dataset_keys) == 0
+            )
             if isinstance(self._group, zarr.Group)
             else (len(list(self._group.iterdir())) == 0)
         )
@@ -554,11 +632,15 @@ class DatasetCollection(BaseCollection):
         self,
         adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
         *,
-        load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
+        load_adata: Callable[
+            [zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData
+        ] = _default_load_adata,
         var_subset: Iterable[str] | None = None,
         n_obs_per_chunk: int = 64,
         shard_size: int | str = "1GB",
-        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        zarr_compressor: Iterable[BytesBytesCodec] = (
+            BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
+        ),
         h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
         dataset_size: int | str = "20GB",
         shuffle_chunk_size: int = 1000,
@@ -652,7 +734,9 @@ class DatasetCollection(BaseCollection):
             "rng": rng,
         }
         if self.is_empty:
-            self._create_collection(**shared_kwargs, dataset_size=dataset_size, var_subset=var_subset)
+            self._create_collection(
+                **shared_kwargs, dataset_size=dataset_size, var_subset=var_subset
+            )
         else:
             self._add_to_collection(**shared_kwargs)
         return self
@@ -665,7 +749,9 @@ class DatasetCollection(BaseCollection):
         var_subset: Iterable[str] | None = None,
         n_obs_per_chunk: int = 64,
         shard_size: int | str = "1GB",
-        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        zarr_compressor: Iterable[BytesBytesCodec] = (
+            BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
+        ),
         h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
         dataset_size: int | str = "20GB",
         shuffle_chunk_size: int = 1000,
@@ -720,10 +806,14 @@ class DatasetCollection(BaseCollection):
                 Random number generator for shuffling.
         """
         if not self.is_empty:
-            raise RuntimeError("Cannot create a collection at a location that already has a shuffled collection")
+            raise RuntimeError(
+                "Cannot create a collection at a location that already has a shuffled collection"
+            )
         needs_estimate = isinstance(dataset_size, str)
         estimated_bytes_per_row = _validate_anndatas_and_maybe_get_bytes_per_row(
-            adata_paths, load_adata=load_adata, estimate_bytes_per_obs_row=needs_estimate
+            adata_paths,
+            load_adata=load_adata,
+            estimate_bytes_per_obs_row=needs_estimate,
         )
 
         if needs_estimate:
@@ -783,7 +873,9 @@ class DatasetCollection(BaseCollection):
         load_adata: Callable[[PathLike[str] | str], ad.AnnData] = ad.read_h5ad,
         n_obs_per_chunk: int = 64,
         shard_size: int | str = "1GB",
-        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        zarr_compressor: Iterable[BytesBytesCodec] = (
+            BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
+        ),
         h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
         shuffle_chunk_size: int = 1000,
         shuffle: bool = True,
@@ -822,16 +914,22 @@ class DatasetCollection(BaseCollection):
                 Whether or not to shuffle when adding.  Otherwise, the incoming data will just be split up and appended.
         """
         if self.is_empty:
-            raise ValueError("Store is empty. Please run `DatasetCollection.add_adatas` first.")
+            raise ValueError(
+                "Store is empty. Please run `DatasetCollection.add_adatas` first."
+            )
         # Check for mismatched keys among the inputs.
         adata_concat = _lazy_load_adata(adata_paths, load_adata=load_adata)
-        if math.ceil(adata_concat.shape[0] / shuffle_chunk_size) < len(self._dataset_keys):
+        if math.ceil(adata_concat.shape[0] / shuffle_chunk_size) < len(
+            self._dataset_keys
+        ):
             raise ValueError(
                 f"Use a shuffle size small enough to distribute the input data with {adata_concat.shape[0]} obs across {len(self._dataset_keys)} anndata stores."
                 "Open an issue if the incoming anndata is so small it cannot be distributed across the on-disk data"
             )
         # Check for mismatched keys between datasets and the inputs.
-        _validate_anndatas_and_maybe_get_bytes_per_row([adata_concat] + [self._group[k] for k in self._dataset_keys])
+        _validate_anndatas_and_maybe_get_bytes_per_row(
+            [adata_concat] + [self._group[k] for k in self._dataset_keys]
+        )
         chunks = _create_chunks_for_shuffling(
             adata_concat.shape[0],
             rng=rng,
@@ -848,7 +946,9 @@ class DatasetCollection(BaseCollection):
         ):
             adata_dataset = ad.io.read_elem(self._group[dataset])
             subset_adata = _to_categorical_obs(
-                adata_concat[chunk, :][:, adata_concat.var.index.isin(adata_dataset.var.index)]
+                adata_concat[chunk, :][
+                    :, adata_concat.var.index.isin(adata_dataset.var.index)
+                ]
             )
             adata = ad.concat([adata_dataset, subset_adata], join="outer")
             if shuffle:
@@ -873,7 +973,31 @@ class DatasetCollection(BaseCollection):
                 )
 
 
-_SCAN_BLOCK_SIZE = 500_000
+_DEFAULT_MAX_MEMORY = "8GB"
+_BLOCK_FRACTION = 0.25
+
+
+def _estimate_bytes_per_row(
+    X_elem,
+    n_vars_out: int,
+    var_ratio: float,
+) -> float:
+    """Estimate in-memory bytes per observation row for the X matrix."""
+    if hasattr(X_elem, "shape") and len(X_elem.shape) == 2 and X_elem.shape[0] > 0:
+        if sp.issparse(X_elem) or isinstance(X_elem, BaseCompressedSparseDataset):
+            if isinstance(X_elem, BaseCompressedSparseDataset):
+                backed = X_elem._to_backed()
+                total_data_bytes = (
+                    backed.data.nbytes + backed.indices.nbytes + backed.indptr.nbytes
+                )
+            else:
+                total_data_bytes = (
+                    X_elem.data.nbytes + X_elem.indices.nbytes + X_elem.indptr.nbytes
+                )
+            return max(total_data_bytes / X_elem.shape[0] * var_ratio, 1.0)
+        elif hasattr(X_elem, "dtype"):
+            return max(n_vars_out * X_elem.dtype.itemsize, 1.0)
+    return max(n_vars_out * 4, 1.0)
 
 
 def _sequential_scan_and_write(
@@ -887,8 +1011,7 @@ def _sequential_scan_and_write(
     zarr_shard_size: int | str,
     zarr_compressor,
     h5ad_compressor,
-    scan_block_size: int = _SCAN_BLOCK_SIZE,
-    max_buffered_rows: int | None = None,
+    max_memory: int | str = _DEFAULT_MAX_MEMORY,
 ) -> None:
     """Read source data in one sequential pass and scatter rows into per-chunk buffers.
 
@@ -903,22 +1026,24 @@ def _sequential_scan_and_write(
     filesystems where random I/O is orders of magnitude slower.
 
     Each chunk buffer collects ``(position, AnnData-slice)`` fragments.
-    When a chunk is complete the fragments are concatenated in position
-    order, producing an AnnData identical to what the old random-access
-    code path would have built.
+    When the total buffered rows across all chunks exceed the memory
+    budget, the chunk with the most accumulated rows is force-flushed:
+    its missing rows are fetched via random access, the chunk is
+    assembled and written, and the buffer is freed.
 
     Parameters
     ----------
-    max_buffered_rows
-        Maximum total rows held in fragment buffers across all chunks
-        before an incomplete-chunk flush is triggered.  When exceeded,
-        the chunk with the most accumulated rows is flushed early by
-        re-reading its missing rows from the source via random access.
-        Defaults to ``2 * max(chunk_sizes)`` which guarantees at most
-        ~2 chunks' worth of data in memory at any time.
+    max_memory
+        Peak memory budget for X data (scan block + fragment buffers),
+        as a byte count or a human-readable size string (e.g.
+        ``"8GB"``, ``"512MB"``).  The scan block size is derived
+        automatically as a quarter of this budget; the remaining
+        three-quarters are available for accumulated fragment buffers.
+        Default ``"8GB"``.
     """
     n_obs = adata_concat.shape[0]
     n_chunks = len(chunks)
+    n_vars_out = int(var_mask.sum())
 
     row_to_chunk = np.empty(n_obs, dtype=np.int64)
     row_to_pos = np.empty(n_obs, dtype=np.int64)
@@ -929,8 +1054,25 @@ def _sequential_scan_and_write(
     chunk_sizes = np.array([len(c) for c in chunks], dtype=np.int64)
     chunk_filled = np.zeros(n_chunks, dtype=np.int64)
 
-    if max_buffered_rows is None:
-        max_buffered_rows = int(2 * chunk_sizes.max())
+    if isinstance(max_memory, str):
+        max_memory_bytes = parse_size(max_memory, binary=True)
+    else:
+        max_memory_bytes = int(max_memory)
+
+    X_elem = adata_concat.X
+    n_vars_src = (
+        X_elem.shape[1]
+        if hasattr(X_elem, "shape") and len(X_elem.shape) == 2
+        else n_vars_out
+    )
+    var_ratio = n_vars_out / max(n_vars_src, 1)
+    bytes_per_row = _estimate_bytes_per_row(X_elem, n_vars_out, var_ratio)
+
+    block_budget_bytes = int(max_memory_bytes * _BLOCK_FRACTION)
+    buffer_budget_bytes = max_memory_bytes - block_budget_bytes
+
+    scan_block_size = max(int(block_budget_bytes / bytes_per_row), 1000)
+    max_buffered_rows = max(int(buffer_budget_bytes / bytes_per_row), scan_block_size)
     total_buffered_rows = 0
 
     chunk_fragments: list[list[tuple[int, ad.AnnData]]] = [[] for _ in range(n_chunks)]
@@ -967,17 +1109,36 @@ def _sequential_scan_and_write(
         chunk_fragments[cid] = []
         chunk_done[cid] = True
 
+    def _materialize_block(block_slice: slice) -> ad.AnnData:
+        """Read a contiguous block from the source, materializing X but using pre-loaded obs."""
+        block_adata = adata_concat[block_slice, :][:, var_mask].copy()
+        block_adata = _persist_adata_in_memory(block_adata)
+        block_adata.obs = obs_full.iloc[block_slice.start : block_slice.stop].copy()
+        block_adata.obs.index = block_adata.obs_names
+        return block_adata
+
+    def _materialize_rows(source_rows: np.ndarray) -> ad.AnnData:
+        """Read specific rows from the source (random access fallback)."""
+        sort_order = np.argsort(source_rows)
+        adata_subset = adata_concat[source_rows[sort_order], :][:, var_mask].copy()
+        adata_subset = _persist_adata_in_memory(adata_subset)
+        unsort_order = np.argsort(sort_order)
+        adata_subset = adata_subset[unsort_order]
+        adata_subset.obs = obs_full.iloc[source_rows].copy()
+        adata_subset.obs.index = adata_subset.obs_names
+        return adata_subset
+
     def _force_flush_largest() -> int:
         """Flush the incomplete chunk with the most buffered rows.
 
-        The missing rows are fetched via random access from adata_concat,
-        which is slower but keeps memory bounded.  Returns number of
-        rows freed.
+        The missing rows are fetched via random access, which is slower
+        but avoids any filesystem writes and keeps memory bounded.
+        Returns the number of rows freed.
         """
-        buffered_per_chunk = np.array([
-            int(chunk_filled[c]) if not chunk_done[c] else 0
-            for c in range(n_chunks)
-        ], dtype=np.int64)
+        buffered_per_chunk = np.array(
+            [int(chunk_filled[c]) if not chunk_done[c] else 0 for c in range(n_chunks)],
+            dtype=np.int64,
+        )
         cid = int(np.argmax(buffered_per_chunk))
         rows_held = int(buffered_per_chunk[cid])
         if rows_held == 0:
@@ -997,25 +1158,6 @@ def _sequential_scan_and_write(
 
         _flush_chunk(cid)
         return rows_held
-
-    def _materialize_block(block_slice: slice) -> ad.AnnData:
-        """Read a contiguous block from the source, materializing X but using pre-loaded obs."""
-        block_adata = adata_concat[block_slice, :][:, var_mask].copy()
-        block_adata = _persist_adata_in_memory(block_adata)
-        block_adata.obs = obs_full.iloc[block_slice.start : block_slice.stop].copy()
-        block_adata.obs.index = block_adata.obs_names
-        return block_adata
-
-    def _materialize_rows(source_rows: np.ndarray) -> ad.AnnData:
-        """Read specific rows from the source (random access fallback)."""
-        sort_order = np.argsort(source_rows)
-        adata_subset = adata_concat[source_rows[sort_order], :][:, var_mask].copy()
-        adata_subset = _persist_adata_in_memory(adata_subset)
-        unsort_order = np.argsort(sort_order)
-        adata_subset = adata_subset[unsort_order]
-        adata_subset.obs = obs_full.iloc[source_rows].copy()
-        adata_subset.obs.index = adata_subset.obs_names
-        return adata_subset
 
     for block_start in tqdm(range(0, n_obs, scan_block_size), desc="sequential scan"):
         block_end = min(block_start + scan_block_size, n_obs)
@@ -1108,7 +1250,9 @@ def _split_positions_by_dataset_groupby(
     ``_group_obs_rows`` sorts by all ``groupby`` columns and
     ``dataset_groupby_keys`` is a prefix), so we merge adjacent ranges.
     """
-    dataset_groups = group_index.groupby(dataset_groupby_keys, dropna=False, sort=True, observed=False)
+    dataset_groups = group_index.groupby(
+        dataset_groupby_keys, dropna=False, sort=True, observed=False
+    )
     chunks: list[np.ndarray] = []
     for _, df in dataset_groups:
         start = int(df["start"].iloc[0])
@@ -1130,14 +1274,21 @@ class GroupedCollection(BaseCollection):
     def _dataset_keys(self) -> list[str]:
         if isinstance(self._group, zarr.Group):
             return sorted(
-                [k for k in self._group.keys() if re.fullmatch(rf"{DATASET_PREFIX}_([0-9]+)", k) is not None],
+                [
+                    k
+                    for k in self._group.keys()
+                    if re.fullmatch(rf"{DATASET_PREFIX}_([0-9]+)", k) is not None
+                ],
                 key=lambda x: int(x.split("_")[1]),
             )
         raise ValueError("Cannot list dataset keys for a folder-based collection")
 
     @property
     def is_empty(self) -> bool:
-        return not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items()) or len(self._dataset_keys) == 0
+        return (
+            not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items())
+            or len(self._dataset_keys) == 0
+        )
 
     def __iter__(self) -> Generator[zarr.Group]:
         for k in self._dataset_keys:
@@ -1157,15 +1308,20 @@ class GroupedCollection(BaseCollection):
         *,
         groupby: str | Iterable[str],
         dataset_groupby: str | Iterable[str] | None = None,
-        load_adata: Callable[[zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData] = _default_load_adata,
+        load_adata: Callable[
+            [zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData
+        ] = _default_load_adata,
         var_subset: Iterable[str] | None = None,
         n_obs_per_chunk: int = 64,
         zarr_shard_size: int | str = "1GB",
-        zarr_compressor: Iterable[BytesBytesCodec] = (BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),),
+        zarr_compressor: Iterable[BytesBytesCodec] = (
+            BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
+        ),
         h5ad_compressor: Literal["gzip", "lzf"] | None = "gzip",
         n_obs_per_dataset: int = 2_097_152,
         shuffle: bool = True,
         random_seed: int | None = None,
+        max_memory: int | str = _DEFAULT_MAX_MEMORY,
     ) -> Self:
         """Create a grouped collection from AnnData paths.
 
@@ -1204,11 +1360,20 @@ class GroupedCollection(BaseCollection):
             Whether to shuffle observations within each group.
         random_seed
             Seed for the random number generator used when ``shuffle=True``.
+        max_memory
+            Peak memory budget for X data during the sequential scan,
+            as a byte count or human-readable size string (e.g.
+            ``"8GB"``, ``"512MB"``).  Covers both the scan block and
+            the accumulated fragment buffers.  When the total in-memory
+            rows exceed this budget the largest incomplete chunk is
+            force-flushed.  Default ``"8GB"``.
         """
         if not shuffle and random_seed is not None:
             raise ValueError("`random_seed` must be None when `shuffle` is False.")
         if not self.is_empty:
-            raise RuntimeError("Cannot create a grouped collection at a non-empty location.")
+            raise RuntimeError(
+                "Cannot create a grouped collection at a non-empty location."
+            )
         groupby_keys = [groupby] if isinstance(groupby, str) else list(groupby)
         if len(groupby_keys) == 0:
             raise ValueError("`groupby` must contain at least one obs column name.")
@@ -1216,9 +1381,15 @@ class GroupedCollection(BaseCollection):
             raise ValueError("`groupby` must not contain duplicate column names.")
 
         if dataset_groupby is not None:
-            dataset_groupby_keys = [dataset_groupby] if isinstance(dataset_groupby, str) else list(dataset_groupby)
+            dataset_groupby_keys = (
+                [dataset_groupby]
+                if isinstance(dataset_groupby, str)
+                else list(dataset_groupby)
+            )
             if len(dataset_groupby_keys) == 0:
-                raise ValueError("`dataset_groupby` must contain at least one obs column name when set.")
+                raise ValueError(
+                    "`dataset_groupby` must contain at least one obs column name when set."
+                )
             if not all(k in groupby_keys for k in dataset_groupby_keys):
                 raise ValueError(
                     f"`dataset_groupby` columns {dataset_groupby_keys} must be a subset of "
@@ -1232,10 +1403,16 @@ class GroupedCollection(BaseCollection):
         else:
             dataset_groupby_keys = None
 
-        adata_concat, var_mask = _load_and_check(adata_paths, load_adata=load_adata, var_subset=var_subset)
-        missing_group_keys = [k for k in groupby_keys if k not in adata_concat.obs.columns]
+        adata_concat, var_mask = _load_and_check(
+            adata_paths, load_adata=load_adata, var_subset=var_subset
+        )
+        missing_group_keys = [
+            k for k in groupby_keys if k not in adata_concat.obs.columns
+        ]
         if len(missing_group_keys) > 0:
-            raise ValueError(f"Could not find groupby key(s) in obs: {missing_group_keys}.")
+            raise ValueError(
+                f"Could not find groupby key(s) in obs: {missing_group_keys}."
+            )
 
         # Materialize obs once -- it is small enough to fit in memory
         # and avoids re-reading it from the backing store on every
@@ -1259,7 +1436,9 @@ class GroupedCollection(BaseCollection):
 
         if dataset_groupby_keys is not None:
             chunks = _split_positions_by_dataset_groupby(
-                ordered_positions, group_index, dataset_groupby_keys=dataset_groupby_keys
+                ordered_positions,
+                group_index,
+                dataset_groupby_keys=dataset_groupby_keys,
             )
         else:
             chunks = split_given_size(ordered_positions, n_obs_per_dataset)
@@ -1274,8 +1453,11 @@ class GroupedCollection(BaseCollection):
             zarr_shard_size=zarr_shard_size,
             zarr_compressor=zarr_compressor,
             h5ad_compressor=h5ad_compressor,
+            max_memory=max_memory,
         )
 
         ad.io.write_elem(self._group, GROUP_INDEX_KEY, group_index)
-        self._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
+        self._group.update_attributes(
+            {**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys}
+        )
         return self
