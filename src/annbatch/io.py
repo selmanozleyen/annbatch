@@ -974,7 +974,7 @@ class DatasetCollection(BaseCollection):
 
 
 _DEFAULT_MAX_MEMORY = "8GB"
-_BLOCK_FRACTION = 0.25
+_MAX_BLOCK_BYTES = 2 * 1024**3  # 2 GB cap for scan block
 
 
 def _estimate_bytes_per_row(
@@ -1068,12 +1068,21 @@ def _sequential_scan_and_write(
     var_ratio = n_vars_out / max(n_vars_src, 1)
     bytes_per_row = _estimate_bytes_per_row(X_elem, n_vars_out, var_ratio)
 
-    block_budget_bytes = int(max_memory_bytes * _BLOCK_FRACTION)
+    block_budget_bytes = min(int(max_memory_bytes * 0.25), _MAX_BLOCK_BYTES)
     buffer_budget_bytes = max_memory_bytes - block_budget_bytes
 
     scan_block_size = max(int(block_budget_bytes / bytes_per_row), 1000)
     max_buffered_rows = max(int(buffer_budget_bytes / bytes_per_row), scan_block_size)
     total_buffered_rows = 0
+
+    all_vars_selected = bool(var_mask.all())
+    tqdm.write(
+        f"  scan config: bytes_per_row={bytes_per_row:.0f}  "
+        f"scan_block_size={scan_block_size:,}  "
+        f"max_buffered_rows={max_buffered_rows:,}  "
+        f"n_blocks={math.ceil(n_obs / scan_block_size)}  "
+        f"var_subset={not all_vars_selected}"
+    )
 
     chunk_fragments: list[list[tuple[int, ad.AnnData]]] = [[] for _ in range(n_chunks)]
     chunk_done = np.zeros(n_chunks, dtype=bool)
@@ -1081,7 +1090,8 @@ def _sequential_scan_and_write(
     var_out = adata_concat.var
     if isinstance(var_out, Dataset2D):
         var_out = var_out.to_memory()
-    var_out = var_out[var_mask]
+    if not all_vars_selected:
+        var_out = var_out[var_mask]
 
     def _flush_chunk(cid: int) -> None:
         """Assemble fragments in position order, write, and free."""
@@ -1111,7 +1121,10 @@ def _sequential_scan_and_write(
 
     def _materialize_block(block_slice: slice) -> ad.AnnData:
         """Read a contiguous block from the source, materializing X but using pre-loaded obs."""
-        block_adata = adata_concat[block_slice, :][:, var_mask].copy()
+        block_adata = adata_concat[block_slice, :]
+        if not all_vars_selected:
+            block_adata = block_adata[:, var_mask]
+        block_adata = block_adata.copy()
         block_adata = _persist_adata_in_memory(block_adata)
         block_adata.obs = obs_full.iloc[block_slice.start : block_slice.stop].copy()
         block_adata.obs.index = block_adata.obs_names
@@ -1120,7 +1133,10 @@ def _sequential_scan_and_write(
     def _materialize_rows(source_rows: np.ndarray) -> ad.AnnData:
         """Read specific rows from the source (random access fallback)."""
         sort_order = np.argsort(source_rows)
-        adata_subset = adata_concat[source_rows[sort_order], :][:, var_mask].copy()
+        adata_subset = adata_concat[source_rows[sort_order], :]
+        if not all_vars_selected:
+            adata_subset = adata_subset[:, var_mask]
+        adata_subset = adata_subset.copy()
         adata_subset = _persist_adata_in_memory(adata_subset)
         unsort_order = np.argsort(sort_order)
         adata_subset = adata_subset[unsort_order]
