@@ -114,6 +114,7 @@ def write_sharded(
         BloscCodec(cname="lz4", clevel=3, shuffle=BloscShuffle.shuffle),
     ),
     key: str | None = None,
+    consolidate: bool = True,
 ):
     """Write a sharded zarr store from a single AnnData object.
 
@@ -135,6 +136,10 @@ def write_sharded(
             The compressors to pass to `zarr`.
         key
             The key to which this object should be written - by default the root, in which case the *entire* store (not just the group) is cleared first.
+        consolidate
+            Whether to consolidate zarr metadata after writing.
+            Set to False when doing many writes in a loop and
+            consolidating once at the end.  Default True.
     """
     with ad.settings.override(
         zarr_write_format=3, write_csr_csc_indices_with_min_possible_dtype=True
@@ -198,7 +203,8 @@ def write_sharded(
         ad.experimental.write_dispatched(
             group, "/" if key is None else key, adata, callback=callback
         )
-        zarr.consolidate_metadata(group.store)
+        if consolidate:
+            zarr.consolidate_metadata(group.store)
 
 
 def _estimate_bytes_per_obs_row(
@@ -1083,6 +1089,7 @@ def _two_pass_scan_and_write(
                 shard_size=zarr_shard_size,
                 compressors=zarr_compressor,
                 key=key,
+                consolidate=False,
             )
         else:
             ad.io.write_h5ad(
@@ -1145,6 +1152,7 @@ def _two_pass_scan_and_write(
                 shard_size=zarr_shard_size,
                 compressors=zarr_compressor,
                 key=final_key,
+                consolidate=False,
             )
         else:
             ad.io.write_h5ad(
@@ -1159,9 +1167,6 @@ def _two_pass_scan_and_write(
                 del group[pkey]
             else:
                 (group / f"{pkey}.h5ad").unlink(missing_ok=True)
-
-    if isinstance(group, zarr.Group):
-        zarr.consolidate_metadata(group.store)
 
 
 def _group_obs_rows(
