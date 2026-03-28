@@ -467,7 +467,9 @@ def _to_categorical_obs(adata: ad.AnnData) -> ad.AnnData:
 
 
 def _persist_adata_in_memory(adata: ad.AnnData) -> ad.AnnData:
-    if isinstance(adata.X, DaskArray):
+    if isinstance(adata.X, BaseCompressedSparseDataset):
+        adata.X = adata.X.to_memory()
+    elif isinstance(adata.X, DaskArray):
         adata.X = _compute_blockwise(adata.X)
     if isinstance(adata.obs, Dataset2D):
         adata.obs = adata.obs.to_memory()
@@ -988,19 +990,25 @@ def _estimate_bytes_per_row(
     n_vars_out: int,
     var_ratio: float,
 ) -> float:
-    """Estimate in-memory bytes per observation row for the X matrix."""
-    if hasattr(X_elem, "shape") and len(X_elem.shape) == 2 and X_elem.shape[0] > 0:
-        if sp.issparse(X_elem) or isinstance(X_elem, BaseCompressedSparseDataset):
-            if isinstance(X_elem, BaseCompressedSparseDataset):
-                backed = X_elem._to_backed()
-                total_data_bytes = (
-                    backed.data.nbytes + backed.indices.nbytes + backed.indptr.nbytes
-                )
-            else:
-                total_data_bytes = (
-                    X_elem.data.nbytes + X_elem.indices.nbytes + X_elem.indptr.nbytes
-                )
-            return max(total_data_bytes / X_elem.shape[0] * var_ratio, 1.0)
+    """Estimate in-memory bytes per observation row for the X matrix.
+
+    For backed sparse datasets, compute from actual nnz and dtypes
+    rather than h5py .nbytes (which can be inflated by chunked
+    storage overhead).
+    """
+    n_obs = X_elem.shape[0] if hasattr(X_elem, "shape") and len(X_elem.shape) == 2 else 0
+    if n_obs > 0:
+        if isinstance(X_elem, BaseCompressedSparseDataset):
+            backed = X_elem._to_backed()
+            nnz = int(backed.data.shape[0])
+            data_dtype_size = backed.data.dtype.itemsize
+            idx_dtype_size = backed.indices.dtype.itemsize
+            indptr_dtype_size = backed.indptr.dtype.itemsize
+            total = nnz * (data_dtype_size + idx_dtype_size) + (n_obs + 1) * indptr_dtype_size
+            return max(total / n_obs * var_ratio, 1.0)
+        elif sp.issparse(X_elem):
+            total = X_elem.data.nbytes + X_elem.indices.nbytes + X_elem.indptr.nbytes
+            return max(total / n_obs * var_ratio, 1.0)
         elif hasattr(X_elem, "dtype"):
             return max(n_vars_out * X_elem.dtype.itemsize, 1.0)
     return max(n_vars_out * 4, 1.0)
@@ -1013,8 +1021,7 @@ def _read_and_persist_block(
     obs_full: pd.DataFrame,
 ) -> ad.AnnData:
     """Read a contiguous slice from the lazy-loaded source and materialize it in memory."""
-    block_adata = adata_concat[block_start:block_end, :].copy()
-    block_adata = _persist_adata_in_memory(block_adata)
+    block_adata = adata_concat[block_start:block_end, :].to_memory()
     block_adata.obs = obs_full.iloc[block_start:block_end]
     block_adata.obs.index = block_adata.obs_names
     return block_adata
@@ -1095,7 +1102,7 @@ def _two_pass_scan_and_write(
     partial_keys: list[list[str]] = [[] for _ in range(n_chunks)]
 
     def _write_partial(key: str, adata_out: ad.AnnData) -> None:
-        adata_out.var = var_out.copy()
+        adata_out.var = var_out
         if isinstance(group, zarr.Group):
             write_sharded(
                 group,
@@ -1117,41 +1124,30 @@ def _two_pass_scan_and_write(
         """Split a materialized block by output chunk and write partials."""
         block_cids = row_to_chunk[block_start:block_end]
 
-        sort_order = np.argsort(block_cids, kind="stable")
-        sorted_cids = block_cids[sort_order]
-        split_points = np.flatnonzero(np.diff(sorted_cids)) + 1
-
-        sorted_block = block_adata[sort_order]
-        del block_adata
-
-        boundaries = np.concatenate([[0], split_points, [len(sort_order)]])
-        unique_cids = sorted_cids[boundaries[:-1]]
-
-        for i in range(len(boundaries) - 1):
-            lo, hi = int(boundaries[i]), int(boundaries[i + 1])
-            cid = int(unique_cids[i])
-            frag = sorted_block[lo:hi]
+        for cid in np.unique(block_cids):
+            cid = int(cid)
+            idx = np.flatnonzero(block_cids == cid)
+            frag = block_adata[idx]
 
             pkey = f"{_PARTIAL_PREFIX}{cid}_{len(partial_keys[cid])}"
             _write_partial(pkey, frag)
             partial_keys[cid].append(pkey)
 
-        del sorted_block
+        del block_adata
 
     # -- Pass 1: pipelined scan, local groupby, write partials -----------
     block_starts = list(range(0, n_obs, scan_block_size))
     with ThreadPoolExecutor(max_workers=2) as pool:
         read_future: Future[ad.AnnData] = pool.submit(
             _read_and_persist_block,
-            adata_concat, block_starts[0],
+            adata_concat,
+            block_starts[0],
             min(block_starts[0] + scan_block_size, n_obs),
             obs_full,
         )
         write_future: Future | None = None
 
-        for idx, block_start in enumerate(
-            tqdm(block_starts, desc="pass 1 (scatter)")
-        ):
+        for idx, block_start in enumerate(tqdm(block_starts, desc="pass 1 (scatter)")):
             block_end = min(block_start + scan_block_size, n_obs)
             block_adata = read_future.result()
 
@@ -1159,7 +1155,8 @@ def _two_pass_scan_and_write(
                 next_start = block_starts[idx + 1]
                 read_future = pool.submit(
                     _read_and_persist_block,
-                    adata_concat, next_start,
+                    adata_concat,
+                    next_start,
                     min(next_start + scan_block_size, n_obs),
                     obs_full,
                 )
@@ -1168,7 +1165,10 @@ def _two_pass_scan_and_write(
                 write_future.result()
 
             write_future = pool.submit(
-                _scatter_block, block_adata, block_start, block_end,
+                _scatter_block,
+                block_adata,
+                block_start,
+                block_end,
             )
 
         if write_future is not None:
@@ -1186,7 +1186,7 @@ def _two_pass_scan_and_write(
             adata_out = parts[0]
         else:
             adata_out = ad.concat(parts, join="outer")
-        adata_out.var = var_out.copy()
+        adata_out.var = var_out
         return adata_out
 
     def _write_final_and_cleanup(cid, adata_out, pkeys):
@@ -1214,7 +1214,9 @@ def _two_pass_scan_and_write(
             else:
                 (group / f"{pkey}.h5ad").unlink(missing_ok=True)
 
-    nonempty_chunks = [(cid, partial_keys[cid]) for cid in range(n_chunks) if partial_keys[cid]]
+    nonempty_chunks = [
+        (cid, partial_keys[cid]) for cid in range(n_chunks) if partial_keys[cid]
+    ]
 
     if nonempty_chunks:
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1235,7 +1237,10 @@ def _two_pass_scan_and_write(
                     write_future.result()
 
                 write_future = pool.submit(
-                    _write_final_and_cleanup, cid, adata_out, pkeys,
+                    _write_final_and_cleanup,
+                    cid,
+                    adata_out,
+                    pkeys,
                 )
 
             if write_future is not None:
