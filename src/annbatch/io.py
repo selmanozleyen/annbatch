@@ -873,6 +873,200 @@ class DatasetCollection(BaseCollection):
                 )
 
 
+_SCAN_BLOCK_SIZE = 500_000
+
+
+def _sequential_scan_and_write(
+    *,
+    adata_concat: ad.AnnData,
+    obs_full: pd.DataFrame,
+    var_mask: np.ndarray,
+    chunks: list[np.ndarray],
+    group: zarr.Group | Path,
+    n_obs_per_chunk: int,
+    zarr_shard_size: int | str,
+    zarr_compressor,
+    h5ad_compressor,
+    scan_block_size: int = _SCAN_BLOCK_SIZE,
+    max_buffered_rows: int | None = None,
+) -> None:
+    """Read source data in one sequential pass and scatter rows into per-chunk buffers.
+
+    Instead of indexing into the lazy-backed AnnData once per output chunk
+    (which causes random I/O on the source file), this reads the source in
+    contiguous blocks and dispatches each row to the correct output chunk.
+    When all rows for a chunk have been collected the chunk is written to
+    disk and its buffer is freed.
+
+    This turns O(n_chunks) random-access passes over the source file into a
+    single sequential scan -- critical for large h5ad files on network
+    filesystems where random I/O is orders of magnitude slower.
+
+    Each chunk buffer collects ``(position, AnnData-slice)`` fragments.
+    When a chunk is complete the fragments are concatenated in position
+    order, producing an AnnData identical to what the old random-access
+    code path would have built.
+
+    Parameters
+    ----------
+    max_buffered_rows
+        Maximum total rows held in fragment buffers across all chunks
+        before an incomplete-chunk flush is triggered.  When exceeded,
+        the chunk with the most accumulated rows is flushed early by
+        re-reading its missing rows from the source via random access.
+        Defaults to ``2 * max(chunk_sizes)`` which guarantees at most
+        ~2 chunks' worth of data in memory at any time.
+    """
+    n_obs = adata_concat.shape[0]
+    n_chunks = len(chunks)
+
+    row_to_chunk = np.empty(n_obs, dtype=np.int64)
+    row_to_pos = np.empty(n_obs, dtype=np.int64)
+    for cid, chunk_indices in enumerate(chunks):
+        row_to_chunk[chunk_indices] = cid
+        row_to_pos[chunk_indices] = np.arange(len(chunk_indices), dtype=np.int64)
+
+    chunk_sizes = np.array([len(c) for c in chunks], dtype=np.int64)
+    chunk_filled = np.zeros(n_chunks, dtype=np.int64)
+
+    if max_buffered_rows is None:
+        max_buffered_rows = int(2 * chunk_sizes.max())
+    total_buffered_rows = 0
+
+    chunk_fragments: list[list[tuple[int, ad.AnnData]]] = [[] for _ in range(n_chunks)]
+    chunk_done = np.zeros(n_chunks, dtype=bool)
+
+    var_out = adata_concat.var
+    if isinstance(var_out, Dataset2D):
+        var_out = var_out.to_memory()
+    var_out = var_out[var_mask]
+
+    def _flush_chunk(cid: int) -> None:
+        """Assemble fragments in position order, write, and free."""
+        frags = chunk_fragments[cid]
+        frags.sort(key=lambda t: t[0])
+        adata_out = ad.concat([f for _, f in frags], join="outer")
+        adata_out.var = var_out.copy()
+
+        key = f"{DATASET_PREFIX}_{cid}"
+        if isinstance(group, zarr.Group):
+            write_sharded(
+                group,
+                adata_out,
+                n_obs_per_chunk=n_obs_per_chunk,
+                shard_size=zarr_shard_size,
+                compressors=zarr_compressor,
+                key=key,
+            )
+        else:
+            ad.io.write_h5ad(
+                group / f"{key}.h5ad",
+                adata_out,
+                dataset_kwargs={"compression": h5ad_compressor},
+            )
+        chunk_fragments[cid] = []
+        chunk_done[cid] = True
+
+    def _force_flush_largest() -> int:
+        """Flush the incomplete chunk with the most buffered rows.
+
+        The missing rows are fetched via random access from adata_concat,
+        which is slower but keeps memory bounded.  Returns number of
+        rows freed.
+        """
+        buffered_per_chunk = np.array([
+            int(chunk_filled[c]) if not chunk_done[c] else 0
+            for c in range(n_chunks)
+        ], dtype=np.int64)
+        cid = int(np.argmax(buffered_per_chunk))
+        rows_held = int(buffered_per_chunk[cid])
+        if rows_held == 0:
+            return 0
+
+        have_positions = set()
+        for pos_min, frag in chunk_fragments[cid]:
+            have_positions.update(range(pos_min, pos_min + frag.n_obs))
+
+        chunk_indices = chunks[cid]
+        need_positions = sorted(set(range(len(chunk_indices))) - have_positions)
+        if need_positions:
+            source_rows = chunk_indices[np.array(need_positions, dtype=np.int64)]
+            missing_adata = _materialize_rows(source_rows)
+            chunk_fragments[cid].append((int(min(need_positions)), missing_adata))
+            chunk_filled[cid] = chunk_sizes[cid]
+
+        _flush_chunk(cid)
+        return rows_held
+
+    def _materialize_block(block_slice: slice) -> ad.AnnData:
+        """Read a contiguous block from the source, materializing X but using pre-loaded obs."""
+        block_adata = adata_concat[block_slice, :][:, var_mask].copy()
+        block_adata = _persist_adata_in_memory(block_adata)
+        block_adata.obs = obs_full.iloc[block_slice.start : block_slice.stop].copy()
+        block_adata.obs.index = block_adata.obs_names
+        return block_adata
+
+    def _materialize_rows(source_rows: np.ndarray) -> ad.AnnData:
+        """Read specific rows from the source (random access fallback)."""
+        sort_order = np.argsort(source_rows)
+        adata_subset = adata_concat[source_rows[sort_order], :][:, var_mask].copy()
+        adata_subset = _persist_adata_in_memory(adata_subset)
+        unsort_order = np.argsort(sort_order)
+        adata_subset = adata_subset[unsort_order]
+        adata_subset.obs = obs_full.iloc[source_rows].copy()
+        adata_subset.obs.index = adata_subset.obs_names
+        return adata_subset
+
+    for block_start in tqdm(range(0, n_obs, scan_block_size), desc="sequential scan"):
+        block_end = min(block_start + scan_block_size, n_obs)
+        block_adata = _materialize_block(slice(block_start, block_end))
+
+        global_rows = np.arange(block_start, block_end, dtype=np.int64)
+        cids = row_to_chunk[global_rows]
+        positions = row_to_pos[global_rows]
+
+        for cid_val in np.unique(cids):
+            cid = int(cid_val)
+            if chunk_done[cid]:
+                continue
+
+            mask = cids == cid_val
+            local_idx = np.where(mask)[0]
+            pos = positions[mask]
+
+            frag = block_adata[local_idx].copy()
+            chunk_fragments[cid].append((int(pos.min()), frag))
+            n_new = len(local_idx)
+            chunk_filled[cid] += n_new
+            total_buffered_rows += n_new
+
+            if chunk_filled[cid] == chunk_sizes[cid]:
+                _flush_chunk(cid)
+                total_buffered_rows -= int(chunk_sizes[cid])
+
+        while total_buffered_rows > max_buffered_rows:
+            freed = _force_flush_largest()
+            if freed == 0:
+                break
+            total_buffered_rows -= freed
+
+    for cid in range(n_chunks):
+        if chunk_done[cid]:
+            continue
+        if chunk_filled[cid] < chunk_sizes[cid]:
+            chunk_indices = chunks[cid]
+            have_positions = set()
+            for pos_min, frag in chunk_fragments[cid]:
+                have_positions.update(range(pos_min, pos_min + frag.n_obs))
+            need_positions = sorted(set(range(len(chunk_indices))) - have_positions)
+            if need_positions:
+                source_rows = chunk_indices[np.array(need_positions, dtype=np.int64)]
+                missing_adata = _materialize_rows(source_rows)
+                chunk_fragments[cid].append((int(min(need_positions)), missing_adata))
+        if chunk_fragments[cid]:
+            _flush_chunk(cid)
+
+
 def _group_obs_rows(
     obs: pd.DataFrame,
     *,
@@ -1043,9 +1237,18 @@ class GroupedCollection(BaseCollection):
         if len(missing_group_keys) > 0:
             raise ValueError(f"Could not find groupby key(s) in obs: {missing_group_keys}.")
 
-        obs_for_grouping = adata_concat.obs[groupby_keys]
-        if isinstance(obs_for_grouping, Dataset2D):
-            obs_for_grouping = obs_for_grouping.to_memory()
+        # Materialize obs once -- it is small enough to fit in memory
+        # and avoids re-reading it from the backing store on every
+        # scan block / chunk.
+        obs_full = adata_concat.obs
+        if isinstance(obs_full, Dataset2D):
+            obs_full = obs_full.to_memory()
+            if "_index" in obs_full.columns:
+                obs_full.index = obs_full["_index"]
+                obs_full = obs_full.drop(columns=["_index"])
+        obs_full = obs_full.copy()
+
+        obs_for_grouping = obs_full[groupby_keys]
         rng = np.random.default_rng(random_seed)
         ordered_positions, group_index = _group_obs_rows(
             obs_for_grouping,
@@ -1061,28 +1264,17 @@ class GroupedCollection(BaseCollection):
         else:
             chunks = split_given_size(ordered_positions, n_obs_per_dataset)
 
-        for i, chunk in enumerate(tqdm(chunks, desc="processing chunks")):
-            sort_order = np.argsort(chunk)
-            adata_chunk = adata_concat[chunk[sort_order], :][:, var_mask].copy()
-            adata_chunk = _persist_adata_in_memory(adata_chunk)
-            unsort_order = np.argsort(sort_order)
-            adata_chunk = adata_chunk[unsort_order]
-            key = f"{DATASET_PREFIX}_{i}"
-            if isinstance(self._group, zarr.Group):
-                write_sharded(
-                    self._group,
-                    adata_chunk,
-                    n_obs_per_chunk=n_obs_per_chunk,
-                    shard_size=zarr_shard_size,
-                    compressors=zarr_compressor,
-                    key=key,
-                )
-            else:
-                ad.io.write_h5ad(
-                    self._group / f"{key}.h5ad",
-                    adata_chunk,
-                    dataset_kwargs={"compression": h5ad_compressor},
-                )
+        _sequential_scan_and_write(
+            adata_concat=adata_concat,
+            obs_full=obs_full,
+            var_mask=var_mask,
+            chunks=chunks,
+            group=self._group,
+            n_obs_per_chunk=n_obs_per_chunk,
+            zarr_shard_size=zarr_shard_size,
+            zarr_compressor=zarr_compressor,
+            h5ad_compressor=h5ad_compressor,
+        )
 
         ad.io.write_elem(self._group, GROUP_INDEX_KEY, group_index)
         self._group.update_attributes({**V1_GROUPED_ENCODING, "groupby_keys": groupby_keys})
