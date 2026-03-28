@@ -985,33 +985,45 @@ class DatasetCollection(BaseCollection):
 _DEFAULT_MAX_MEMORY = "8GB"
 
 
+_SAMPLE_ROWS = 1000
+
+
 def _estimate_bytes_per_row(
-    X_elem,
+    adata: ad.AnnData,
     n_vars_out: int,
     var_ratio: float,
 ) -> float:
-    """Estimate in-memory bytes per observation row for the X matrix.
+    """Estimate in-memory bytes per observation row by sampling.
 
-    For backed sparse datasets, compute from actual nnz and dtypes
-    rather than h5py .nbytes (which can be inflated by chunked
-    storage overhead).
+    Materializes a small slice of the source data and measures its
+    actual memory footprint.  Falls back to a metadata-based
+    estimate when sampling is not possible.
     """
-    n_obs = X_elem.shape[0] if hasattr(X_elem, "shape") and len(X_elem.shape) == 2 else 0
-    if n_obs > 0:
-        if isinstance(X_elem, BaseCompressedSparseDataset):
-            backed = X_elem._to_backed()
-            nnz = int(backed.data.shape[0])
-            data_dtype_size = backed.data.dtype.itemsize
-            idx_dtype_size = backed.indices.dtype.itemsize
-            indptr_dtype_size = backed.indptr.dtype.itemsize
-            total = nnz * (data_dtype_size + idx_dtype_size) + (n_obs + 1) * indptr_dtype_size
-            return max(total / n_obs * var_ratio, 1.0)
-        elif sp.issparse(X_elem):
-            total = X_elem.data.nbytes + X_elem.indices.nbytes + X_elem.indptr.nbytes
-            return max(total / n_obs * var_ratio, 1.0)
-        elif hasattr(X_elem, "dtype"):
+    import sys
+
+    n_obs = adata.shape[0]
+    if n_obs == 0:
+        return max(n_vars_out * 4, 1.0)
+
+    sample_n = min(_SAMPLE_ROWS, n_obs)
+    try:
+        sample = adata[:sample_n, :].to_memory()
+        total = 0
+        X = sample.X
+        if sp.issparse(X):
+            total += X.data.nbytes + X.indices.nbytes + X.indptr.nbytes
+        elif hasattr(X, "nbytes"):
+            total += X.nbytes
+        else:
+            total += sys.getsizeof(X)
+        bpr = max(total / sample_n * var_ratio, 1.0)
+        del sample
+        return bpr
+    except Exception:
+        X_elem = adata.X
+        if hasattr(X_elem, "dtype"):
             return max(n_vars_out * X_elem.dtype.itemsize, 1.0)
-    return max(n_vars_out * 4, 1.0)
+        return max(n_vars_out * 4, 1.0)
 
 
 def _read_and_persist_block(
@@ -1073,14 +1085,9 @@ def _two_pass_scan_and_write(
     else:
         max_memory_bytes = int(max_memory)
 
-    X_elem = adata_concat.X
-    n_vars_src = (
-        X_elem.shape[1]
-        if hasattr(X_elem, "shape") and len(X_elem.shape) == 2
-        else n_vars_out
-    )
+    n_vars_src = adata_concat.shape[1] if len(adata_concat.shape) == 2 else n_vars_out
     var_ratio = n_vars_out / max(n_vars_src, 1)
-    bytes_per_row = _estimate_bytes_per_row(X_elem, n_vars_out, var_ratio)
+    bytes_per_row = _estimate_bytes_per_row(adata_concat, n_vars_out, var_ratio)
 
     scan_block_size = max(int(max_memory_bytes / bytes_per_row), 1000)
 
