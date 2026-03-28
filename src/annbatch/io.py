@@ -974,7 +974,6 @@ class DatasetCollection(BaseCollection):
 
 
 _DEFAULT_MAX_MEMORY = "8GB"
-_MAX_BLOCK_BYTES = 2 * 1024**3  # 2 GB cap for scan block
 
 
 def _estimate_bytes_per_row(
@@ -1000,7 +999,7 @@ def _estimate_bytes_per_row(
     return max(n_vars_out * 4, 1.0)
 
 
-def _sequential_scan_and_write(
+def _two_pass_scan_and_write(
     *,
     adata_concat: ad.AnnData,
     obs_full: pd.DataFrame,
@@ -1013,46 +1012,33 @@ def _sequential_scan_and_write(
     h5ad_compressor,
     max_memory: int | str = _DEFAULT_MAX_MEMORY,
 ) -> None:
-    """Read source data in one sequential pass and scatter rows into per-chunk buffers.
+    """Two-pass external-sort style scan for building grouped datasets.
 
-    Instead of indexing into the lazy-backed AnnData once per output chunk
-    (which causes random I/O on the source file), this reads the source in
-    contiguous blocks and dispatches each row to the correct output chunk.
-    When all rows for a chunk have been collected the chunk is written to
-    disk and its buffer is freed.
+    Pass 1 reads the source sequentially in blocks, groups each block
+    locally by output chunk, and writes per-chunk partials to the output
+    store.  Peak memory is bounded to a single block.
 
-    This turns O(n_chunks) random-access passes over the source file into a
-    single sequential scan -- critical for large h5ad files on network
-    filesystems where random I/O is orders of magnitude slower.
+    Pass 2 iterates over output chunks, reads back all partials for each
+    chunk, concatenates them in memory, writes the final dataset, and
+    deletes the partials.
 
-    Each chunk buffer collects ``(position, AnnData-slice)`` fragments.
-    When the total buffered rows across all chunks exceed the memory
-    budget, the chunk with the most accumulated rows is force-flushed:
-    its missing rows are fetched via random access, the chunk is
-    assembled and written, and the buffer is freed.
+    No random I/O is performed on the source file.  All writes (partials
+    and finals) go to the output store.
 
     Parameters
     ----------
     max_memory
-        Peak memory budget for X data (scan block + fragment buffers),
-        as a byte count or a human-readable size string (e.g.
-        ``"8GB"``, ``"512MB"``).  The scan block size is derived
-        automatically as a quarter of this budget; the remaining
-        three-quarters are available for accumulated fragment buffers.
-        Default ``"8GB"``.
+        Peak memory budget for the scan block (pass 1), as a byte
+        count or a human-readable size string (e.g. ``"8GB"``,
+        ``"512MB"``).  Default ``"8GB"``.
     """
     n_obs = adata_concat.shape[0]
     n_chunks = len(chunks)
     n_vars_out = int(var_mask.sum())
 
     row_to_chunk = np.empty(n_obs, dtype=np.int64)
-    row_to_pos = np.empty(n_obs, dtype=np.int64)
     for cid, chunk_indices in enumerate(chunks):
         row_to_chunk[chunk_indices] = cid
-        row_to_pos[chunk_indices] = np.arange(len(chunk_indices), dtype=np.int64)
-
-    chunk_sizes = np.array([len(c) for c in chunks], dtype=np.int64)
-    chunk_filled = np.zeros(n_chunks, dtype=np.int64)
 
     if isinstance(max_memory, str):
         max_memory_bytes = parse_size(max_memory, binary=True)
@@ -1068,24 +1054,15 @@ def _sequential_scan_and_write(
     var_ratio = n_vars_out / max(n_vars_src, 1)
     bytes_per_row = _estimate_bytes_per_row(X_elem, n_vars_out, var_ratio)
 
-    block_budget_bytes = min(int(max_memory_bytes * 0.25), _MAX_BLOCK_BYTES)
-    buffer_budget_bytes = max_memory_bytes - block_budget_bytes
-
-    scan_block_size = max(int(block_budget_bytes / bytes_per_row), 1000)
-    max_buffered_rows = max(int(buffer_budget_bytes / bytes_per_row), scan_block_size)
-    total_buffered_rows = 0
+    scan_block_size = max(int(max_memory_bytes / bytes_per_row), 1000)
 
     all_vars_selected = bool(var_mask.all())
     tqdm.write(
         f"  scan config: bytes_per_row={bytes_per_row:.0f}  "
         f"scan_block_size={scan_block_size:,}  "
-        f"max_buffered_rows={max_buffered_rows:,}  "
         f"n_blocks={math.ceil(n_obs / scan_block_size)}  "
         f"var_subset={not all_vars_selected}"
     )
-
-    chunk_fragments: list[list[tuple[int, ad.AnnData]]] = [[] for _ in range(n_chunks)]
-    chunk_done = np.zeros(n_chunks, dtype=bool)
 
     var_out = adata_concat.var
     if isinstance(var_out, Dataset2D):
@@ -1093,14 +1070,11 @@ def _sequential_scan_and_write(
     if not all_vars_selected:
         var_out = var_out[var_mask]
 
-    def _flush_chunk(cid: int) -> None:
-        """Assemble fragments in position order, write, and free."""
-        frags = chunk_fragments[cid]
-        frags.sort(key=lambda t: t[0])
-        adata_out = ad.concat([f for _, f in frags], join="outer")
-        adata_out.var = var_out.copy()
+    _PARTIAL_PREFIX = "_partial_"
+    partial_keys: list[list[str]] = [[] for _ in range(n_chunks)]
 
-        key = f"{DATASET_PREFIX}_{cid}"
+    def _write_partial(key: str, adata_out: ad.AnnData) -> None:
+        adata_out.var = var_out.copy()
         if isinstance(group, zarr.Group):
             write_sharded(
                 group,
@@ -1116,113 +1090,78 @@ def _sequential_scan_and_write(
                 adata_out,
                 dataset_kwargs={"compression": h5ad_compressor},
             )
-        chunk_fragments[cid] = []
-        chunk_done[cid] = True
 
-    def _materialize_block(block_slice: slice) -> ad.AnnData:
-        """Read a contiguous block from the source, materializing X but using pre-loaded obs."""
-        block_adata = adata_concat[block_slice, :]
+    # -- Pass 1: sequential scan, local groupby, write partials -----------
+    for block_start in tqdm(range(0, n_obs, scan_block_size), desc="pass 1 (scatter)"):
+        block_end = min(block_start + scan_block_size, n_obs)
+
+        block_adata = adata_concat[block_start:block_end, :]
         if not all_vars_selected:
             block_adata = block_adata[:, var_mask]
         block_adata = block_adata.copy()
         block_adata = _persist_adata_in_memory(block_adata)
-        block_adata.obs = obs_full.iloc[block_slice.start : block_slice.stop].copy()
+        block_adata.obs = obs_full.iloc[block_start:block_end].copy()
         block_adata.obs.index = block_adata.obs_names
-        return block_adata
 
-    def _materialize_rows(source_rows: np.ndarray) -> ad.AnnData:
-        """Read specific rows from the source (random access fallback)."""
-        sort_order = np.argsort(source_rows)
-        adata_subset = adata_concat[source_rows[sort_order], :]
-        if not all_vars_selected:
-            adata_subset = adata_subset[:, var_mask]
-        adata_subset = adata_subset.copy()
-        adata_subset = _persist_adata_in_memory(adata_subset)
-        unsort_order = np.argsort(sort_order)
-        adata_subset = adata_subset[unsort_order]
-        adata_subset.obs = obs_full.iloc[source_rows].copy()
-        adata_subset.obs.index = adata_subset.obs_names
-        return adata_subset
+        block_cids = row_to_chunk[block_start:block_end]
 
-    def _force_flush_largest() -> int:
-        """Flush the incomplete chunk with the most buffered rows.
-
-        The missing rows are fetched via random access, which is slower
-        but avoids any filesystem writes and keeps memory bounded.
-        Returns the number of rows freed.
-        """
-        buffered_per_chunk = np.array(
-            [int(chunk_filled[c]) if not chunk_done[c] else 0 for c in range(n_chunks)],
-            dtype=np.int64,
-        )
-        cid = int(np.argmax(buffered_per_chunk))
-        rows_held = int(buffered_per_chunk[cid])
-        if rows_held == 0:
-            return 0
-
-        have_positions = set()
-        for pos_min, frag in chunk_fragments[cid]:
-            have_positions.update(range(pos_min, pos_min + frag.n_obs))
-
-        chunk_indices = chunks[cid]
-        need_positions = sorted(set(range(len(chunk_indices))) - have_positions)
-        if need_positions:
-            source_rows = chunk_indices[np.array(need_positions, dtype=np.int64)]
-            missing_adata = _materialize_rows(source_rows)
-            chunk_fragments[cid].append((int(min(need_positions)), missing_adata))
-            chunk_filled[cid] = chunk_sizes[cid]
-
-        _flush_chunk(cid)
-        return rows_held
-
-    for block_start in tqdm(range(0, n_obs, scan_block_size), desc="sequential scan"):
-        block_end = min(block_start + scan_block_size, n_obs)
-        block_adata = _materialize_block(slice(block_start, block_end))
-
-        global_rows = np.arange(block_start, block_end, dtype=np.int64)
-        cids = row_to_chunk[global_rows]
-        positions = row_to_pos[global_rows]
-
-        for cid_val in np.unique(cids):
+        for cid_val in np.unique(block_cids):
             cid = int(cid_val)
-            if chunk_done[cid]:
-                continue
+            local_mask = block_cids == cid_val
+            frag = block_adata[local_mask].copy()
 
-            mask = cids == cid_val
-            local_idx = np.where(mask)[0]
-            pos = positions[mask]
+            pkey = f"{_PARTIAL_PREFIX}{cid}_{len(partial_keys[cid])}"
+            _write_partial(pkey, frag)
+            partial_keys[cid].append(pkey)
 
-            frag = block_adata[local_idx].copy()
-            chunk_fragments[cid].append((int(pos.min()), frag))
-            n_new = len(local_idx)
-            chunk_filled[cid] += n_new
-            total_buffered_rows += n_new
+        del block_adata
 
-            if chunk_filled[cid] == chunk_sizes[cid]:
-                _flush_chunk(cid)
-                total_buffered_rows -= int(chunk_sizes[cid])
-
-        while total_buffered_rows > max_buffered_rows:
-            freed = _force_flush_largest()
-            if freed == 0:
-                break
-            total_buffered_rows -= freed
-
-    for cid in range(n_chunks):
-        if chunk_done[cid]:
+    # -- Pass 2: gather partials per chunk, concat, write final -----------
+    for cid in tqdm(range(n_chunks), desc="pass 2 (gather)"):
+        pkeys = partial_keys[cid]
+        if not pkeys:
             continue
-        if chunk_filled[cid] < chunk_sizes[cid]:
-            chunk_indices = chunks[cid]
-            have_positions = set()
-            for pos_min, frag in chunk_fragments[cid]:
-                have_positions.update(range(pos_min, pos_min + frag.n_obs))
-            need_positions = sorted(set(range(len(chunk_indices))) - have_positions)
-            if need_positions:
-                source_rows = chunk_indices[np.array(need_positions, dtype=np.int64)]
-                missing_adata = _materialize_rows(source_rows)
-                chunk_fragments[cid].append((int(min(need_positions)), missing_adata))
-        if chunk_fragments[cid]:
-            _flush_chunk(cid)
+
+        parts = []
+        for pkey in pkeys:
+            if isinstance(group, zarr.Group):
+                parts.append(ad.io.read_elem(group[pkey]))
+            else:
+                parts.append(ad.read_h5ad(group / f"{pkey}.h5ad"))
+
+        if len(parts) == 1:
+            adata_out = parts[0]
+        else:
+            adata_out = ad.concat(parts, join="outer")
+        adata_out.var = var_out.copy()
+        del parts
+
+        final_key = f"{DATASET_PREFIX}_{cid}"
+        if isinstance(group, zarr.Group):
+            write_sharded(
+                group,
+                adata_out,
+                n_obs_per_chunk=n_obs_per_chunk,
+                shard_size=zarr_shard_size,
+                compressors=zarr_compressor,
+                key=final_key,
+            )
+        else:
+            ad.io.write_h5ad(
+                group / f"{final_key}.h5ad",
+                adata_out,
+                dataset_kwargs={"compression": h5ad_compressor},
+            )
+        del adata_out
+
+        for pkey in pkeys:
+            if isinstance(group, zarr.Group):
+                del group[pkey]
+            else:
+                (group / f"{pkey}.h5ad").unlink(missing_ok=True)
+
+    if isinstance(group, zarr.Group):
+        zarr.consolidate_metadata(group.store)
 
 
 def _group_obs_rows(
@@ -1377,12 +1316,10 @@ class GroupedCollection(BaseCollection):
         random_seed
             Seed for the random number generator used when ``shuffle=True``.
         max_memory
-            Peak memory budget for X data during the sequential scan,
-            as a byte count or human-readable size string (e.g.
-            ``"8GB"``, ``"512MB"``).  Covers both the scan block and
-            the accumulated fragment buffers.  When the total in-memory
-            rows exceed this budget the largest incomplete chunk is
-            force-flushed.  Default ``"8GB"``.
+            Peak memory budget for the scan block during pass 1, as a
+            byte count or human-readable size string (e.g. ``"8GB"``,
+            ``"512MB"``).  Controls the number of source rows read per
+            iteration.  Default ``"8GB"``.
         """
         if not shuffle and random_seed is not None:
             raise ValueError("`random_seed` must be None when `shuffle` is False.")
@@ -1459,7 +1396,7 @@ class GroupedCollection(BaseCollection):
         else:
             chunks = split_given_size(ordered_positions, n_obs_per_dataset)
 
-        _sequential_scan_and_write(
+        _two_pass_scan_and_write(
             adata_concat=adata_concat,
             obs_full=obs_full,
             var_mask=var_mask,
