@@ -1121,7 +1121,7 @@ def _two_pass_scan_and_write(
         sorted_cids = block_cids[sort_order]
         split_points = np.flatnonzero(np.diff(sorted_cids)) + 1
 
-        sorted_block = block_adata[sort_order].copy()
+        sorted_block = block_adata[sort_order]
         del block_adata
 
         boundaries = np.concatenate([[0], split_points, [len(sort_order)]])
@@ -1130,7 +1130,7 @@ def _two_pass_scan_and_write(
         for i in range(len(boundaries) - 1):
             lo, hi = int(boundaries[i]), int(boundaries[i + 1])
             cid = int(unique_cids[i])
-            frag = sorted_block[lo:hi].copy()
+            frag = sorted_block[lo:hi]
 
             pkey = f"{_PARTIAL_PREFIX}{cid}_{len(partial_keys[cid])}"
             _write_partial(pkey, frag)
