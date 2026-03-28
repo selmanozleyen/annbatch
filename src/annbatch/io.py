@@ -4,6 +4,7 @@ import math
 import re
 import warnings
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -1005,6 +1006,20 @@ def _estimate_bytes_per_row(
     return max(n_vars_out * 4, 1.0)
 
 
+def _read_and_persist_block(
+    adata_concat: ad.AnnData,
+    block_start: int,
+    block_end: int,
+    obs_full: pd.DataFrame,
+) -> ad.AnnData:
+    """Read a contiguous slice from the lazy-loaded source and materialize it in memory."""
+    block_adata = adata_concat[block_start:block_end, :].copy()
+    block_adata = _persist_adata_in_memory(block_adata)
+    block_adata.obs = obs_full.iloc[block_start:block_end]
+    block_adata.obs.index = block_adata.obs_names
+    return block_adata
+
+
 def _two_pass_scan_and_write(
     *,
     adata_concat: ad.AnnData,
@@ -1098,26 +1113,14 @@ def _two_pass_scan_and_write(
                 dataset_kwargs={"compression": h5ad_compressor},
             )
 
-    # -- Pass 1: sequential scan, local groupby, write partials -----------
-    for block_start in tqdm(range(0, n_obs, scan_block_size), desc="pass 1 (scatter)"):
-        block_end = min(block_start + scan_block_size, n_obs)
-
-        block_adata = adata_concat[block_start:block_end, :]
-        if not all_vars_selected:
-            block_adata = block_adata[:, var_mask]
-        block_adata = block_adata.copy()
-        block_adata = _persist_adata_in_memory(block_adata)
-        block_adata.obs = obs_full.iloc[block_start:block_end].copy()
-        block_adata.obs.index = block_adata.obs_names
-
+    def _scatter_block(block_adata, block_start, block_end):
+        """Split a materialized block by output chunk and write partials."""
         block_cids = row_to_chunk[block_start:block_end]
 
         sort_order = np.argsort(block_cids, kind="stable")
         sorted_cids = block_cids[sort_order]
         split_points = np.flatnonzero(np.diff(sorted_cids)) + 1
 
-        # Single fancy-index to sort the block; after this each
-        # group is a contiguous slice that can be extracted cheaply.
         sorted_block = block_adata[sort_order].copy()
         del block_adata
 
@@ -1135,26 +1138,58 @@ def _two_pass_scan_and_write(
 
         del sorted_block
 
-    # -- Pass 2: gather partials per chunk, concat, write final -----------
-    for cid in tqdm(range(n_chunks), desc="pass 2 (gather)"):
-        pkeys = partial_keys[cid]
-        if not pkeys:
-            continue
+    # -- Pass 1: pipelined scan, local groupby, write partials -----------
+    block_starts = list(range(0, n_obs, scan_block_size))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future: Future[ad.AnnData] = pool.submit(
+            _read_and_persist_block,
+            adata_concat, block_starts[0],
+            min(block_starts[0] + scan_block_size, n_obs),
+            obs_full,
+        )
+        write_future: Future | None = None
 
+        for idx, block_start in enumerate(
+            tqdm(block_starts, desc="pass 1 (scatter)")
+        ):
+            block_end = min(block_start + scan_block_size, n_obs)
+            block_adata = read_future.result()
+
+            if idx + 1 < len(block_starts):
+                next_start = block_starts[idx + 1]
+                read_future = pool.submit(
+                    _read_and_persist_block,
+                    adata_concat, next_start,
+                    min(next_start + scan_block_size, n_obs),
+                    obs_full,
+                )
+
+            if write_future is not None:
+                write_future.result()
+
+            write_future = pool.submit(
+                _scatter_block, block_adata, block_start, block_end,
+            )
+
+        if write_future is not None:
+            write_future.result()
+
+    # -- Pass 2: pipelined gather per chunk, concat, write final ---------
+    def _read_partials(pkeys):
         parts = []
         for pkey in pkeys:
             if isinstance(group, zarr.Group):
                 parts.append(ad.io.read_elem(group[pkey]))
             else:
                 parts.append(ad.read_h5ad(group / f"{pkey}.h5ad"))
-
         if len(parts) == 1:
             adata_out = parts[0]
         else:
             adata_out = ad.concat(parts, join="outer")
         adata_out.var = var_out.copy()
-        del parts
+        return adata_out
 
+    def _write_final_and_cleanup(cid, adata_out, pkeys):
         final_key = f"{DATASET_PREFIX}_{cid}"
         if isinstance(group, zarr.Group):
             write_sharded(
@@ -1173,12 +1208,38 @@ def _two_pass_scan_and_write(
                 dataset_kwargs={"compression": h5ad_compressor},
             )
         del adata_out
-
         for pkey in pkeys:
             if isinstance(group, zarr.Group):
                 del group[pkey]
             else:
                 (group / f"{pkey}.h5ad").unlink(missing_ok=True)
+
+    nonempty_chunks = [(cid, partial_keys[cid]) for cid in range(n_chunks) if partial_keys[cid]]
+
+    if nonempty_chunks:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_cid, first_pkeys = nonempty_chunks[0]
+            read_future = pool.submit(_read_partials, first_pkeys)
+            write_future: Future | None = None
+
+            for idx, (cid, pkeys) in enumerate(
+                tqdm(nonempty_chunks, desc="pass 2 (gather)")
+            ):
+                adata_out = read_future.result()
+
+                if idx + 1 < len(nonempty_chunks):
+                    _, next_pkeys = nonempty_chunks[idx + 1]
+                    read_future = pool.submit(_read_partials, next_pkeys)
+
+                if write_future is not None:
+                    write_future.result()
+
+                write_future = pool.submit(
+                    _write_final_and_cleanup, cid, adata_out, pkeys,
+                )
+
+            if write_future is not None:
+                write_future.result()
 
 
 def _group_obs_rows(
