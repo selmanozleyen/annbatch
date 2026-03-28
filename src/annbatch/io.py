@@ -1112,16 +1112,28 @@ def _two_pass_scan_and_write(
 
         block_cids = row_to_chunk[block_start:block_end]
 
-        for cid_val in np.unique(block_cids):
-            cid = int(cid_val)
-            local_mask = block_cids == cid_val
-            frag = block_adata[local_mask].copy()
+        sort_order = np.argsort(block_cids, kind="stable")
+        sorted_cids = block_cids[sort_order]
+        split_points = np.flatnonzero(np.diff(sorted_cids)) + 1
+
+        # Single fancy-index to sort the block; after this each
+        # group is a contiguous slice that can be extracted cheaply.
+        sorted_block = block_adata[sort_order].copy()
+        del block_adata
+
+        boundaries = np.concatenate([[0], split_points, [len(sort_order)]])
+        unique_cids = sorted_cids[boundaries[:-1]]
+
+        for i in range(len(boundaries) - 1):
+            lo, hi = int(boundaries[i]), int(boundaries[i + 1])
+            cid = int(unique_cids[i])
+            frag = sorted_block[lo:hi].copy()
 
             pkey = f"{_PARTIAL_PREFIX}{cid}_{len(partial_keys[cid])}"
             _write_partial(pkey, frag)
             partial_keys[cid].append(pkey)
 
-        del block_adata
+        del sorted_block
 
     # -- Pass 2: gather partials per chunk, concat, write final -----------
     for cid in tqdm(range(n_chunks), desc="pass 2 (gather)"):
