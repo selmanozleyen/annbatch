@@ -302,7 +302,7 @@ class Loader[
         self,
         collection: BaseCollection,
         *,
-        load_adata: Callable[[zarr.Group], ad.AnnData] = load_x_and_obs_and_var,
+        load_adata: Callable[[zarr.Group | ad.AnnData], ad.AnnData] = load_x_and_obs_and_var,
     ) -> Self:
         """Load from an existing :class:`annbatch.DatasetCollection` or :class:`annbatch.GroupedCollection`.
 

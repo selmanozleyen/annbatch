@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 import zarr
 
-from annbatch import CategoricalSampler, GroupedCollection, Loader
+from annbatch import CategoricalSampler, GroupedCollection, Loader, write_sharded
 from annbatch.io import V1_GROUPED_ENCODING
 
 if TYPE_CHECKING:
@@ -490,3 +491,99 @@ def test_e2e_weighted_categories_bias(
     assert dominant_count == total, (
         f"Expected all {total} batches to be label={dominant_label!r}, got {dominant_count}"
     )
+
+
+def test_multistore_grouped_collection_uses_filename_stem(
+    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path],
+):
+    paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+    collection = GroupedCollection(paths)
+
+    group_index = collection.group_index
+    assert list(group_index["category"]) == [p.stem for p in paths]
+    assert int(group_index["start"].iloc[0]) == 0
+    assert np.array_equal(
+        group_index["count"].to_numpy(),
+        group_index["stop"].to_numpy() - group_index["start"].to_numpy(),
+    )
+    assert int(group_index["count"].sum()) == adata_with_zarr_path_same_var_space[0].n_obs
+
+
+def test_multistore_grouped_collection_prefers_metadata_category(
+    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path], tmp_path: Path
+):
+    source_paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+    copied_paths = []
+    categories = []
+    for i, source_path in enumerate(source_paths):
+        target = tmp_path / f"store_{i}.zarr"
+        copied_paths.append(target)
+        category = f"cell_line_{i}"
+        categories.append(category)
+        group = zarr.open_group(target, mode="w", zarr_format=3)
+        write_sharded(group, ad.read_zarr(source_path), n_obs_per_chunk=10, shard_size=20)
+        group.attrs["category"] = category
+
+    collection = GroupedCollection(copied_paths)
+    assert list(collection.group_index["category"]) == categories
+
+
+def test_virtual_grouped_collection_add_adatas_matches_multistore_boundaries(
+    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path],
+):
+    paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+
+    virtual = GroupedCollection().add_adatas(paths)
+    multi_store = GroupedCollection(paths)
+
+    pd.testing.assert_frame_equal(
+        virtual.group_index[["category", "count", "start", "stop"]].reset_index(drop=True),
+        multi_store.group_index[["category", "count", "start", "stop"]].reset_index(drop=True),
+    )
+
+
+def test_virtual_grouped_collection_uses_explicit_labels_for_in_memory_inputs():
+    adatas = [
+        ad.AnnData(X=np.ones((2, 3), dtype=np.float32)),
+        ad.AnnData(X=np.ones((4, 3), dtype=np.float32)),
+    ]
+
+    collection = GroupedCollection().add_adatas(adatas, category_labels=["a", "b"])
+    group_index = collection.group_index
+
+    assert list(group_index["category"]) == ["a", "b"]
+    assert list(group_index["count"]) == [2, 4]
+
+
+def test_virtual_grouped_collection_requires_labels_for_in_memory_inputs_without_metadata():
+    adatas = [
+        ad.AnnData(X=np.ones((2, 3), dtype=np.float32)),
+        ad.AnnData(X=np.ones((4, 3), dtype=np.float32)),
+    ]
+
+    with pytest.raises(ValueError, match="category_labels"):
+        GroupedCollection().add_adatas(adatas)
+
+
+def test_loader_with_virtual_grouped_collection(
+    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path],
+):
+    paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+    collection = GroupedCollection().add_adatas(paths)
+
+    loader = Loader(
+        chunk_size=10,
+        preload_nchunks=2,
+        batch_size=20,
+        shuffle=False,
+        return_index=True,
+        preload_to_gpu=False,
+        to_torch=False,
+    ).use_collection(collection)
+
+    all_indices = []
+    for batch in loader:
+        all_indices.append(batch["index"])
+    stacked = np.concatenate(all_indices)
+    assert len(stacked) == loader.n_obs
+    assert np.array_equal(np.sort(stacked), np.arange(loader.n_obs))

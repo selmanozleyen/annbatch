@@ -8,7 +8,7 @@ from collections import Counter
 import numpy as np
 import pytest
 
-from annbatch import CategoricalSampler
+from annbatch import CategoricalSampler, GroupedCollection
 
 
 def _get_category_for_index(index: int, boundaries: list[slice]) -> int:
@@ -295,3 +295,49 @@ def test_batch_size_less_than_chunk_size_raises():
             preload_nchunks=2,
             num_samples=50,
         )
+
+
+def test_from_collection_multistore_categories(
+    adata_with_zarr_path_same_var_space,
+):
+    paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+    collection = GroupedCollection(paths)
+
+    sampler = CategoricalSampler.from_collection(
+        collection,
+        chunk_size=10,
+        preload_nchunks=2,
+        batch_size=10,
+        num_samples=100,
+        rng=np.random.default_rng(0),
+    )
+
+    assert sampler.n_categories == len(paths)
+    total_batches = 0
+    for lr in sampler.sample(int(collection.group_index["stop"].iloc[-1])):
+        total_batches += len(lr["splits"])
+    assert total_batches == 10
+
+
+def test_from_collection_boundaries_equivalent_across_grouped_collection_modes(
+    adata_with_zarr_path_same_var_space,
+    tmp_path,
+):
+    paths = sorted(p for p in adata_with_zarr_path_same_var_space[1].iterdir() if p.suffix == ".zarr")
+    grouped_store = GroupedCollection(tmp_path / "src_path_grouped.zarr").add_adatas(
+        paths,
+        groupby="src_path",
+        dataset_groupby="src_path",
+        n_obs_per_chunk=10,
+        zarr_shard_size=20,
+        shuffle=False,
+    )
+    multi_store = GroupedCollection(paths)
+    virtual = GroupedCollection().add_adatas(paths, category_labels=[str(p) for p in paths])
+
+    grouped_boundaries = grouped_store.group_index[["count", "start", "stop"]].reset_index(drop=True)
+    multi_boundaries = multi_store.group_index[["count", "start", "stop"]].reset_index(drop=True)
+    virtual_boundaries = virtual.group_index[["count", "start", "stop"]].reset_index(drop=True)
+
+    assert grouped_boundaries.equals(multi_boundaries)
+    assert grouped_boundaries.equals(virtual_boundaries)

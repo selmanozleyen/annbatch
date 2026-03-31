@@ -1306,6 +1306,107 @@ def _split_positions_by_dataset_groupby(
     return chunks
 
 
+def _normalize_group_index(group_index: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized group_index with a derived category column."""
+    normalized = group_index.copy()
+    if "category" not in normalized.columns:
+        group_cols = [col for col in normalized.columns if col not in {"start", "stop", "count"}]
+        if len(group_cols) == 1:
+            normalized["category"] = normalized[group_cols[0]]
+        elif len(group_cols) > 1:
+            normalized["category"] = list(normalized[group_cols].itertuples(index=False, name=None))
+        else:
+            normalized["category"] = np.arange(len(normalized))
+    return normalized
+
+
+def _make_group_index_from_counts(
+    categories: list[object],
+    counts: list[int],
+    *,
+    path_strings: list[str] | None = None,
+) -> pd.DataFrame:
+    counts_arr = np.asarray(counts, dtype=np.int64)
+    stops = np.cumsum(counts_arr)
+    group_index = pd.DataFrame(
+        {
+            "category": categories,
+            "count": counts_arr,
+            "start": stops - counts_arr,
+            "stop": stops,
+        }
+    )
+    if path_strings is not None:
+        group_index["path"] = path_strings
+    return _normalize_group_index(group_index)
+
+
+def _group_input_path_string(
+    item: zarr.Group | h5py.Group | PathLike[str] | str | ad.AnnData,
+) -> str | None:
+    if isinstance(item, str | Path):
+        return str(item)
+    filename = getattr(item, "filename", None)
+    if isinstance(filename, str):
+        return filename
+    store_path = getattr(getattr(item, "store", None), "path", None)
+    if isinstance(store_path, str):
+        return store_path
+    return None
+
+
+def _resolve_category_from_adata(
+    adata: ad.AnnData,
+    *,
+    category_key: str,
+) -> object | None:
+    if category_key in adata.uns:
+        value = adata.uns[category_key]
+        if np.isscalar(value):
+            return value.item() if isinstance(value, np.generic) else value
+    if category_key in adata.obs.columns:
+        values = pd.Index(adata.obs[category_key]).dropna().unique()
+        if len(values) == 1:
+            value = values[0]
+            return value.item() if isinstance(value, np.generic) else value
+    return None
+
+
+def _resolve_category_label(
+    item: zarr.Group | h5py.Group | PathLike[str] | str | ad.AnnData,
+    *,
+    adata: ad.AnnData,
+    category_key: str,
+    fallback_index: int,
+    explicit_label: object | None = None,
+) -> object:
+    if isinstance(item, zarr.Group | h5py.Group) and category_key in item.attrs:
+        value = item.attrs[category_key]
+        return value.item() if isinstance(value, np.generic) else value
+    value = _resolve_category_from_adata(adata, category_key=category_key)
+    if value is not None:
+        return value
+    if (path_str := _group_input_path_string(item)) is not None:
+        return Path(path_str).stem
+    if explicit_label is not None:
+        return explicit_label
+    group_name = getattr(item, "name", "")
+    if isinstance(group_name, str) and len(group_name) > 0:
+        return group_name.rsplit("/", maxsplit=1)[-1]
+    return f"category_{fallback_index}"
+
+
+def _coerce_store_inputs(
+    group: list[zarr.Group | PathLike[str] | str] | tuple[zarr.Group | PathLike[str] | str, ...] | str | Path,
+) -> list[zarr.Group | str]:
+    if isinstance(group, str | Path):
+        path = Path(group)
+        if path.is_dir() and path.suffix != ".zarr":
+            return [str(p) for p in sorted(path.iterdir()) if p.suffix == ".zarr"]
+        return [str(path)]
+    return [str(item) if isinstance(item, Path) else item for item in group]
+
+
 class GroupedCollection(BaseCollection):
     """A grouped zarr collection where data is written sequentially with group boundaries stored as metadata.
 
@@ -1315,8 +1416,77 @@ class GroupedCollection(BaseCollection):
     constructed via :meth:`~annbatch.CategoricalSampler.from_collection`.
     """
 
+    _mode: str
+    _items: list[zarr.Group | ad.AnnData]
+    _group_index: pd.DataFrame | None
+
+    def __init__(
+        self,
+        group: (
+            zarr.Group
+            | str
+            | Path
+            | list[zarr.Group | PathLike[str] | str]
+            | tuple[zarr.Group | PathLike[str] | str, ...]
+            | None
+        ) = None,
+        *,
+        mode: Literal["a", "r", "r+"] = "a",
+        is_collection_h5ad: bool = False,
+        load_adata: Callable[
+            [zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData
+        ] = _default_load_adata,
+        category_key: str = "category",
+        category_labels: Iterable[object] | None = None,
+    ):
+        self._items = []
+        self._group_index = None
+        if group is None:
+            self._mode = "virtual"
+            self._group = None
+            return
+        if isinstance(group, list | tuple) or (
+            isinstance(group, str | Path)
+            and Path(group).is_dir()
+            and Path(group).suffix != ".zarr"
+        ):
+            store_inputs = _coerce_store_inputs(group)
+            labels = list(category_labels) if category_labels is not None else None
+            if labels is not None and len(labels) != len(store_inputs):
+                raise ValueError("category_labels must match the number of input stores.")
+            counts: list[int] = []
+            resolved_labels: list[object] = []
+            path_strings: list[str] = []
+            for i, item in enumerate(store_inputs):
+                store = zarr.open_group(item, mode="r") if isinstance(item, str) else item
+                adata = load_adata(store)
+                self._items.append(store)
+                counts.append(int(adata.n_obs))
+                resolved_labels.append(
+                    _resolve_category_label(
+                        item,
+                        adata=adata,
+                        category_key=category_key,
+                        fallback_index=i,
+                        explicit_label=None if labels is None else labels[i],
+                    )
+                )
+                path_strings.append(_group_input_path_string(item) or "")
+            self._mode = "multi-store"
+            self._group = None
+            self._group_index = _make_group_index_from_counts(
+                resolved_labels,
+                counts,
+                path_strings=path_strings,
+            )
+            return
+        self._mode = "store"
+        super().__init__(group, mode=mode, is_collection_h5ad=is_collection_h5ad)
+
     @property
     def _dataset_keys(self) -> list[str]:
+        if self._mode != "store":
+            return [f"{DATASET_PREFIX}_{i}" for i in range(len(self._items))]
         if isinstance(self._group, zarr.Group):
             return sorted(
                 [
@@ -1330,32 +1500,46 @@ class GroupedCollection(BaseCollection):
 
     @property
     def is_empty(self) -> bool:
-        return (
-            not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items())
-            or len(self._dataset_keys) == 0
-        )
+        if self._mode == "store":
+            return (
+                not (V1_GROUPED_ENCODING.items() <= self._group.attrs.items())
+                or len(self._dataset_keys) == 0
+            )
+        if self._mode == "virtual":
+            return len(self._items) == 0
+        return len(self._items) == 0 or self._group_index is None
 
-    def __iter__(self) -> Generator[zarr.Group]:
-        for k in self._dataset_keys:
-            yield self._group[k]
+    def __iter__(self) -> Generator[zarr.Group | ad.AnnData]:
+        if self._mode == "store":
+            for k in self._dataset_keys:
+                yield self._group[k]
+            return
+        for item in self._items:
+            yield item
 
     @property
     def group_index(self) -> pd.DataFrame:
         """The group boundary metadata for this collection."""
-        if GROUP_INDEX_KEY not in self._group:
+        if self._mode == "store":
+            if GROUP_INDEX_KEY not in self._group:
+                raise ValueError("Grouped collection is missing `group_index` metadata.")
+            return _normalize_group_index(ad.io.read_elem(self._group[GROUP_INDEX_KEY]))
+        if self._group_index is None:
             raise ValueError("Grouped collection is missing `group_index` metadata.")
-        return ad.io.read_elem(self._group[GROUP_INDEX_KEY])
+        return self._group_index
 
     @_with_settings
     def add_adatas(
         self,
-        adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str],
+        adata_paths: Iterable[zarr.Group | h5py.Group | PathLike[str] | str | ad.AnnData],
         *,
-        groupby: str | Iterable[str],
+        groupby: str | Iterable[str] | None = None,
         dataset_groupby: str | Iterable[str] | None = None,
         load_adata: Callable[
             [zarr.Group | h5py.Group | PathLike[str] | str], ad.AnnData
         ] = _default_load_adata,
+        category_key: str = "category",
+        category_labels: Iterable[object] | None = None,
         var_subset: Iterable[str] | None = None,
         n_obs_per_chunk: int = 64,
         zarr_shard_size: int | str = "1GB",
@@ -1411,12 +1595,64 @@ class GroupedCollection(BaseCollection):
             ``"512MB"``).  Controls the number of source rows read per
             iteration.  Default ``"8GB"``.
         """
+        if self._mode == "multi-store":
+            raise RuntimeError("Cannot add adatas to a multi-store GroupedCollection opened in read-only mode.")
+        if self._mode == "virtual":
+            if groupby is not None:
+                raise ValueError("Virtual GroupedCollection.add_adatas does not support `groupby`; categories are per input.")
+            items = list(adata_paths)
+            labels = list(category_labels) if category_labels is not None else None
+            if labels is not None and len(labels) != len(items):
+                raise ValueError("category_labels must match the number of input datasets.")
+            if len(items) == 0:
+                raise ValueError("Number of adatas must be greater than 1, got 0")
+            counts: list[int] = []
+            resolved_labels: list[object] = []
+            stored_items: list[zarr.Group | ad.AnnData] = []
+            path_strings: list[str] = []
+            for i, item in enumerate(items):
+                if isinstance(item, ad.AnnData):
+                    adata = item
+                    stored_items.append(item)
+                else:
+                    adata = load_adata(item)
+                    stored_items.append(zarr.open_group(item, mode="r") if isinstance(item, str | Path) else item)
+                if (
+                    isinstance(item, ad.AnnData)
+                    and labels is None
+                    and _resolve_category_from_adata(adata, category_key=category_key) is None
+                    and _group_input_path_string(item) is None
+                ):
+                    raise ValueError(
+                        "In-memory AnnData inputs require category_labels when no category metadata is present."
+                    )
+                counts.append(int(adata.n_obs))
+                resolved_labels.append(
+                    _resolve_category_label(
+                        item,
+                        adata=adata,
+                        category_key=category_key,
+                        fallback_index=i,
+                        explicit_label=None if labels is None else labels[i],
+                    )
+                )
+                path_strings.append(_group_input_path_string(item) or "")
+            self._items = stored_items
+            self._group_index = _make_group_index_from_counts(
+                resolved_labels,
+                counts,
+                path_strings=path_strings,
+            )
+            return self
+
         if not shuffle and random_seed is not None:
             raise ValueError("`random_seed` must be None when `shuffle` is False.")
         if not self.is_empty:
             raise RuntimeError(
                 "Cannot create a grouped collection at a non-empty location."
             )
+        if groupby is None:
+            raise ValueError("`groupby` must contain at least one obs column name.")
         groupby_keys = [groupby] if isinstance(groupby, str) else list(groupby)
         if len(groupby_keys) == 0:
             raise ValueError("`groupby` must contain at least one obs column name.")
