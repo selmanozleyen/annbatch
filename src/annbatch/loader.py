@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import OrderedDict, defaultdict
 from functools import singledispatchmethod
 from importlib.metadata import version
@@ -44,6 +45,47 @@ if TYPE_CHECKING:
     OutputInMemoryArray = OutputInMemoryArray_T
 type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
 zarr_version = Version(version("zarr"))
+
+
+# Switchable indexing strategy used by `_fetch_data_dense` / `_fetch_data_sparse`.
+# Controlled exclusively by the ANNBATCH_INDEXING_MODE env var. No heuristic.
+#   "slice"   -> one BasicIndexer per slice, batched via MultiBasicIndexer (default; today's behavior).
+#   "integer" -> a single OrthogonalIndexer over the concatenated integer row/nnz indices for the
+#                whole dataset, so codec pipelines that coalesce same-chunk reads (e.g. zarrs) can
+#                fetch each on-disk chunk at most once per request.
+# See https://github.com/zarr-developers/zarr-python/issues/3175 for background.
+_VALID_INDEXING_MODES = ("slice", "integer")
+_INDEXING_MODE = os.environ.get("ANNBATCH_INDEXING_MODE", "slice").lower()
+if _INDEXING_MODE not in _VALID_INDEXING_MODES:
+    raise ValueError(
+        f"Invalid ANNBATCH_INDEXING_MODE={_INDEXING_MODE!r}; "
+        f"must be one of {_VALID_INDEXING_MODES}."
+    )
+
+_INDEXING_MODE_ANNOUNCED = False
+
+
+def _announce_indexing_mode() -> None:
+    """Print the active fetch indexing mode once per process."""
+    global _INDEXING_MODE_ANNOUNCED
+    if _INDEXING_MODE_ANNOUNCED:
+        return
+    print(
+        f"[annbatch] fetching with {_INDEXING_MODE!r} indexing "
+        f"(ANNBATCH_INDEXING_MODE; valid: {_VALID_INDEXING_MODES})",
+        flush=True,
+    )
+    _INDEXING_MODE_ANNOUNCED = True
+
+
+def _slices_to_int_index(slices: list[slice]) -> np.ndarray:
+    """Concatenate a list of slices into a single 1D int64 index array."""
+    return np.concatenate([np.arange(s.start, s.stop, dtype=np.int64) for s in slices])
+
+
+def _chunk_grid(arr: zarr.AsyncArray | ZarrArray):
+    """Return the chunk grid in a way that works on both old and new zarr versions."""
+    return arr.metadata.chunk_grid if zarr_version <= Version("3.1.6") else arr._chunk_grid
 
 
 class CSRDatasetElems(NamedTuple):
@@ -634,17 +676,35 @@ class Loader[
 
     @_fetch_data.register
     async def _fetch_data_dense(self, dataset: ZarrArray, slices: list[slice], out: np.ndarray) -> None:
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer(
-                    (s, Ellipsis),
-                    shape=dataset.metadata.shape,
-                    chunk_grid=dataset.metadata.chunk_grid if zarr_version <= Version("3.1.6") else dataset._chunk_grid,
-                )
-                for s in slices
-            ]
-        )
+        _announce_indexing_mode()
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
+        if _INDEXING_MODE == "integer":
+            # One OrthogonalIndexer over all rows for this dataset. The codec pipeline sees a single
+            # selection, which is what enables same-chunk read coalescing in coalescing pipelines
+            # (e.g. zarrs). The output buffer layout is (sum(s.stop - s.start), *shape[1:]) and rows
+            # are written in the order given by `idx`, which matches the order of `slices`.
+            # Note: cannot use Ellipsis here -- zarr's OrthogonalIndexer.replace_ellipsis does
+            # `selection.index(Ellipsis)`, which triggers element-wise __eq__ on the ndarray entry
+            # and raises an ambiguous-truth-value error. Spell out slice(None) per trailing axis.
+            idx = _slices_to_int_index(slices)
+            shape = dataset.metadata.shape
+            full_selection = (idx, *(slice(None) for _ in shape[1:]))
+            indexer = zarr.core.indexing.OrthogonalIndexer(
+                full_selection,
+                shape=shape,
+                chunk_grid=_chunk_grid(dataset),
+            )
+        else:
+            indexer = MultiBasicIndexer(
+                [
+                    zarr.core.indexing.BasicIndexer(
+                        (s, Ellipsis),
+                        shape=dataset.metadata.shape,
+                        chunk_grid=_chunk_grid(dataset),
+                    )
+                    for s in slices
+                ]
+            )
         await dataset._async_array._get_selection(
             indexer,
             prototype=buffer_prototype,
@@ -714,28 +774,49 @@ class Loader[
     ) -> None:
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
         # for the inspiration of this function.
+        _announce_indexing_mode()
         indptr, indices, data = dataset
         indptr_limits = [slice(int(indptr[s.start]), int(indptr[s.stop])) for s in slices]
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer(
-                    (l,),
-                    shape=data.metadata.shape,
-                    chunk_grid=data.metadata.chunk_grid if zarr_version <= Version("3.1.6") else data._chunk_grid,
-                )
-                for l in indptr_limits
-            ]
-        )
-
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
+        if _INDEXING_MODE == "integer":
+            # Concatenate per-slice nnz ranges into one int64 index array and issue a single
+            # OrthogonalIndexer per array. The same selection is reused for both `data` and
+            # `indices` since they share layout. Coalescing pipelines (e.g. zarrs) will fetch
+            # each on-disk chunk at most once even when many small rows fall in the same chunk.
+            nnz_idx = np.concatenate(
+                [np.arange(l.start, l.stop, dtype=np.int64) for l in indptr_limits]
+            )
+            data_indexer = zarr.core.indexing.OrthogonalIndexer(
+                (nnz_idx,), shape=data.metadata.shape, chunk_grid=_chunk_grid(data)
+            )
+            indices_indexer = zarr.core.indexing.OrthogonalIndexer(
+                (nnz_idx,), shape=indices.metadata.shape, chunk_grid=_chunk_grid(indices)
+            )
+        else:
+            data_indexer = MultiBasicIndexer(
+                [
+                    zarr.core.indexing.BasicIndexer(
+                        (l,), shape=data.metadata.shape, chunk_grid=_chunk_grid(data)
+                    )
+                    for l in indptr_limits
+                ]
+            )
+            indices_indexer = MultiBasicIndexer(
+                [
+                    zarr.core.indexing.BasicIndexer(
+                        (l,), shape=indices.metadata.shape, chunk_grid=_chunk_grid(indices)
+                    )
+                    for l in indptr_limits
+                ]
+            )
         await asyncio.gather(
             data._get_selection(
-                indexer,
+                data_indexer,
                 prototype=buffer_prototype,
                 out=buffer_prototype.nd_buffer(out.elems[0]),
             ),
             indices._get_selection(
-                indexer,
+                indices_indexer,
                 prototype=buffer_prototype,
                 out=buffer_prototype.nd_buffer(out.elems[1]),
             ),
