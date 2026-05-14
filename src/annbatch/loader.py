@@ -78,6 +78,38 @@ def _announce_indexing_mode() -> None:
     _INDEXING_MODE_ANNOUNCED = True
 
 
+# Optional entry-count diagnostic. When ANNBATCH_COUNT_ENTRIES=1, every fetch call
+# wraps its indexer so that after iteration we log how many ChunkProjections were
+# yielded into the codec pipeline. This is the portable filesystem-agnostic number
+# that lets us reason about slice vs integer indexing performance regardless of
+# the underlying store. Off by default; zero overhead when off.
+_COUNT_ENTRIES = os.environ.get("ANNBATCH_COUNT_ENTRIES", "0") == "1"
+
+
+class _CountingIndexer:
+    """Transparent proxy around a zarr Indexer that counts yielded ChunkProjections.
+
+    Forwards .shape and .drop_axes so it is a drop-in replacement wherever
+    `AsyncArray._get_selection` consumes an Indexer. Prints the count once each
+    iteration completes. Note: for sparse fetches the same indexer is iterated
+    twice (once by data._get_selection, once by indices._get_selection), so you
+    will see two log lines per sparse call.
+    """
+
+    def __init__(self, indexer, label: str):
+        self._indexer = indexer
+        self._label = label
+        self.shape = indexer.shape
+        self.drop_axes = indexer.drop_axes
+
+    def __iter__(self):
+        n = 0
+        for item in self._indexer:
+            n += 1
+            yield item
+        print(f"[annbatch.count] {self._label} n_entries={n}", flush=True)
+
+
 def _slices_to_int_index(slices: list[slice]) -> np.ndarray:
     """Concatenate a list of slices into a single 1D int64 index array."""
     return np.concatenate([np.arange(s.start, s.stop, dtype=np.int64) for s in slices])
@@ -695,6 +727,8 @@ class Loader[
                 for s in slices
             ]
         )
+        if _COUNT_ENTRIES:
+            indexer = _CountingIndexer(indexer, f"dense.slice n_slices={len(slices)}")
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await dataset._async_array._get_selection(
             indexer,
@@ -720,6 +754,10 @@ class Loader[
             shape=shape,
             chunk_grid=_chunk_grid(dataset),
         )
+        if _COUNT_ENTRIES:
+            indexer = _CountingIndexer(
+                indexer, f"dense.integer n_slices={len(slices)} idx_len={int(idx.shape[0])}"
+            )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await dataset._async_array._get_selection(
             indexer,
@@ -816,6 +854,10 @@ class Loader[
             ]
         )
 
+        if _COUNT_ENTRIES:
+            indexer = _CountingIndexer(
+                indexer, f"sparse.slice n_slices={len(indptr_limits)}"
+            )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await asyncio.gather(
             data._get_selection(
@@ -845,6 +887,11 @@ class Loader[
         indexer = zarr.core.indexing.OrthogonalIndexer(
             (nnz_idx,), shape=data.metadata.shape, chunk_grid=_chunk_grid(data)
         )
+        if _COUNT_ENTRIES:
+            indexer = _CountingIndexer(
+                indexer,
+                f"sparse.integer n_slices={len(indptr_limits)} nnz_len={int(nnz_idx.shape[0])}",
+            )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await asyncio.gather(
             data._get_selection(
