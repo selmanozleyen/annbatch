@@ -880,17 +880,20 @@ class Loader[
         out: CSRContainer,
     ) -> None:
         # Concatenate per-slice nnz ranges into one int64 index array and issue a single
-        # OrthogonalIndexer for `data`. The same selection shape works for `indices` since
-        # the two arrays share layout. Coalescing pipelines (e.g. zarrs) will fetch each
-        # on-disk chunk at most once even when many small rows fall in the same chunk.
+        # CoordinateIndexer for `data`. The same selection shape works for `indices` since
+        # the two arrays share layout. CoordinateIndexer (zarr's vindex) emits
+        # chunk_selection as a 1-tuple of ndarray and out_selection as a bare slice/ndarray,
+        # which zarrs-python recognizes as the "1-D scattered fast path" and ships straight
+        # to Rust without per-element fragment splitting. OrthogonalIndexer wraps out_selection
+        # in a tuple and would fall back to the slow split path.
         nnz_idx = np.concatenate([np.arange(l.start, l.stop, dtype=np.int64) for l in indptr_limits])
-        indexer = zarr.core.indexing.OrthogonalIndexer(
-            (nnz_idx,), shape=data.metadata.shape, chunk_grid=_chunk_grid(data)
+        indexer = zarr.core.indexing.CoordinateIndexer(
+            nnz_idx, shape=data.metadata.shape, chunk_grid=_chunk_grid(data)
         )
         if _COUNT_ENTRIES:
             indexer = _CountingIndexer(
                 indexer,
-                f"sparse.integer n_slices={len(indptr_limits)} nnz_len={int(nnz_idx.shape[0])}",
+                f"sparse.coord n_slices={len(indptr_limits)} nnz_len={int(nnz_idx.shape[0])}",
             )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await asyncio.gather(
