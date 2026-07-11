@@ -264,43 +264,106 @@ def test_two_passes_differ():
 # =============================================================================
 
 
-def _projected_per_obs(categorical: pd.Categorical, position: int) -> np.ndarray:
-    return np.array([label[position] for label in categorical.categories], dtype=object)[np.asarray(categorical.codes)]
+def _obj1d(values) -> np.ndarray:
+    # 1-D object array (numpy would otherwise coerce a list of equal-length tuples to 2-D)
+    arr = np.empty(len(values), dtype=object)
+    for i, value in enumerate(values):
+        arr[i] = value
+    return arr
 
 
-def test_on_binds_on_tuple_position():
-    # inner classes are (cell_type, donor); condition is (cell_type, batch); bind on cell_type (pos 0 both)
-    inner_pairs = [("B", "d1")] * 40 + [("B", "d2")] * 40 + [("T", "d1")] * 40 + [("T", "d2")] * 40
-    inner = make_inner(pd.Categorical(inner_pairs), num_samples=1000, seed=4)
-    condition = pd.Categorical([("B", "x")] * 50 + [("T", "y")] * 50 + [("B", "y")] * 50 + [("T", "x")] * 50)
-    sampler = make_bound(inner, condition, on={0: 0}, seed=6)
+def _tuple_cat(rows: list[tuple], block: int = 40, reps: int = 3) -> pd.Categorical:
+    """Categorical of tuple labels, each distinct row laid out in runs of ``block``."""
+    return pd.Categorical(_obj1d([row for _ in range(reps) for row in rows for _ in range(block)]))
 
-    cond_cell = _projected_per_obs(condition, 0)
-    bound_cell = []
+
+def _project(label, positions: tuple[int, ...] | None):
+    if positions is None:
+        return label
+    if len(positions) == 1:
+        return label[positions[0]]
+    return tuple(label[i] for i in positions)
+
+
+@pytest.mark.parametrize(
+    ("inner_rows", "condition_rows", "on"),
+    [
+        # both tables share the columns (cell_type, donor); bind on 1, on all, or on the whole label
+        pytest.param([("B", "d1"), ("T", "d2")], [("B", "d1"), ("T", "d2")], {0: 0}, id="shared_cols-bind_one"),
+        pytest.param([("B", "d1"), ("T", "d2")], [("B", "d1"), ("T", "d2")], {0: 0, 1: 1}, id="shared_cols-bind_all"),
+        pytest.param([("B", "d1"), ("T", "d2")], [("B", "d1"), ("T", "d2")], None, id="shared_cols-whole_label"),
+        # the parent's columns are all common: inner is (cell_type,); the child adds a batch column
+        pytest.param([("B",), ("T",)], [("B", "x"), ("T", "y")], {0: 0}, id="parent_cols_all_common"),
+        # the child's columns are all common: condition is (cell_type,); the parent adds a donor column
+        pytest.param([("B", "d1"), ("T", "d2")], [("B",), ("T",)], {0: 0}, id="child_cols_all_common"),
+        # partial overlap: bind only on the common column (cell_type)
+        pytest.param([("B", "d1"), ("T", "d2")], [("B", "x"), ("T", "y")], {0: 0}, id="partial_overlap-bind_common"),
+        # the common column sits at a different position on each side
+        pytest.param([("B", "d1"), ("T", "d2")], [("x", "B"), ("y", "T")], {0: 1}, id="different_positions"),
+    ],
+)
+def test_on_binds_matching_projected_key(inner_rows, condition_rows, on):
+    inner_classes, condition = _tuple_cat(inner_rows), _tuple_cat(condition_rows)
+    inner_positions = tuple(on) if on else None
+    condition_positions = tuple(on.values()) if on else None
+
+    def fresh_inner() -> ClassSampler:
+        return make_inner(inner_classes, num_samples=200, seed=0)
+
+    sampler = make_bound(fresh_inner(), condition, on=on, seed=1)
+
+    # the class the inner draws for each batch, projected onto the bound columns
+    expected = [_project(label, inner_positions) for label in inner_batch_labels(fresh_inner())]
+
+    # the class of each bound batch, read from the condition table's projected key
+    condition_key = _obj1d([_project(label, condition_positions) for label in condition.categories])
+    condition_key = condition_key[np.asarray(condition.codes)]
+    bound = []
     for lr in sampler.sample(len(condition)):
-        concat = cond_cell[np.concatenate([np.arange(s.start, s.stop) for s in lr["requests"]])]
+        window_key = condition_key[np.concatenate([np.arange(s.start, s.stop) for s in lr["requests"]])]
         for split in lr["splits"]:
-            unique = np.unique(concat[split])
-            assert unique.size == 1, "each batch must be coherent on the bound cell_type"
-            bound_cell.append(unique[0])
+            keys = {window_key[i] for i in split}
+            assert len(keys) == 1, "each batch must be coherent on the bound key"
+            bound.append(keys.pop())
 
-    expected = [lbl[0] for lbl in inner_batch_labels(make_inner(pd.Categorical(inner_pairs), num_samples=1000, seed=4))]
-    assert bound_cell == expected
+    assert bound == expected
 
 
-def test_on_maps_different_positions():
-    # cell_type sits at inner position 0 but condition position 1 -> on={0: 1}
-    inner_pairs = [("B", "d1")] * 40 + [("T", "d1")] * 40 + [("B", "d2")] * 40 + [("T", "d2")] * 40
-    inner = make_inner(pd.Categorical(inner_pairs), num_samples=800, seed=1)
-    condition = pd.Categorical([("x", "B")] * 50 + [("y", "T")] * 50 + [("y", "B")] * 50 + [("x", "T")] * 50)
-    sampler = make_bound(inner, condition, on={0: 1}, seed=2)
+@pytest.mark.parametrize("n_columns", [pytest.param(3, id="bind_3"), pytest.param(4, id="bind_4")])
+def test_on_binds_many_consecutive_columns(n_columns):
+    # 4-component tuples; bind on the first `n_columns` consecutive positions.
+    # The first two rows differ only in column 3, so binding on 3 collapses them into one class
+    # while binding on all 4 keeps them distinct.
+    rows = [
+        ("B", "d1", "x", "t1"),
+        ("B", "d1", "x", "t2"),
+        ("T", "d2", "y", "t1"),
+        ("NK", "d1", "x", "t3"),
+    ]
+    inner_classes, condition = _tuple_cat(rows), _tuple_cat(rows)
+    on = {i: i for i in range(n_columns)}  # consecutive columns: {0:0, 1:1, 2:2[, 3:3]}
+    positions = tuple(range(n_columns))
 
-    cond_cell = _projected_per_obs(condition, 1)
+    def fresh_inner() -> ClassSampler:
+        return make_inner(inner_classes, num_samples=2000, seed=0)
+
+    sampler = make_bound(fresh_inner(), condition, on=on, seed=1)
+
+    expected = [_project(label, positions) for label in inner_batch_labels(fresh_inner())]
+
+    condition_key = _obj1d([_project(label, positions) for label in condition.categories])
+    condition_key = condition_key[np.asarray(condition.codes)]
+    bound = []
     for lr in sampler.sample(len(condition)):
-        concat = cond_cell[np.concatenate([np.arange(s.start, s.stop) for s in lr["requests"]])]
+        window_key = condition_key[np.concatenate([np.arange(s.start, s.stop) for s in lr["requests"]])]
         for split in lr["splits"]:
-            assert np.unique(concat[split]).size == 1, "each batch must be coherent on the bound cell_type"
-    assert sampler.n_batches(len(condition)) == inner.n_batches(0)
+            keys = {window_key[i] for i in split}
+            assert len(keys) == 1, "each batch must be coherent on the bound key"
+            bound.append(keys.pop())
+
+    assert bound == expected
+    # binding on 3 collapses the two rows that differ only in column 3; binding on 4 keeps them apart
+    assert len(set(bound)) == n_columns
 
 
 def test_on_pickle_roundtrip():
@@ -362,6 +425,85 @@ def test_secondary_zero_weight_excludes_and_exempts_run_length():
     # giving the short-run class a positive weight -> run-length rule now applies and fails
     with pytest.raises(ValueError, match="at least chunk_size"):
         make_bound(inner, condition, classes=donor, class_weights=np.array([1.0, 1.0]))
+
+
+# =============================================================================
+# Coverage and weighting (larger table)
+# =============================================================================
+
+
+def test_covers_all_drawable_obs_and_respects_weights():
+    # A larger condition table (dataset B) described as a DataFrame. Adversarial on purpose:
+    #   * (B, d1) and (NK, d2) each appear in two separate runs (non-contiguous),
+    #   * donor d3 is excluded (weight 0) and even appears in a length-1 run (must stay exempt),
+    #   * cell type Mono is never emitted by the inner sampler (must never be drawn),
+    #   * donors present differ per cell type, so weights renormalize within each cell type,
+    #   * the inner sampler uses a different category ordering.
+    blocks = [
+        ("B", "d1", 30),
+        ("B", "d2", 30),
+        ("T", "d1", 30),
+        ("T", "d3", 20),  # d3 excluded (weight 0)
+        ("NK", "d2", 30),
+        ("NK", "d3", 1),  # excluded AND shorter than chunk_size -> must stay exempt from the run-length rule
+        ("Mono", "d1", 30),  # Mono is never emitted by the inner sampler -> never drawn, exempt
+        ("B", "d1", 30),  # a second, separate run of (B, d1)
+        ("NK", "d2", 30),  # a second, separate run of (NK, d2)
+    ]
+    obs = pd.DataFrame(
+        {
+            "cell_type": np.repeat([ct for ct, _, _ in blocks], [n for _, _, n in blocks]),
+            "donor": np.repeat([dn for _, dn, _ in blocks], [n for _, _, n in blocks]),
+        }
+    )
+    condition = pd.Categorical(obs["cell_type"])
+    donor = pd.Categorical(obs["donor"])
+    donor_weights = pd.Series({"d1": 3.0, "d2": 1.0, "d3": 0.0})  # d3 excluded
+    class_weights = donor_weights.reindex(donor.categories).to_numpy()
+
+    # the inner sampler (dataset A) drives the cell-type schedule; Mono excluded, different ordering
+    inner_cell = pd.Categorical(np.repeat(["Mono", "NK", "T", "B"], 60))
+    inner_weights = np.where(inner_cell.categories == "Mono", 0.0, 1.0)
+    inner = ClassSampler(
+        10,
+        4,
+        10,
+        classes=inner_cell,
+        num_samples=60_000,
+        class_weights=inner_weights,
+        drop_last=True,
+        rng=np.random.default_rng(0),
+    )
+    sampler = BoundClassSampler(
+        inner,
+        3,
+        4,
+        3,
+        condition_classes=condition,
+        classes=donor,
+        class_weights=class_weights,
+        rng=np.random.default_rng(1),
+    )
+
+    # every observation the sampler reads off disk
+    drawn_idx = np.concatenate([np.arange(s.start, s.stop) for lr in sampler.sample(len(obs)) for s in lr["requests"]])
+    drawn = obs.iloc[drawn_idx]
+
+    # what *should* be drawable: an emittable cell type and a positive-weight donor
+    drawable = obs[obs["cell_type"].isin(["B", "T", "NK"]) & obs["donor"].map(donor_weights).gt(0)]
+
+    # coverage: every drawable observation is hit, and nothing outside the drawable set ever is
+    assert set(drawn_idx.tolist()) == set(drawable.index)
+
+    # weighting: within each cell type, donor shares track the renormalized positive weights
+    observed = drawn.groupby("cell_type")["donor"].value_counts(normalize=True)
+    expected = drawable.drop_duplicates(["cell_type", "donor"]).copy()
+    expected["w"] = expected["donor"].map(donor_weights)
+    expected["share"] = expected["w"] / expected.groupby("cell_type")["w"].transform("sum")
+    for row in expected.itertuples():
+        assert abs(observed[row.cell_type, row.donor] - row.share) < 0.02, (
+            f"{row.cell_type}/{row.donor}: {observed[row.cell_type, row.donor]:.3f} vs {row.share:.3f}"
+        )
 
 
 # =============================================================================
