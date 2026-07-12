@@ -1,4 +1,4 @@
-"""BoundClassSampler -- class schedule bound to an inner ClassSampler."""
+"""BoundClassSampler -- class schedule bound to an inner class sampler."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ import pandas as pd
 
 from annbatch.abc import BaseClassSampler
 from annbatch.samplers._class_sampler import _RunClassSampler
-from annbatch.samplers._utils import codes_of_categorical, project_index, resolve_class_weights
+from annbatch.samplers._utils import (
+    codes_of_categorical,
+    grouped_weighted_choice,
+    project_index,
+    resolve_class_weights,
+    to_level_arrays,
+)
 
 
 class BoundClassSampler(_RunClassSampler):
@@ -20,7 +26,8 @@ class BoundClassSampler(_RunClassSampler):
     When the inner balances over several columns (its categories are tuples) you can bind on
     a subset with ``on`` -- a ``dict`` mapping inner tuple positions to ``classes_to_bind_on``
     tuple positions (``{0: 0, 1: 1}``); ``None`` matches the whole label. ``classes_to_bind_on``
-    (after ``on`` projection) must be a subset of the inner sampler's classes.
+    (after ``on`` projection) must be a subset of the inner sampler's
+    :attr:`~annbatch.abc.BaseClassSampler.vocab`.
 
     With no ``classes``, rows of the matched class are drawn uniformly. Passing a secondary
     ``classes`` (a single column, row-aligned with ``classes_to_bind_on``) plus ``class_weights``
@@ -42,7 +49,8 @@ class BoundClassSampler(_RunClassSampler):
         Sizing for this sampler; ``batch_size`` must be a multiple of ``chunk_size``.
     classes_to_bind_on
         A :class:`pandas.Categorical`, one entry per observation; matched (via ``on``) to the
-        class the inner picks. Its (projected) categories must be a subset of the inner's.
+        class the inner picks. Its (projected) categories must be a subset of the inner's
+        :attr:`~annbatch.abc.BaseClassSampler.vocab`.
     on
         Optional ``dict`` mapping inner tuple positions to ``classes_to_bind_on`` positions.
         ``None`` matches the whole label.
@@ -175,18 +183,13 @@ class BoundClassSampler(_RunClassSampler):
         self._weight_of_joint = sec_weights[j_sec]
         drawable = np.where(np.isin(j_match, emittable_match), sec_weights[j_sec], 0.0)
 
-        # Flatten (match, secondary) into one flat tuple per joint class -- when the match is itself a
+        # Flatten (match, secondary) into one flat label per joint class -- when the match is itself a
         # tuple (a multi-column inner), keeping it nested would hide those columns from a downstream
         # `on`, so a chain could not condition on them. Flat labels compose: (cellline, drug) + batch
-        # -> (cellline, drug, batch), which the next level can project any position of.
-        def as_tuple(label: object) -> tuple:
-            return label if isinstance(label, tuple) else (label,)
-
-        labels = pd.Index(
-            [
-                (*as_tuple(match_uniques[m]), *as_tuple(classes.categories[s]))
-                for m, s in zip(j_match, j_sec, strict=True)
-            ]
+        # -> (cellline, drug, batch), which the next level can project any position of. Built column-wise
+        # (take + from_arrays) so it stays vectorized at ~200k joint classes -- no per-label loop.
+        labels = pd.MultiIndex.from_arrays(
+            to_level_arrays(match_uniques.take(j_match)) + to_level_arrays(classes.categories.take(j_sec))
         )
         return joint_codes, drawable, labels
 
@@ -195,29 +198,23 @@ class BoundClassSampler(_RunClassSampler):
         return self._classes_to_bind_on
 
     def _draw_class_of_slice(self, n_slices: int) -> np.ndarray:
-        # group the joint classes present in the current range by their match class
-        info = self._per_class_sampling_info
-        present_codes = info.index.to_numpy()
-        present_positions = np.arange(len(info))
+        # the joint classes present here, with the match class and secondary weight of each
+        present_codes = self._per_class_sampling_info.index.to_numpy()
         present_match = self._match_of_joint[present_codes]
         present_weight = self._weight_of_joint[present_codes]
-        by_match = {
-            int(m): (present_positions[present_match == m], present_weight[present_match == m])
-            for m in np.unique(present_match)
-        }
 
-        # replay the inner schedule -> a match class per batch -> a (weighted) joint position per batch
+        # a mask can leave a class the inner still emits with no drawable run in the current range
         match_of_batch = self._inner_to_match[self._inner_sampler.batch_codes()]
-        positions = np.empty(match_of_batch.shape[0], dtype=np.int64)
-        for m in np.unique(match_of_batch):
-            batch_idx = np.flatnonzero(match_of_batch == m)
-            if int(m) not in by_match:
-                raise ValueError(
-                    f"Class {self._match_uniques[m]!r} emitted by the inner sampler has no drawable run "
-                    "of at least chunk_size in the current range."
-                )
-            rows, weight = by_match[int(m)]
-            positions[batch_idx] = self._class_rng.choice(rows, size=batch_idx.shape[0], p=weight / weight.sum())
+        drawable = np.zeros(len(self._match_uniques), dtype=bool)
+        drawable[present_match] = True
+        undrawable = match_of_batch[~drawable[match_of_batch]]
+        if undrawable.size:
+            raise ValueError(
+                f"Class {self._match_uniques[undrawable[0]]!r} emitted by the inner sampler has no drawable "
+                "run of at least chunk_size in the current range."
+            )
 
+        # pick a joint of each batch's match class, weighted by the secondary -- one vectorized grouped draw
+        positions = grouped_weighted_choice(present_match, present_weight, match_of_batch, self._class_rng)
         group_chunks = self._batch_size // self._chunk_size
         return np.repeat(positions, group_chunks)

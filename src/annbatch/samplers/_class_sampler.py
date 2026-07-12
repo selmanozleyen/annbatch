@@ -202,7 +202,10 @@ class _RunClassSampler(BaseClassSampler):
 
     @property
     def vocab(self) -> pd.Index:
-        return pd.Index(self._category_labels)
+        # return as-is (a MultiIndex stays a MultiIndex -- pd.Index() would flatten it to tuples),
+        # so a downstream `on` projects it column-wise without a from_tuples round-trip
+        labels = self._category_labels
+        return labels if isinstance(labels, pd.Index) else pd.Index(labels)
 
     def emittable_codes(self) -> np.ndarray:
         return self._per_class_sampling_info.index.to_numpy()

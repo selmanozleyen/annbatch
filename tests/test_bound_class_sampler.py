@@ -20,7 +20,7 @@ import pytest
 
 from annbatch.abc import BaseClassSampler
 from annbatch.samplers import BoundClassSampler, ClassSampler
-from annbatch.samplers._utils import WorkerInfo, project_index
+from annbatch.samplers._utils import WorkerInfo, grouped_weighted_choice, project_index
 
 
 def make_inner(
@@ -148,6 +148,20 @@ def test_unused_bound_category_is_ignored():
     bound = pd.Categorical(["B"] * 100 + ["T"] * 100, categories=["B", "T", "Ghost"])
     sampler = make_bound(inner, bound)
     assert sampler.n_batches(0) == inner.n_batches(0)
+
+
+def test_grouped_weighted_choice():
+    # group 0 -> items {0: w3, 1: w1}; group 1 -> item {2: w1}
+    group_of_item = np.array([0, 0, 1])
+    weight_of_item = np.array([3.0, 1.0, 1.0])
+    rng = np.random.default_rng(0)
+
+    picks0 = grouped_weighted_choice(group_of_item, weight_of_item, np.zeros(4000, dtype=int), rng)
+    assert set(picks0.tolist()) <= {0, 1}, "group-0 draws pick only group-0 items"
+    assert abs((picks0 == 0).mean() - 0.75) < 0.03, "within group 0, items are weighted 3:1"
+
+    picks1 = grouped_weighted_choice(group_of_item, weight_of_item, np.ones(10, dtype=int), rng)
+    assert (picks1 == 2).all(), "group-1 draws pick its only item"
 
 
 def test_inner_must_be_class_sampler():
