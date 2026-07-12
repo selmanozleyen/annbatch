@@ -97,6 +97,20 @@ def resolve_class_weights(class_weights: np.ndarray | None, n_classes: int) -> n
     return weights
 
 
+def codes_of_categorical(categorical: pd.Categorical, name: str) -> np.ndarray:
+    """Return a :class:`pandas.Categorical`'s integer codes, validating it first.
+
+    Rejects a non-categorical -- the common mistake is passing a ``Series`` or ndarray instead of
+    its ``.values`` -- and NA entries (``codes == -1``), both of which would otherwise fail later.
+    """
+    if not isinstance(categorical, pd.Categorical):
+        raise TypeError(f"{name} must be a pandas.Categorical.")
+    codes = categorical.codes  # pd.Categorical.codes is already an ndarray
+    if (codes == -1).any():
+        raise ValueError(f"{name} contains NA values (codes == -1). Remove NAs before passing.")
+    return codes
+
+
 def build_run_table(codes: np.ndarray, start: int) -> pd.DataFrame:
     # Run-length encode ``codes``; returns runs with global start/end (offset by ``start``), len and cat.
     # Boundaries where the code changes, plus the range's start and stop.
@@ -109,6 +123,28 @@ def build_run_table(codes: np.ndarray, start: int) -> pd.DataFrame:
             "cat": codes[edges[:-1]],
         }
     )
+
+
+def project_index(categories: pd.Index, positions: tuple[int, ...] | None) -> pd.Index:
+    """Project category labels onto ``positions`` as a pandas Index for vectorized label matching.
+
+    ``positions is None`` keeps the whole label. Multi-column labels are tuples and are decomposed
+    with a :class:`pandas.MultiIndex` so both the projection and the downstream ``get_indexer`` stay
+    vectorized -- no per-category Python loop and no object hashing, which keeps construction fast at
+    ~100k categories. A single-column label is a scalar (a 1-tuple whose only position is ``0``).
+    """
+    if positions is None:
+        return pd.Index(categories)
+    if len(categories) and isinstance(categories[0], tuple):
+        mi = pd.MultiIndex.from_tuples(categories)
+        if len(positions) == 1:
+            return mi.get_level_values(positions[0])
+        return pd.MultiIndex.from_arrays([mi.get_level_values(p) for p in positions])
+    if positions != (0,):
+        raise ValueError(
+            f"Cannot project single-column categories onto positions {positions}; a single column has only position 0."
+        )
+    return pd.Index(categories)
 
 
 def iter_windows(

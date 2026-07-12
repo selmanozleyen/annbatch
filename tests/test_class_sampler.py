@@ -272,7 +272,7 @@ def test_absent_class_weight_is_ignored():
     # "c" is declared but has no observations; its weight must be silently dropped and
     # the present classes renormalize among themselves (here -> 50/50).
     cat = pd.Categorical(["a"] * 100 + ["b"] * 100, categories=["a", "b", "c"])
-    codes = np.asarray(cat.codes)
+    codes = cat.codes
     sampler = make_sampler(cat, num_samples=40_000, class_weights=np.array([1.0, 1.0, 5.0]))
     _assert_shares(sampler, codes, {0: 0.5, 1: 0.5})
 

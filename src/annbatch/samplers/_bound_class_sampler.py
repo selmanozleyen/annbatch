@@ -2,110 +2,132 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 import pandas as pd
 
-from annbatch.samplers._class_sampler import ClassSampler, _RunClassSampler
-from annbatch.samplers._utils import resolve_class_weights
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-
-def _as_object_1d(values: Sequence) -> np.ndarray:
-    # pack into a 1-D object array (numpy would otherwise coerce a list of tuples to 2-D)
-    arr = np.empty(len(values), dtype=object)
-    for i, v in enumerate(values):
-        arr[i] = v
-    return arr
-
-
-def _project_labels(categories: pd.Index, positions: tuple[int, ...] | None) -> np.ndarray:
-    labels = list(categories)
-    if positions is None:
-        return _as_object_1d(labels)
-    if len(positions) == 1:
-        p = positions[0]
-        return _as_object_1d([label[p] for label in labels])
-    return _as_object_1d([tuple(label[i] for i in positions) for label in labels])
+from annbatch.abc import BaseClassSampler
+from annbatch.samplers._class_sampler import _RunClassSampler
+from annbatch.samplers._utils import codes_of_categorical, project_index, resolve_class_weights
 
 
 class BoundClassSampler(_RunClassSampler):
-    """Bind a :class:`ClassSampler`'s per-batch class schedule onto another obs table.
+    """Bind a class sampler's per-batch class schedule onto another obs table.
 
-    Match on tuple *positions* with ``on`` -- a ``dict`` mapping inner tuple positions to
-    condition tuple positions (e.g. ``{0: 0}``); ``None`` matches the whole label. Build
-    the tuple categories with e.g. ``pd.Categorical(list(zip(cell_type, donor)))`` so a
-    position selects one component (``pd.factorize`` on tuples works too; a bare
-    :class:`pandas.Categorical` cannot carry column names, only positions).
+    For every batch the inner sampler yields, this sampler yields one batch of its own
+    ``batch_size`` observations of the matching class, drawn from ``classes_to_bind_on``
+    (this sampler's own obs) and read as contiguous chunks. Classes are matched by *label*.
+
+    When the inner balances over several columns (its categories are tuples) you can bind on
+    a subset with ``on`` -- a ``dict`` mapping inner tuple positions to ``classes_to_bind_on``
+    tuple positions (``{0: 0, 1: 1}``); ``None`` matches the whole label. ``classes_to_bind_on``
+    (after ``on`` projection) must be a subset of the inner sampler's classes.
+
+    With no ``classes``, rows of the matched class are drawn uniformly. Passing a secondary
+    ``classes`` (a single column, row-aligned with ``classes_to_bind_on``) plus ``class_weights``
+    adds conditional sampling: which rows of the matched class are drawn is weighted by the
+    secondary class (a non-positive weight excludes it), with ``class_weights`` one flat array
+    in ``classes.categories`` order.
+
+    ``batch_size`` must be a multiple of ``chunk_size``; the total is
+    ``inner_sampler.n_batches() * batch_size`` (one full batch per inner batch). Every drawable
+    run must be at least ``chunk_size`` long (stricter with a secondary ``classes``, since runs
+    are then cut on the joint key). Multiple workers are not supported.
+
+    Parameters
+    ----------
+    inner_sampler
+        Any :class:`~annbatch.abc.BaseClassSampler` (typically a :class:`ClassSampler`) whose
+        per-batch class schedule and batch count drive sampling.
+    chunk_size, preload_nchunks, batch_size
+        Sizing for this sampler; ``batch_size`` must be a multiple of ``chunk_size``.
+    classes_to_bind_on
+        A :class:`pandas.Categorical`, one entry per observation; matched (via ``on``) to the
+        class the inner picks. Its (projected) categories must be a subset of the inner's.
+    on
+        Optional ``dict`` mapping inner tuple positions to ``classes_to_bind_on`` positions.
+        ``None`` matches the whole label.
+    classes
+        Optional secondary single-column :class:`pandas.Categorical`, the same length as
+        ``classes_to_bind_on``, for conditional (within-class) sampling.
+    class_weights
+        Optional weights, one per ``classes.categories``; a non-positive weight excludes that class.
+    mask, rng
+        Optional observation range and random number generator (independent of the inner's).
     """
 
-    _inner_sampler: ClassSampler
-    _condition_classes: pd.Categorical
+    _inner_sampler: BaseClassSampler
+    _classes_to_bind_on: pd.Categorical
 
     def __init__(
         self,
-        inner_sampler: ClassSampler,
+        inner_sampler: BaseClassSampler,
         chunk_size: int,
         preload_nchunks: int,
         batch_size: int,
         *,
-        condition_classes: pd.Categorical,
+        classes_to_bind_on: pd.Categorical,
         on: dict[int, int] | None = None,
         classes: pd.Categorical | None = None,
         class_weights: np.ndarray | None = None,
         mask: slice | None = None,
         rng: np.random.Generator | None = None,
     ):
-        if not isinstance(inner_sampler, ClassSampler):
-            raise TypeError(f"inner_sampler must be a ClassSampler, got {type(inner_sampler).__name__}.")
-        if not isinstance(condition_classes, pd.Categorical):
-            raise TypeError(f"condition_classes must be a pandas.Categorical, got {type(condition_classes).__name__}.")
+        if not isinstance(inner_sampler, BaseClassSampler):
+            raise TypeError("inner_sampler must be a BaseClassSampler.")
         if batch_size % chunk_size != 0:
             raise ValueError(
                 "batch_size must be a multiple of chunk_size so each batch replays one inner class as whole chunks. "
                 f"Got chunk_size={chunk_size}, batch_size={batch_size}."
             )
-
-        cond_codes = np.asarray(condition_classes.codes)
-        if (cond_codes == -1).any():
-            raise ValueError("condition_classes contains NA values (codes == -1). Remove NAs before passing.")
+        bind_codes = codes_of_categorical(classes_to_bind_on, "classes_to_bind_on")
 
         if on is None:
-            inner_pos = cond_pos = None
+            inner_pos = bind_pos = None
         elif isinstance(on, dict):
-            inner_pos, cond_pos = tuple(on.keys()), tuple(on.values())
+            inner_pos, bind_pos = tuple(on.keys()), tuple(on.values())
         else:
-            raise TypeError(f"on must be a dict[int, int] or None, got {type(on).__name__}.")
+            raise TypeError("on must be a dict[int, int] or None.")
 
-        # project both sides onto the bind positions; the condition's projected key drives run-building
-        inner_proj = _project_labels(inner_sampler.classes.categories, inner_pos)
-        cond_proj_obs = _project_labels(condition_classes.categories, cond_pos)[cond_codes]
-        cond_obs_codes, cond_uniques = pd.factorize(cond_proj_obs)
+        # match key: project both sides onto the bound positions and match by label. Factorize the
+        # (few) bound categories and map to obs by codes -- never the per-obs expansion -- and match
+        # via MultiIndex.get_indexer, so construction stays vectorized even at ~100k categories.
+        inner_proj = project_index(inner_sampler.vocab, inner_pos)
+        cat_to_match, match_uniques = pd.factorize(project_index(classes_to_bind_on.categories, bind_pos))
+        match_obs_codes = cat_to_match[bind_codes]  # per-obs match code, vectorized
+        inner_to_match = match_uniques.get_indexer(inner_proj)  # per inner category -> match code
 
-        # every class the inner sampler can emit must have a matching projected key here
-        inner_to_cond = pd.Index(cond_uniques, tupleize_cols=False).get_indexer(inner_proj)
-        emittable_inner = np.asarray(inner_sampler._per_class_sampling_info.index)
-        emittable_cond = inner_to_cond[emittable_inner]
-        if (emittable_cond < 0).any():
-            missing = pd.unique(inner_proj[emittable_inner][emittable_cond < 0])
+        # Only match classes that actually occur in the obs matter for the subset/drawable rules:
+        # factorizing over `.categories` also surfaces declared-but-unused categories (pandas keeps
+        # these after subsetting), which must not trigger the checks.
+        present = np.zeros(len(match_uniques), dtype=bool)
+        present[match_obs_codes] = True
+        present_codes = np.flatnonzero(present)
+
+        # classes_to_bind_on (its present classes) must be a subset of the inner sampler's classes
+        present_uniques = match_uniques[present_codes]
+        not_in_inner = inner_proj.unique().get_indexer(present_uniques) < 0
+        if not_in_inner.any():
             raise ValueError(
-                f"The inner sampler can emit classes {list(missing)} absent from condition_classes. "
-                "condition_classes must contain every class the inner sampler can emit (after `on` projection)."
+                f"classes_to_bind_on has classes {list(present_uniques[not_in_inner])} not present in the inner "
+                "sampler's classes; classes_to_bind_on must be a subset of the inner sampler's classes."
             )
-        emittable_cond_set = {int(c) for c in np.unique(emittable_cond)}
+        # and every class the inner can emit must be present here, so it is drawable
+        emittable_inner = inner_sampler.emittable_codes()
+        emittable_match = inner_to_match[emittable_inner]
+        drawable = np.isin(emittable_match, present_codes)  # np.isin treats the -1 "absent" code as not present
+        if not drawable.all():
+            missing = inner_proj[emittable_inner][~drawable].unique()
+            raise ValueError(f"The inner sampler can emit classes {list(missing)} absent from classes_to_bind_on.")
 
         codes, weights, labels = self._build_joint(
-            cond_obs_codes, cond_uniques, emittable_cond_set, classes, class_weights
+            match_obs_codes, match_uniques, np.unique(emittable_match), classes, class_weights
         )
 
         self._inner_sampler = inner_sampler
-        self._condition_classes = condition_classes
+        self._classes_to_bind_on = classes_to_bind_on
         self._on = on
-        self._inner_to_cond = inner_to_cond
-        self._cond_uniques = cond_uniques
+        self._inner_to_match = inner_to_match  # per inner category -> match code
+        self._match_uniques = match_uniques  # projected match keys (for error messages)
 
         super().__init__(
             chunk_size=chunk_size,
@@ -122,89 +144,80 @@ class BoundClassSampler(_RunClassSampler):
 
     def _build_joint(
         self,
-        cond_obs_codes: np.ndarray,
-        cond_uniques: np.ndarray,
-        emittable_cond_set: set[int],
+        match_obs_codes: np.ndarray,
+        match_uniques: pd.Index,
+        emittable_match: np.ndarray,
         classes: pd.Categorical | None,
         class_weights: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray, pd.Index]:
-        # caches _joint_to_cond (joint class -> condition class) and _joint_to_weight
-        # (joint class -> secondary weight) for _draw_class_of_slice
+        # caches _match_of_joint (joint class -> match class) and _weight_of_joint (joint class -> secondary weight)
         if classes is None:
             if class_weights is not None:
                 raise ValueError("class_weights was given but classes is None; pass a secondary `classes` too.")
-            self._joint_to_cond = np.arange(len(cond_uniques), dtype=np.int64)
-            self._joint_to_weight = np.ones(len(cond_uniques), dtype=float)
-            weights = np.array([1.0 if int(c) in emittable_cond_set else 0.0 for c in self._joint_to_cond])
-            return cond_obs_codes, weights, pd.Index(cond_uniques, tupleize_cols=False)
+            self._match_of_joint = np.arange(len(match_uniques), dtype=np.int64)
+            self._weight_of_joint = np.ones(len(match_uniques), dtype=float)
+            drawable = np.isin(self._match_of_joint, emittable_match).astype(float)
+            return match_obs_codes, drawable, match_uniques
 
-        if not isinstance(classes, pd.Categorical):
-            raise TypeError(f"classes must be a pandas.Categorical, got {type(classes).__name__}.")
-        if len(classes) != cond_obs_codes.shape[0]:
+        sec_codes = codes_of_categorical(classes, "classes")
+        if len(classes) != match_obs_codes.shape[0]:
             raise ValueError(
-                f"classes must be the same length as condition_classes ({cond_obs_codes.shape[0]}), got {len(classes)}."
+                f"classes must be the same length as classes_to_bind_on ({match_obs_codes.shape[0]}), got {len(classes)}."
             )
-        sec_codes = np.asarray(classes.codes)
-        if (sec_codes == -1).any():
-            raise ValueError("classes contains NA values (codes == -1). Remove NAs before passing.")
         n_sec = len(classes.categories)
         sec_weights = resolve_class_weights(class_weights, n_sec)
 
-        # runs are cut on the joint (condition, secondary) key so each slice is coherent in both
-        joint_obs_codes, joint_raw = pd.factorize(cond_obs_codes.astype(np.int64) * n_sec + sec_codes)
-        j_cond = (joint_raw // n_sec).astype(np.int64)
+        # runs are cut on the joint (match, secondary) key so each slice is coherent in both
+        joint_codes, joint_raw = pd.factorize(match_obs_codes.astype(np.int64) * n_sec + sec_codes)
+        j_match = (joint_raw // n_sec).astype(np.int64)
         j_sec = (joint_raw % n_sec).astype(np.int64)
-        self._joint_to_cond = j_cond
-        self._joint_to_weight = sec_weights[j_sec]
-        weights = np.array(
-            [sec_weights[s] if int(c) in emittable_cond_set else 0.0 for c, s in zip(j_cond, j_sec, strict=True)]
+        self._match_of_joint = j_match
+        self._weight_of_joint = sec_weights[j_sec]
+        drawable = np.where(np.isin(j_match, emittable_match), sec_weights[j_sec], 0.0)
+
+        # Flatten (match, secondary) into one flat tuple per joint class -- when the match is itself a
+        # tuple (a multi-column inner), keeping it nested would hide those columns from a downstream
+        # `on`, so a chain could not condition on them. Flat labels compose: (cellline, drug) + batch
+        # -> (cellline, drug, batch), which the next level can project any position of.
+        def as_tuple(label: object) -> tuple:
+            return label if isinstance(label, tuple) else (label,)
+
+        labels = pd.Index(
+            [
+                (*as_tuple(match_uniques[m]), *as_tuple(classes.categories[s]))
+                for m, s in zip(j_match, j_sec, strict=True)
+            ]
         )
-        labels = pd.Index([(cond_uniques[c], classes.categories[s]) for c, s in zip(j_cond, j_sec, strict=True)])
-        return joint_obs_codes, weights, labels
+        return joint_codes, drawable, labels
 
     @property
-    def classes(self) -> pd.Categorical:
-        return self._condition_classes
-
-    def _replay_inner_batch_classes(self) -> np.ndarray:
-        inner = self._inner_sampler
-        codes = np.asarray(inner.classes.codes)
-        batch_size, chunk_size = inner.batch_size, None
-        batch_classes: list[int] = []
-        for load_request in inner.sample(codes.shape[0]):
-            requests = load_request["requests"]  # chunk_size slices, in order
-            if chunk_size is None:  # first slice is a full chunk (the short one, if any, is always last)
-                chunk_size = requests[0].stop - requests[0].start
-            # batch i occupies window rows [i*batch_size, (i+1)*batch_size) and is class-coherent,
-            # so its class is that of the slice its first row falls in
-            for i in range(len(load_request["splits"])):
-                batch_classes.append(int(codes[requests[(i * batch_size) // chunk_size].start]))
-        return np.asarray(batch_classes, dtype=np.int64)
+    def classes_to_bind_on(self) -> pd.Categorical:
+        return self._classes_to_bind_on
 
     def _draw_class_of_slice(self, n_slices: int) -> np.ndarray:
-        # group the joint classes present in the current range by their condition class
+        # group the joint classes present in the current range by their match class
         info = self._per_class_sampling_info
         present_codes = info.index.to_numpy()
         present_positions = np.arange(len(info))
-        present_cond = self._joint_to_cond[present_codes]
-        present_weight = self._joint_to_weight[present_codes]
-        by_cond = {
-            int(c): (present_positions[present_cond == c], present_weight[present_cond == c])
-            for c in np.unique(present_cond)
+        present_match = self._match_of_joint[present_codes]
+        present_weight = self._weight_of_joint[present_codes]
+        by_match = {
+            int(m): (present_positions[present_match == m], present_weight[present_match == m])
+            for m in np.unique(present_match)
         }
 
-        # replay the inner schedule -> a condition class per batch -> a (weighted) joint position per batch
-        cond_of_batch = self._inner_to_cond[self._replay_inner_batch_classes()]
-        positions = np.empty(cond_of_batch.shape[0], dtype=np.int64)
-        for c in np.unique(cond_of_batch):
-            batch_idx = np.flatnonzero(cond_of_batch == c)
-            if int(c) not in by_cond:
+        # replay the inner schedule -> a match class per batch -> a (weighted) joint position per batch
+        match_of_batch = self._inner_to_match[self._inner_sampler.batch_codes()]
+        positions = np.empty(match_of_batch.shape[0], dtype=np.int64)
+        for m in np.unique(match_of_batch):
+            batch_idx = np.flatnonzero(match_of_batch == m)
+            if int(m) not in by_match:
                 raise ValueError(
-                    f"Class {self._cond_uniques[c]!r} emitted by the inner sampler has no drawable run "
+                    f"Class {self._match_uniques[m]!r} emitted by the inner sampler has no drawable run "
                     "of at least chunk_size in the current range."
                 )
-            rows, weight = by_cond[int(c)]
-            positions[batch_idx] = self._rng.choice(rows, size=batch_idx.shape[0], p=weight / weight.sum())
+            rows, weight = by_match[int(m)]
+            positions[batch_idx] = self._class_rng.choice(rows, size=batch_idx.shape[0], p=weight / weight.sum())
 
         group_chunks = self._batch_size // self._chunk_size
         return np.repeat(positions, group_chunks)

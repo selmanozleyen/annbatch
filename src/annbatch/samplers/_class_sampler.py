@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from annbatch.abc import Sampler
+from annbatch.abc import BaseClassSampler
 from annbatch.samplers._utils import (
     build_run_table,
     check_lt_1,
+    codes_of_categorical,
     get_torch_worker_info,
     iter_windows,
     resolve_class_weights,
@@ -26,13 +27,25 @@ if TYPE_CHECKING:
     from annbatch.types import LoadRequest
 
 
-class _RunClassSampler(Sampler):
+class _RunClassSampler(BaseClassSampler):
+    """Shared run-length/slice machinery for class-coherent samplers.
+
+    Every subclass reduces its problem to one integer ``_codes`` array over ``_category_labels``
+    (a plain class for :class:`ClassSampler`, an internal joint ``(match, secondary)`` code for
+    :class:`~annbatch.samplers.BoundClassSampler`). Because the runs, the emittable set, the
+    per-batch schedule, and :attr:`vocab` all live in that one code space, the whole
+    :class:`~annbatch.abc.BaseClassSampler` contract is satisfied here -- so any subclass can be
+    bound onto, matched by the labels in :attr:`vocab`.
+    """
+
     _batch_size: int
     _chunk_size: int
     _preload_nchunks: int
     _num_samples: int
     _n_obs: int
     _rng: np.random.Generator
+    _class_rng: np.random.Generator
+    _split_rng: np.random.Generator
     _drop_last: bool
     _mask: slice
     _codes: np.ndarray
@@ -61,7 +74,8 @@ class _RunClassSampler(Sampler):
         self._num_samples = num_samples
         self._drop_last = drop_last
         self._rng = rng or np.random.default_rng()
-        self._codes = np.asarray(codes)
+        self._spawn_class_split_rngs()  # derive independent class-choice and slice/split streams
+        self._codes = codes  # pd.Categorical.codes / pd.factorize output are already ndarrays
         self._weights = weights  # full array (<=0 for excluded); codes are 0..N-1 so direct indexing works
         self._category_labels = category_labels
         self._n_obs = int(self._codes.shape[0])
@@ -74,6 +88,22 @@ class _RunClassSampler(Sampler):
         # eager build for the (default or constructor) range so run-length errors surface early
         self._built_range: tuple[int, int] | None = None
         self._ensure_runs(self._n_obs)
+
+    def _spawn_class_split_rngs(self) -> None:
+        # independent streams (numpy sequence-of-seeds pattern): class choice vs slice/shuffle,
+        # so the class schedule is reproducible regardless of the split randomness and vice versa
+        root = self._rng.integers(np.iinfo(np.int64).max)
+        self._class_rng = np.random.default_rng([0, root])
+        self._split_rng = np.random.default_rng([1, root])
+
+    @property
+    def rng(self) -> np.random.Generator:
+        return self._rng
+
+    @rng.setter
+    def rng(self, value: np.random.Generator) -> None:
+        self._rng = value
+        self._spawn_class_split_rngs()
 
     @property
     def mask(self) -> slice:
@@ -137,6 +167,14 @@ class _RunClassSampler(Sampler):
         return self._batch_size
 
     @property
+    def chunk_size(self) -> int:
+        return self._chunk_size
+
+    @property
+    def num_samples(self) -> int:
+        return self._num_samples
+
+    @property
     def shuffle(self) -> bool:
         return True
 
@@ -162,6 +200,23 @@ class _RunClassSampler(Sampler):
         self._ensure_runs(n_obs)
         return self._iter_requests()
 
+    @property
+    def vocab(self) -> pd.Index:
+        return pd.Index(self._category_labels)
+
+    def emittable_codes(self) -> np.ndarray:
+        return self._per_class_sampling_info.index.to_numpy()
+
+    def batch_codes(self) -> np.ndarray:
+        # Per-batch category code for a full pass -- the exact classes sample() would draw, from the class
+        # schedule alone (no slice/window building). _draw_class_of_slice is the first (and only class-picking)
+        # rng use in _iter_requests, so this matches a real pass's per-batch class exactly.
+        n_slices = math.ceil(self._num_samples / self._chunk_size)
+        slice_codes = self._per_class_sampling_info.index.to_numpy()[self._draw_class_of_slice(n_slices)]
+        # batch j occupies rows [j*batch_size, (j+1)*batch_size); coherent, so its class is that of
+        # slice (j*batch_size)//chunk_size
+        return slice_codes[(np.arange(self.n_batches(0)) * self._batch_size) // self._chunk_size]
+
     @abstractmethod
     def _draw_class_of_slice(self, n_slices: int) -> np.ndarray:
         # return n_slices row indices into _per_class_sampling_info: the class of each slice
@@ -178,14 +233,14 @@ class _RunClassSampler(Sampler):
         # [a: slice(0, 10), b: slice(10, 20), a: slice(20, 30)]
         # would have two possible run positions for a (one of 0 and 2) and one for b (just 1)
         class_n_runs = self._per_class_sampling_info["n_runs"].to_numpy()
-        possible_run_pos_within_a_class = self._rng.integers(class_n_runs[class_of_slice])
+        possible_run_pos_within_a_class = self._split_rng.integers(class_n_runs[class_of_slice])
         # Generate a position into the runs table to get the run to fetch within
         first_row_of_class = self._per_class_sampling_info["first_row_in_runs_of_class"].to_numpy()
         chosen = first_row_of_class[class_of_slice] + possible_run_pos_within_a_class
         run_starts = self._class_runs["start"].to_numpy()[chosen]
         run_ends = self._class_runs["end"].to_numpy()[chosen]
         # Now sample a valid start position within each chunk
-        slice_starts = self._rng.integers(run_starts, run_ends - self._chunk_size + 1)
+        slice_starts = self._split_rng.integers(run_starts, run_ends - self._chunk_size + 1)
 
         slices = [slice(int(s), int(s + self._chunk_size)) for s in slice_starts]
         if remainder > 0:
@@ -198,7 +253,7 @@ class _RunClassSampler(Sampler):
             chunk_size=self._chunk_size,
             batch_size=self._batch_size,
             drop_last=self._drop_last,
-            rng=self._rng,
+            rng=self._split_rng,
         )
 
 
@@ -307,8 +362,6 @@ class ClassSampler(_RunClassSampler):
         here; pass a seeded :class:`numpy.random.Generator` to control randomness.
     """
 
-    _classes: pd.Categorical
-
     def __init__(
         self,
         chunk_size: int,
@@ -322,13 +375,7 @@ class ClassSampler(_RunClassSampler):
         drop_last: bool = False,
         rng: np.random.Generator | None = None,
     ):
-        if not isinstance(classes, pd.Categorical):
-            raise TypeError(f"classes must be a pandas.Categorical, got {type(classes).__name__}.")
-        codes = np.asarray(classes.codes)
-        if (codes == -1).any():
-            raise ValueError("classes contains NA values (codes == -1). Remove NAs before passing.")
-
-        self._classes = classes
+        codes = codes_of_categorical(classes, "classes")
         super().__init__(
             chunk_size=chunk_size,
             preload_nchunks=preload_nchunks,
@@ -342,15 +389,11 @@ class ClassSampler(_RunClassSampler):
             category_labels=classes.categories,
         )
 
-    @property
-    def classes(self) -> pd.Categorical:
-        return self._classes
-
     def _draw_class_of_slice(self, n_slices: int) -> np.ndarray:
         # one class per lcm(chunk_size, batch_size) group, repeated across the group's chunks
         group_chunks = self._batch_size // math.gcd(self._chunk_size, self._batch_size)
         n_groups = math.ceil(n_slices / group_chunks)
-        group_classes = self._rng.choice(
+        group_classes = self._class_rng.choice(
             len(self._per_class_sampling_info), size=n_groups, p=self._per_class_sampling_info["prob"].to_numpy()
         )
         return np.repeat(group_classes, group_chunks)[:n_slices]
