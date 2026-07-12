@@ -193,24 +193,23 @@ def grouped_weighted_choice(
     return order[hit]
 
 
-def project_index(categories: pd.Index, positions: tuple[int, ...] | None) -> pd.Index:
-    """Project category labels onto ``positions`` as a pandas Index for vectorized label matching.
+def project_index(labels: pd.Index, positions: tuple[int, ...] | None) -> pd.Index:
+    """Project label tuples onto ``positions`` for vectorized label matching.
 
-    ``positions is None`` keeps the whole label. Multi-column labels are tuples and are decomposed
-    with a :class:`pandas.MultiIndex` so both the projection and the downstream ``get_indexer`` stay
-    vectorized -- no per-category Python loop and no object hashing, which keeps construction fast at
-    ~100k categories. A single-column label is a scalar (a 1-tuple whose only position is ``0``).
+    ``positions is None`` keeps the whole label. Multi-column labels are tuples, decomposed with a
+    :class:`pandas.MultiIndex` so both the projection and the downstream ``get_indexer`` stay
+    vectorized -- no per-label Python loop and no object hashing, which keeps construction fast at
+    ~100k labels. A single-column label is a scalar (its only position is ``0``).
     """
     if positions is None:
-        return pd.Index(categories)
-    mi = _as_multiindex(categories)  # a chained sampler's MultiIndex vocab passes through, no round-trip
+        return labels
+    mi = _as_multiindex(labels)  # a chained sampler's MultiIndex vocab passes through, no round-trip
     if mi is None:  # single-column scalars: the only position is 0 (the whole label)
         if positions != (0,):
             raise ValueError(
-                f"Cannot project single-column categories onto positions {positions}; a single column has only "
-                "position 0."
+                f"Cannot project single-column labels onto positions {positions}; a single column has only position 0."
             )
-        return pd.Index(categories)
+        return labels
     if len(positions) == 1:
         return mi.get_level_values(positions[0])
     return pd.MultiIndex.from_arrays([mi.get_level_values(p) for p in positions])

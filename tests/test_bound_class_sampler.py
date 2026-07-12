@@ -164,9 +164,15 @@ def test_grouped_weighted_choice():
     assert (picks1 == 2).all(), "group-1 draws pick its only item"
 
 
-def test_inner_must_be_class_sampler():
-    with pytest.raises(TypeError, match="inner_sampler must be a BaseClassSampler"):
-        make_bound("not a sampler", np.repeat(["B", "T"], 100))
+def test_project_index_keeps_multiindex_and_cross_matches():
+    # positions=None returns the labels unchanged -- a MultiIndex stays a MultiIndex (not flattened to
+    # tuples) -- and it must still get_indexer-match an equivalent object-tuple Index. That cross-type
+    # match is what lets a chained bound match its MultiIndex vocab against object-tuple categories.
+    mi = pd.MultiIndex.from_tuples([("c1", "b1"), ("c1", "b2"), ("c2", "b1")])
+    proj = project_index(mi, None)
+    assert isinstance(proj, pd.MultiIndex), "a MultiIndex is preserved, not flattened"
+    obj = pd.Index([("c2", "b1"), ("c1", "b1")], tupleize_cols=False)  # same tuples, object dtype
+    assert proj.get_indexer(obj).tolist() == [2, 0], "MultiIndex <-> object-tuple Index cross-match"
 
 
 def test_bound_can_be_inner_of_another_bound():
@@ -231,6 +237,26 @@ def test_chained_bound_composes_columns():
         window = key[window_indices(lr)]
         for split in lr["splits"]:
             assert len(set(window[split].tolist())) == 1, "each batch coherent on (cellline, drug, batch)"
+
+
+def test_chained_bound_matches_whole_multiindex_vocab():
+    # bind on=None onto a mid-bound whose vocab is a MultiIndex (its joint (cellline, batch)). The
+    # whole-label path returns that MultiIndex as-is and must match the outer's object-tuple
+    # categories -- the exact MultiIndex <-> object-tuple case the direct `return labels` relies on.
+    cl = np.repeat(["c1", "c2"], 100)
+    ba = np.tile(np.repeat(["b1", "b2"], 50), 2)
+    inner = make_inner(cl, num_samples=200, seed=0)
+    mid = make_bound(inner, cl, on={0: 0}, classes=pd.Categorical(ba), class_weights=np.array([1.0, 1.0]), seed=1)
+    assert isinstance(mid.vocab, pd.MultiIndex), "the mid-bound's joint vocab is a MultiIndex"
+
+    joint = pd.Categorical(pd.MultiIndex.from_arrays([cl, ba]).to_flat_index())  # dataset C: object tuples
+    outer = make_bound(mid, joint, seed=2)  # on=None -> match the whole (cellline, batch) joint
+    assert outer.n_batches(0) == mid.n_batches(0)
+    key = joint.codes
+    for lr in outer.sample(len(joint)):
+        window = key[window_indices(lr)]
+        for split in lr["splits"]:
+            assert len(set(window[split].tolist())) == 1, "each batch coherent on the whole (cellline, batch) joint"
 
 
 def test_classes_to_bind_on_must_be_categorical():

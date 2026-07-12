@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
-from annbatch.abc import BaseClassSampler
 from annbatch.samplers._class_sampler import _RunClassSampler
 from annbatch.samplers._utils import (
     codes_of_categorical,
@@ -14,6 +15,9 @@ from annbatch.samplers._utils import (
     resolve_class_weights,
     to_level_arrays,
 )
+
+if TYPE_CHECKING:
+    from annbatch.abc import BaseClassSampler
 
 
 class BoundClassSampler(_RunClassSampler):
@@ -80,8 +84,6 @@ class BoundClassSampler(_RunClassSampler):
         mask: slice | None = None,
         rng: np.random.Generator | None = None,
     ):
-        if not isinstance(inner_sampler, BaseClassSampler):
-            raise TypeError("inner_sampler must be a BaseClassSampler.")
         if batch_size % chunk_size != 0:
             raise ValueError(
                 "batch_size must be a multiple of chunk_size so each batch replays one inner class as whole chunks. "
@@ -101,7 +103,7 @@ class BoundClassSampler(_RunClassSampler):
         # via MultiIndex.get_indexer, so construction stays vectorized even at ~100k categories.
         inner_proj = project_index(inner_sampler.vocab, inner_pos)
         cat_to_match, match_uniques = pd.factorize(project_index(classes_to_bind_on.categories, bind_pos))
-        match_obs_codes = cat_to_match[bind_codes]  # per-obs match code, vectorized
+        match_obs_codes = cat_to_match[bind_codes]  # per-obs match code
         inner_to_match = match_uniques.get_indexer(inner_proj)  # per inner category -> match code
 
         # Only match classes that actually occur in the obs matter for the subset/drawable rules:
@@ -121,6 +123,7 @@ class BoundClassSampler(_RunClassSampler):
             )
         # and every class the inner can emit must be present here, so it is drawable
         emittable_inner = inner_sampler.emittable_codes()
+        # the match classes the inner will ever ask this bound to produce
         emittable_match = inner_to_match[emittable_inner]
         drawable = np.isin(emittable_match, present_codes)  # np.isin treats the -1 "absent" code as not present
         if not drawable.all():
@@ -158,11 +161,12 @@ class BoundClassSampler(_RunClassSampler):
         classes: pd.Categorical | None,
         class_weights: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray, pd.Index]:
-        # caches _match_of_joint (joint class -> match class) and _weight_of_joint (joint class -> secondary weight)
+        # case 1: no secondary sampling
         if classes is None:
             if class_weights is not None:
                 raise ValueError("class_weights was given but classes is None; pass a secondary `classes` too.")
-            self._match_of_joint = np.arange(len(match_uniques), dtype=np.int64)
+            # identity mapping and uniform weighting
+            self._match_of_joint = np.arange(len(match_uniques))
             self._weight_of_joint = np.ones(len(match_uniques), dtype=float)
             drawable = np.isin(self._match_of_joint, emittable_match).astype(float)
             return match_obs_codes, drawable, match_uniques
