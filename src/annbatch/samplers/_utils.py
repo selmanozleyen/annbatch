@@ -102,7 +102,7 @@ def _as_multiindex(index: pd.Index) -> pd.MultiIndex | None:
     # None when the labels are single-column scalars. A MultiIndex passes through without a round-trip.
     if isinstance(index, pd.MultiIndex):
         return index
-    if len(index) and isinstance(index[0], tuple):
+    if len(index) > 0 and isinstance(index[0], tuple):
         return pd.MultiIndex.from_tuples(index)
     return None
 
@@ -154,7 +154,7 @@ def grouped_weighted_choice(
     group_of_draw: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Draw one item per request, weighted within the request's group -- vectorized.
+    """Draw one item per request, weighted within the request's group.
 
     Replaces a per-group ``rng.choice(items, p=weights)`` loop (``O(groups * items)``) with a single
     inverse-CDF lookup (``O(items log items)``): lay every group's items end to end on one number
@@ -194,12 +194,9 @@ def grouped_weighted_choice(
 
 
 def project_index(labels: pd.Index, positions: tuple[int, ...] | None) -> pd.Index:
-    """Project label tuples onto ``positions`` for vectorized label matching.
+    """Project label tuples onto ``positions``.
 
-    ``positions is None`` keeps the whole label. Multi-column labels are tuples, decomposed with a
-    :class:`pandas.MultiIndex` so both the projection and the downstream ``get_indexer`` stay
-    vectorized -- no per-label Python loop and no object hashing, which keeps construction fast at
-    ~100k labels. A single-column label is a scalar (its only position is ``0``).
+    ``positions is None`` keeps the whole label.
     """
     if positions is None:
         return labels
