@@ -52,6 +52,11 @@ class _RunClassSampler(BaseClassSampler):
     _class_runs: pd.DataFrame
     _per_class_sampling_info: pd.DataFrame
 
+    # Whether every kept run must hold at least one full chunk. Samplers that draw a random
+    # chunk-sized slice *within* a run (ClassSampler, BoundClassSampler) require it; a sequential
+    # full-run read (SequentialClassSampler) does not, so it opts out.
+    _enforce_run_length_rule: bool = True
+
     def __init__(
         self,
         *,
@@ -131,17 +136,19 @@ class _RunClassSampler(BaseClassSampler):
                 f"[{start}, {stop}); its renormalized weights would sum to zero."
             )
 
-        # run-length rule: every kept run must hold at least one full chunk
-        too_short_mask = runs["len"].to_numpy() < self._chunk_size
-        if np.any(too_short_mask):
-            bad = np.unique(runs.loc[too_short_mask, "cat"].to_numpy())
-            bad_labels = pd.Index(self._category_labels)[bad].tolist()
-            raise ValueError(
-                f"Every contiguous run must be at least chunk_size ({self._chunk_size}) observations long, "
-                f"but {int(too_short_mask.sum())} run(s) are shorter (classes {bad_labels}). "
-                "Re-chunk the data so each class's runs are large enough, lower chunk_size, "
-                "or exclude these classes with a zero weight."
-            )
+        # run-length rule: every kept run must hold at least one full chunk (only samplers that draw a
+        # random chunk-sized slice within a run need this; a sequential full-run read opts out).
+        if self._enforce_run_length_rule:
+            too_short_mask = runs["len"].to_numpy() < self._chunk_size
+            if np.any(too_short_mask):
+                bad = np.unique(runs.loc[too_short_mask, "cat"].to_numpy())
+                bad_labels = pd.Index(self._category_labels)[bad].tolist()
+                raise ValueError(
+                    f"Every contiguous run must be at least chunk_size ({self._chunk_size}) observations long, "
+                    f"but {int(too_short_mask.sum())} run(s) are shorter (classes {bad_labels}). "
+                    "Re-chunk the data so each class's runs are large enough, lower chunk_size, "
+                    "or exclude these classes with a zero weight."
+                )
 
         # Sort runs by class so each class's runs are contiguous in the table;
         # `first_row_in_runs_of_class` then indexes directly into the sorted run table.
