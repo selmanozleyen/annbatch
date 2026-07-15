@@ -654,6 +654,77 @@ class DatasetCollection:
             return pd.DataFrame()
         return pd.concat(obs_dfs)
 
+    def attach(self, sources: Iterable[PathLike[str] | str], *, check_integrity: bool = True) -> Self:
+        """Attach existing on-disk AnnData zarr stores as datasets via symlink (no data copy).
+
+        Each entry in ``sources`` is a path to an AnnData written as a zarr v3 store; it is
+        linked into this collection as ``dataset_{i}`` with a filesystem symlink, so no cell
+        data is copied or rewritten. This is the cheap way to assemble a collection from
+        stores produced independently (e.g. one grouped zarr per plate). New datasets are
+        numbered after any already attached, so repeated calls append.
+
+        With ``check_integrity`` (the default) every source must be a readable AnnData zarr
+        (``X``/``obs``/``var`` present) and share an identical ``var`` index with the other
+        sources and with any datasets already attached; otherwise a :class:`ValueError` (or
+        :class:`FileNotFoundError`) is raised and **nothing** is linked. On success the
+        collection is marked preshuffled (:data:`V1_ENCODING`), so :attr:`is_empty` becomes
+        ``False`` and it can be read like any other collection.
+
+        Only supported for zarr-backed collections on a local filesystem.
+
+        Parameters
+        ----------
+            sources
+                Paths to AnnData zarr stores to link into the collection as datasets.
+            check_integrity
+                Validate every source (readable AnnData zarr; matching ``var`` index) before
+                linking anything. Leave on unless the sources are already known-consistent.
+
+        Returns
+        -------
+            ``self``, so calls can be chained.
+        """
+        if not isinstance(self._group, zarr.Group):
+            raise ValueError("`attach` is only supported for zarr-backed collections, not h5ad folders.")
+        root = getattr(self._group.store, "root", None)
+        if root is None:
+            raise TypeError(
+                f"`attach` needs a local filesystem store to create symlinks, got {type(self._group.store).__name__}."
+            )
+        base = Path(root) / self._group.path
+        sources = [Path(s) for s in sources]
+        if not sources:
+            return self
+
+        def _var_index(g: zarr.Group) -> np.ndarray:
+            return np.asarray(ad.io.read_elem(g["var"]).index).astype(str)
+
+        if check_integrity:
+            existing = self._dataset_keys
+            ref = _var_index(self._group[existing[0]]) if existing else None
+            for s in sources:
+                if not s.exists():
+                    raise FileNotFoundError(f"`attach` source does not exist: {s}")
+                g = zarr.open_group(s, mode="r")
+                missing = [k for k in ("X", "obs", "var") if k not in g]
+                if missing:
+                    raise ValueError(f"`attach` source {s} is not a valid AnnData zarr (missing {missing}).")
+                v = _var_index(g)
+                if ref is None:
+                    ref = v
+                elif not np.array_equal(v, ref):
+                    raise ValueError(f"`attach` source {s} has a `var` index that does not match the collection.")
+
+        existing = self._dataset_keys
+        start = max((int(k.split("_")[1]) for k in existing), default=-1) + 1
+        for j, s in enumerate(sources):
+            link = base / f"{DATASET_PREFIX}_{start + j}"
+            if link.is_symlink() or link.exists():
+                raise FileExistsError(f"`attach` target already exists: {link}")
+            link.symlink_to(s.resolve())
+        self._group.attrs.update(V1_ENCODING)
+        return self
+
     @_with_settings
     def add_adatas(
         self,
