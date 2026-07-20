@@ -1010,12 +1010,16 @@ class Loader[
             # the split semantics are independent of how chunks were regrouped across datasets.
             # ``order`` is a permutation of ``range(n)``, so every used slot is overwritten -- the
             # reused buffer never carries stale values from a previous request.
+            # NB: this is the INVERSE permutation (scatter), not a gather. ``order`` maps a buffer
+            # position to its request-order position; ``inv`` must invert that. ``inv = positions[order]``
+            # is only correct when ``order`` is self-inverse (e.g. a single dataset, identity order), and
+            # silently pulls rows from the wrong dataset once chunks regroup across several datasets.
             n = order.size
             inv_buffer = np.empty(n, dtype=np.intp)
             if n > positions.size:
                 positions = np.arange(n, dtype=np.intp)
             inv = inv_buffer[:n]
-            inv = positions[order]
+            inv[order] = positions[:n]
 
             raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
 
