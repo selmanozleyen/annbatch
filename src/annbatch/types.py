@@ -34,6 +34,10 @@ class LoadRequest(TypedDict):
         How the in-memory data should be split into batches after it is read off disk and after all the chunks are loaded and concatenated in the order requested by `chunks`.
         A list of splits, last one may be partial but not empty i.e. 1 <= len(last_split) <= batch_size.
         If not provided, the sampler's batch_size property will be used to automatically generate splits.
+    combs
+        Optional per-batch category label, one entry aligned with ``splits`` (a class sampler emits the
+        combination each class-coherent batch was drawn from). When present, the loader surfaces it on
+        each yielded batch as ``comb``. Samplers with no notion of a class (e.g. random/sequential) omit it.
 
     Notes
     -----
@@ -49,12 +53,18 @@ class LoadRequest(TypedDict):
 
     requests: list[slice] | np.ndarray
     splits: NotRequired[list[np.ndarray]]
+    combs: NotRequired[list]
 
 
 class LoaderOutput[OutputInMemoryArray: OutputInMemoryArray_T](TypedDict):
-    """The output of the loader, the "data matrix" with its obs, optional, var, optional, and index, also optional."""
+    """The output of the loader, the "data matrix" with its obs, optional, var, optional, and index, also optional.
+
+    ``comb`` is present only when the batch sampler is class-based: it is the category label the
+    (class-coherent) batch was drawn from — a tuple for a multi-column grouping, otherwise the label.
+    """
 
     X: OutputInMemoryArray_T.__value__  # TODO: remove after sphinx 9 - myst compat
     obs: pd.DataFrame | None
     var: pd.DataFrame | None
     index: np.ndarray | None
+    comb: NotRequired[object]

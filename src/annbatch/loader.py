@@ -1034,15 +1034,19 @@ class Loader[
 
             concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_rows)
             in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(dataset_index_to_rows)
-            for split in splits:
+            combs = load_request.get("combs")  # per-split category label (class samplers only)
+            for i, split in enumerate(splits):
                 sel = inv[split]
                 data = in_memory_data[sel]
-                yield {
+                out: LoaderOutput = {
                     "X": data if self._to is None else convert(data, self._preload_to_gpu, self._to),
                     "obs": concatenated_obs.iloc[sel] if concatenated_obs is not None else None,
                     "var": self._var,
                     "index": in_memory_indices[sel] if in_memory_indices is not None else None,
                 }
+                if combs is not None:
+                    out["comb"] = combs[i]
+                yield out
 
             # https://github.com/cupy/cupy/issues/9625
             if self._preload_to_gpu and is_sparse:

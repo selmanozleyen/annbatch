@@ -10,7 +10,7 @@ import pandas as pd
 from annbatch.utils import check_lt_1, split_given_size
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
 
     from annbatch.types import LoadRequest
 
@@ -220,18 +220,26 @@ def iter_windows(
     batch_size: int,
     drop_last: bool,
     rng: np.random.Generator,
+    slice_combs: Sequence | None = None,
 ) -> Iterator[LoadRequest]:
-    # Group ``slices`` into preload windows and split each window into shuffled batches.
+    # Group ``slices`` into preload windows and split each window into shuffled batches. When
+    # ``slice_combs`` (one category label per slice) is given, tag each split with its combination
+    # (``combs``, aligned with ``splits``) so the loader can surface a per-batch ``comb``.
     window_size = preload_nchunks * chunk_size
     full_splits = split_given_size(np.arange(window_size), batch_size)
-    for window in itertools.batched(slices, preload_nchunks):
+    comb_windows = itertools.batched(slice_combs, preload_nchunks) if slice_combs is not None else itertools.repeat(None)
+    for window, window_combs in zip(itertools.batched(slices, preload_nchunks), comb_windows):
         n_rows = (len(window) - 1) * chunk_size + (window[-1].stop - window[-1].start)
         splits = full_splits if n_rows == window_size else split_given_size(np.arange(n_rows), batch_size)
         if drop_last and splits[-1].size < batch_size:
             splits = splits[:-1]
             if not splits:
                 continue
+        request: LoadRequest = {"requests": list(window), "splits": splits}
+        if window_combs is not None:
+            # each split is class-coherent, so its comb is the label of the slice its first row falls in
+            request["combs"] = [window_combs[(k * batch_size) // chunk_size] for k in range(len(splits))]
         for batch in splits:
             # can't vectorize this because we need to return a list, not ndarray
             rng.shuffle(batch)
-        yield {"requests": list(window), "splits": splits}
+        yield request

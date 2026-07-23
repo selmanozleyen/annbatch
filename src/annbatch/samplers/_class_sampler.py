@@ -256,6 +256,11 @@ class _RunClassSampler(BaseClassSampler):
             last = int(slice_starts[-1])
             slices[-1] = slice(last, last + remainder)
 
+        # Per-slice category label so the loader can tag each (class-coherent) batch with its combination.
+        # class_of_slice indexes _per_class_sampling_info, whose .index gives the code into the vocab.
+        category_codes = self._per_class_sampling_info.index.to_numpy()[class_of_slice]
+        slice_combs = list(self.vocab.take(category_codes))
+
         yield from iter_windows(
             slices,
             preload_nchunks=self._preload_nchunks,
@@ -263,6 +268,7 @@ class _RunClassSampler(BaseClassSampler):
             batch_size=self._batch_size,
             drop_last=self._drop_last,
             rng=self._split_rng,
+            slice_combs=slice_combs,
         )
 
 

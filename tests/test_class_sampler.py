@@ -210,6 +210,20 @@ def test_batches_are_class_coherent(chunk_size: int, batch_size: int, preload_nc
             assert np.unique(concat[split]).size == 1, "every batch must lie within a single class"
 
 
+def test_batch_combs_match_class():
+    # each split carries a `comb` (its class label), aligned with `splits`.
+    codes = np.repeat([0, 1, 2, 3], 100)
+    sampler = make_sampler(pd.Categorical(codes), num_samples=400, chunk_size=10, batch_size=10, preload_nchunks=4)
+    for load_request in sampler.sample(len(codes)):
+        combs = load_request["combs"]
+        splits = load_request["splits"]
+        assert len(combs) == len(splits), "one comb per split"
+        concat = np.concatenate([codes[s.start : s.stop] for s in load_request["requests"]])
+        for split, comb in zip(splits, combs, strict=True):
+            cls = np.unique(concat[split])
+            assert cls.size == 1 and comb == cls[0], "comb must equal the batch's class label"
+
+
 def test_shuffle_is_true():
     assert make_sampler(pd.Categorical(np.repeat([0, 1], 50))).shuffle is True
 
