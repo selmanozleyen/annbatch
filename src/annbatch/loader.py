@@ -1045,7 +1045,7 @@ class Loader[
                     "index": in_memory_indices[sel] if in_memory_indices is not None else None,
                 }
                 if combs is not None:
-                    out["comb"] = combs[i]
+                    out["label"] = combs[i]
                 yield out
 
             # https://github.com/cupy/cupy/issues/9625

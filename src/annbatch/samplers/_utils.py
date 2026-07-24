@@ -224,7 +224,7 @@ def iter_windows(
 ) -> Iterator[LoadRequest]:
     # Group ``slices`` into preload windows and split each window into shuffled batches. When
     # ``slice_combs`` (one category label per slice) is given, tag each split with its combination
-    # (``combs``, aligned with ``splits``) so the loader can surface a per-batch ``comb``.
+    # (``combs``, aligned with ``splits``) so the loader can surface a per-batch ``label``.
     window_size = preload_nchunks * chunk_size
     full_splits = split_given_size(np.arange(window_size), batch_size)
     comb_windows = itertools.batched(slice_combs, preload_nchunks) if slice_combs is not None else itertools.repeat(None)

@@ -37,7 +37,7 @@ class LoadRequest(TypedDict):
     combs
         Optional per-batch category label, one entry aligned with ``splits`` (a class sampler emits the
         combination each class-coherent batch was drawn from). When present, the loader surfaces it on
-        each yielded batch as ``comb``. Samplers with no notion of a class (e.g. random/sequential) omit it.
+        each yielded batch as ``label``. Samplers with no notion of a class (e.g. random/sequential) omit it.
 
     Notes
     -----
@@ -59,7 +59,7 @@ class LoadRequest(TypedDict):
 class LoaderOutput[OutputInMemoryArray: OutputInMemoryArray_T](TypedDict):
     """The output of the loader, the "data matrix" with its obs, optional, var, optional, and index, also optional.
 
-    ``comb`` is present only when the batch sampler is class-based: it is the category label the
+    ``label`` is present only when the batch sampler is class-based: it is the category label the
     (class-coherent) batch was drawn from — a tuple for a multi-column grouping, otherwise the label.
     """
 
@@ -67,4 +67,4 @@ class LoaderOutput[OutputInMemoryArray: OutputInMemoryArray_T](TypedDict):
     obs: pd.DataFrame | None
     var: pd.DataFrame | None
     index: np.ndarray | None
-    comb: NotRequired[object]
+    label: NotRequired[object]
