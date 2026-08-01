@@ -855,7 +855,9 @@ _N0 = 200
                 "batch_size": 10,
                 "preload_nchunks": 2,
                 "chunk_size": 10,
-                "requests": np.concatenate([np.arange(_N0, _N0 + 10), np.arange(0, 10)]),  # split 0 from ds1, split 1 from ds0
+                "requests": np.concatenate(
+                    [np.arange(_N0, _N0 + 10), np.arange(0, 10)]
+                ),  # split 0 from ds1, split 1 from ds0
                 "splits": [np.arange(0, 10), np.arange(10, 20)],
             },
             id="whole-chunk-swap",
@@ -868,7 +870,7 @@ _N0 = 200
                 "preload_nchunks": 2,
                 "chunk_size": 2,
                 "requests": np.array([0, _N0, _N0 + 1, 1]),
-                "splits": [np.array([0, 1]), np.array([2, 3])], 
+                "splits": [np.array([0, 1]), np.array([2, 3])],
             },
             id="scattered-across-datasets",
         ),
@@ -891,7 +893,9 @@ def test_splits_map_to_their_rows_across_datasets(
 
     batches = list(loader)
     # X follows the index: every yielded row is exactly the on-disk row it claims to be i.e., the requests/splits provided
-    assert [list(b["index"]) for b in batches] == [list(sampler_info["requests"][split]) for split in sampler_info["splits"]]
+    assert [list(b["index"]) for b in batches] == [
+        list(sampler_info["requests"][split]) for split in sampler_info["splits"]
+    ]
     for batch in batches:
         for row, idx in zip(np.asarray(batch["X"]), batch["index"], strict=True):
             expected = data0["dataset"][idx] if idx < n0 else data1["dataset"][idx - n0]
