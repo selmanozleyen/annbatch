@@ -861,6 +861,7 @@ _N0 = 200
             id="whole-chunk-swap",
         ),
         # Single-row requests interleaved [ds0, ds1, ds1, ds0], each batch spanning *both* datasets.
+        # See https://github.com/scverse/annbatch/issues/256
         pytest.param(
             {
                 "batch_size": 2,
