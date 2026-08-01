@@ -847,64 +847,50 @@ _N0 = 200
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "expected_index_sets"),
+    "sampler_info",
     [
-        # Two whole chunks, dataset 1's chunk requested *before* dataset 0's. The loader's in-memory
-        # buffer is grouped by dataset (here the reverse of chunk order), so each split must be
-        # remapped back to chunk order. This grouping permutation is a plain swap (an involution), so
-        # gather and scatter coincide -- this case only guards the chunk-order remap itself.
+        # Two whole chunks, dataset 1's chunk requested *before* dataset 0's.
         pytest.param(
             {
                 "batch_size": 10,
                 "preload_nchunks": 2,
                 "chunk_size": 10,
-                "requests": [slice(_N0, _N0 + 10), slice(0, 10)],  # split 0 from ds1, split 1 from ds0
+                "requests": np.concatenate([np.arange(_N0, _N0 + 10), np.arange(0, 10)]),  # split 0 from ds1, split 1 from ds0
                 "splits": [np.arange(0, 10), np.arange(10, 20)],
             },
-            [set(range(_N0, _N0 + 10)), set(range(0, 10))],
             id="whole-chunk-swap",
         ),
         # Single-row requests interleaved [ds0, ds1, ds1, ds0], each batch spanning *both* datasets.
-        # This grouping permutation is *not* its own inverse, so a scattered split must map through the
-        # *inverse* -- a scatter `inv[order] = positions`, not a gather `inv = positions[order]`. Under
-        # the gather bug each batch picks up a row from the wrong dataset; the swap case can't catch it.
         pytest.param(
             {
                 "batch_size": 2,
                 "preload_nchunks": 2,
                 "chunk_size": 2,
-                "requests": np.array([0, _N0, _N0 + 1, 1]),  # scattered single rows (chunk_size=1 style)
-                "splits": [np.array([0, 1]), np.array([2, 3])],  # split 0 -> {0, _N0}, split 1 -> {_N0 + 1, 1}
+                "requests": np.array([0, _N0, _N0 + 1, 1]),
+                "splits": [np.array([0, 1]), np.array([2, 3])], 
             },
-            [{0, _N0}, {_N0 + 1, 1}],
             id="scattered-across-datasets",
         ),
     ],
 )
 def test_splits_map_to_their_rows_across_datasets(
     adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path],
-    kwargs: dict,
-    expected_index_sets: list[set[int]],
+    sampler_info: dict,
 ):
-    """Each split selects exactly its own rows once the loader undoes its dataset-grouped buffer layout.
-
-    The in-memory buffer is grouped by dataset, so splits (indexed in chunk order) must be remapped
-    back. Both cases pin down the split->row mapping across datasets; see each param for the extra bug
-    it guards (chunk-order remap vs. the inverse permutation for scattered splits).
-    """
+    """Uses a sampler that emits fixed requests/splits to verify correctness when requesting within/across datasets."""
     paths = sorted(adata_with_zarr_path_same_var_space[1].glob("*.zarr"))
     data0, data1 = open_dense(paths[0]), open_dense(paths[1])
     n0 = data0["dataset"].shape[0]  # ds0 -> global [0, n0) ; ds1 -> global [n0, ...)
     assert n0 == _N0, "fixture size drifted; update _N0 and the parametrized requests"
 
-    sampler = _FixedRequestSampler(**kwargs)
+    sampler = _FixedRequestSampler(**sampler_info)
     loader = Loader(batch_sampler=sampler, return_index=True, preload_to_gpu=False, to=None)
     loader.add_dataset(dataset=data0["dataset"], obs=data0.get("obs", None), var=data0.get("var", None))
     loader.add_dataset(dataset=data1["dataset"], obs=data1.get("obs", None), var=data1.get("var", None))
 
     batches = list(loader)
-    assert [set(b["index"]) for b in batches] == expected_index_sets, "split->row mapping is wrong"
-    # X follows the index: every yielded row is exactly the on-disk row it claims to be
+    # X follows the index: every yielded row is exactly the on-disk row it claims to be i.e., the requests/splits provided
+    assert [list(b["index"]) for b in batches] == [list(sampler_info["requests"][split]) for split in sampler_info["splits"]]
     for batch in batches:
         for row, idx in zip(np.asarray(batch["X"]), batch["index"], strict=True):
             expected = data0["dataset"][idx] if idx < n0 else data1["dataset"][idx - n0]
