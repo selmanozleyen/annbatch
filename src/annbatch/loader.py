@@ -1035,7 +1035,7 @@ class Loader[
             if n > positions.size:
                 positions = np.arange(n, dtype=np.intp)
             inv = inv_buffer[:n]
-            inv = positions[order]
+            inv[order] = positions[:n]
 
             raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
 
