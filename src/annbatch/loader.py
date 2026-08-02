@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import OrderedDict
 from functools import singledispatchmethod
 from importlib.metadata import version
@@ -45,6 +46,12 @@ type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
 zarr_version = Version(version("zarr"))
 
 Default = object()
+
+
+# Route backed-sparse reads through anndata's own CSRDataset reader
+# instead of annbatch's hand-rolled gather. Off by default so both are
+# measurable from one build.
+_USE_ANNDATA_FETCH = os.environ.get("ANNBATCH_ANNDATA_FETCH", "") not in ("", "0")
 
 
 class CSRDatasetElems(NamedTuple):
@@ -904,6 +911,26 @@ class Loader[
             ),
         )
 
+    @_fetch_data.register
+    async def _fetch_data_anndata_csr(
+        self, dataset: ad.abc.CSRDataset, rows: np.ndarray, out: CSRContainer
+    ) -> None:
+        """Fetch via anndata's own reader rather than annbatch's gather.
+
+        `CSRDataset.__getitem__` -> `get_compressed_vectors` ->
+        `zarr.Array[coords]`, i.e. the path every anndata user gets. It is
+        synchronous, so it goes to a thread: annbatch gathers the per-dataset
+        fetches concurrently and blocking the event loop here would serialise
+        them, which is the whole thing this path needs to keep.
+
+        anndata allocates its own arrays rather than writing into `out`, so the
+        result is copied in. That copy is ~35 MB per 4096-row fetch, ~0.3% of
+        the fetch, and buys not maintaining a second implementation.
+        """
+        mtx = await asyncio.to_thread(dataset.__getitem__, rows)
+        out.elems[0][:] = mtx.data
+        out.elems[1][:] = mtx.indices
+
     async def _index_datasets(
         self,
         dataset_index_to_rows: OrderedDict[int, np.ndarray],
@@ -924,7 +951,9 @@ class Loader[
             per_dataset_outs = self._allocate_per_dataset_outs(dataset_index_to_rows)
             tasks = [
                 self._fetch_data(
-                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
+                    self._train_datasets[dataset_idx]
+                    if (is_backed_sparse and _USE_ANNDATA_FETCH) or not is_backed_sparse
+                    else self._get_elem_from_cache(dataset_idx),
                     rows,
                     per_dataset_outs[dataset_idx],
                 )
@@ -968,7 +997,9 @@ class Loader[
 
             tasks.append(
                 self._fetch_data(
-                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
+                    self._train_datasets[dataset_idx]
+                    if (is_backed_sparse and _USE_ANNDATA_FETCH) or not is_backed_sparse
+                    else self._get_elem_from_cache(dataset_idx),
                     rows,
                     out_view,
                 )
