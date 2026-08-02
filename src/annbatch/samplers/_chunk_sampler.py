@@ -180,7 +180,10 @@ class _ChunkSampler(Sampler):
             yield {"requests": request_slices, "splits": split_batch_indices}
         # On the last yield, drop the last uneven batch and create new batch_indices since the in-memory size of this last yield could be divisible by batch_size but smaller than preload_nchunks * chunk_size
         final_slices = slices_per_request[-1]
-        total_obs_in_last_batch = int(sum(s.stop - s.start for s in final_slices))
+        if isinstance(final_slices, np.ndarray) and np.issubdtype(final_slices.dtype, np.integer):
+            total_obs_in_last_batch = len(final_slices)
+        else:
+            total_obs_in_last_batch = int(sum(s.stop - s.start if isinstance(s, slice) else 1 for s in final_slices))
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:
@@ -191,7 +194,7 @@ class _ChunkSampler(Sampler):
         batch_indices = split_given_size(indices, self.batch_size)
         yield {"requests": final_slices, "splits": batch_indices}
 
-    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice] | np.ndarray:
         """Compute slices from start and stop indices.
 
         Slices are computed such that the last slice may be incomplete.
@@ -203,8 +206,12 @@ class _ChunkSampler(Sampler):
 
     def _compute_slices_with_replacement(
         self, start: int, stop: int, n_obs: int, rng: np.random.Generator
-    ) -> list[slice]:
+    ) -> list[slice] | np.ndarray:
         """Draw random slice positions with replacement."""
+        if self._chunk_size == 1:
+            num_samples = self._resolve_num_samples(n_obs)
+            return rng.integers(start, stop, size=num_samples)
+
         num_samples = self._resolve_num_samples(n_obs)
         n_slices, remainder = divmod(num_samples, self._chunk_size)
         start_indices = rng.integers(start, stop - self._chunk_size + 1, size=n_slices)
@@ -214,12 +221,20 @@ class _ChunkSampler(Sampler):
             res.append(slice(start_index, start_index + remainder))
         return res
 
-    def _compute_slices_without_replacement(self, start: int, stop: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_slices_without_replacement(
+        self, start: int, stop: int, rng: np.random.Generator
+    ) -> list[slice] | np.ndarray:
         """Compute slices covering the full range exactly once.
 
         The incomplete slice (slice that is less than chunk_size) is always placed last in iteration order regardless
         of shuffling -- ensuring no observation is duplicated.
         """
+        if self._chunk_size == 1:
+            slice_indices = np.arange(start, stop, dtype=np.int64)
+            if self.shuffle:
+                rng.shuffle(slice_indices)
+            return slice_indices
+
         slice_indices = np.arange(math.ceil((stop - start) / self._chunk_size))
         if self.shuffle:
             rng.shuffle(slice_indices)

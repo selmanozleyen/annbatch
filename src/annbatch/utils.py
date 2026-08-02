@@ -57,9 +57,13 @@ def split_given_size(a: np.ndarray, size: int) -> list[np.ndarray]:
     return np.split(a, np.arange(size, len(a), size))
 
 
-def interval_indexer_from_slices(slices: Iterable[slice]) -> pd.IntervalIndex:
-    """Generate an IntervalIndex from a list of slices representing start-stop bounds."""
-    len_bounds = list(itertools.accumulate((sum(s.stop - s.start for s in v) for v in slices), initial=0))
+def interval_indexer_from_slices(slices: Iterable[slice | int]) -> pd.IntervalIndex:
+    """Generate an IntervalIndex from a list of slices/integers representing start-stop bounds."""
+    len_bounds = list(
+        itertools.accumulate(
+            (sum(s.stop - s.start if isinstance(s, slice) else 1 for s in v) for v in slices), initial=0
+        )
+    )
     starts = len_bounds[:-1]
     ends = len_bounds[1:]
     return pd.IntervalIndex.from_tuples(

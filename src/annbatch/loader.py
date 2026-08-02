@@ -204,6 +204,7 @@ class Loader[
         to: Literal["torch", "jax"] | None = Default,  # type: ignore
         rng: np.random.Generator | None = None,
     ):
+
         # args that are passed after resolving defaults
         core_sampler_args = {
             "chunk_size": chunk_size,
@@ -846,24 +847,48 @@ class Loader[
     ) -> None:
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
         # for the inspiration of this function.
-        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        row_runs = np.split(rows, breaks)
         indptr, indices, data = dataset
-        indptr_indices = [indptr[slice(s[0], s[-1] + 2)] for s in row_runs]
-        indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
-        indexer_data, indexer_indices = (
-            MultiBasicIndexer(
-                [
-                    zarr.core.indexing.BasicIndexer(
-                        (l,),
-                        shape=arr.metadata.shape,
-                        chunk_grid=arr.metadata.chunk_grid if zarr_version <= Version("3.1.6") else arr._chunk_grid,
-                    )
-                    for l in indptr_limits
-                ]
+        if isinstance(rows, np.ndarray) and np.issubdtype(rows.dtype, np.integer):
+            row_starts = indptr[rows]
+            row_ends = indptr[rows + 1]
+            row_nnzs = row_ends - row_starts
+            total_nnz = int(row_nnzs.sum())
+            if total_nnz == 0:
+                nnz_coords = np.empty(0, dtype=np.int64)
+            else:
+                nnz_coords = np.empty(total_nnz, dtype=np.int64)
+                pos = 0
+                for s, e in zip(row_starts, row_ends, strict=True):
+                    n = int(e - s)
+                    if n > 0:
+                        nnz_coords[pos : pos + n] = np.arange(s, e, dtype=np.int64)
+                        pos += n
+            indexer_data, indexer_indices = (
+                zarr.core.indexing.CoordinateIndexer(
+                    (nnz_coords,),
+                    shape=arr.metadata.shape,
+                    chunk_grid=arr.metadata.chunk_grid if zarr_version <= Version("3.1.6") else arr._chunk_grid,
+                )
+                for arr in [data, indices]
             )
-            for arr in [data, indices]
-        )
+        else:
+            breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+            row_runs = np.split(rows, breaks)
+            indptr_indices = [indptr[slice(s[0], s[-1] + 2)] for s in row_runs]
+            indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
+            indexer_data, indexer_indices = (
+                MultiBasicIndexer(
+                    [
+                        zarr.core.indexing.BasicIndexer(
+                            (l,),
+                            shape=arr.metadata.shape,
+                            chunk_grid=arr.metadata.chunk_grid if zarr_version <= Version("3.1.6") else arr._chunk_grid,
+                        )
+                        for l in indptr_limits
+                    ]
+                )
+                for arr in [data, indices]
+            )
 
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
         await asyncio.gather(
@@ -986,8 +1011,6 @@ class Loader[
             ["Number of datasets", "Number of observations"],
         )
         is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset | sp.csr_matrix | sp.csr_array)
-        # Create `positions` variable so we don't need to run `np.arange` (O(n)) every time
-        positions = np.empty(0, dtype=np.intp)
         for load_request in self._batch_sampler.sample(self.n_obs):
             requests_to_load = load_request.get("requests", None)
             if requests_to_load is None:
@@ -1003,19 +1026,35 @@ class Loader[
                     raise KeyError("load_request must contain either 'requests' or 'chunks'.")
             splits = load_request["splits"]
 
-            dataset_index_to_rows, order = self._requests_to_dataset_rows(requests_to_load)
+            is_integer_req = (
+                isinstance(requests_to_load, np.ndarray) and np.issubdtype(requests_to_load.dtype, np.integer)
+            ) or (
+                isinstance(requests_to_load, list)
+                and len(requests_to_load) > 0
+                and isinstance(requests_to_load[0], (int, np.integer))
+            )
 
-            # The buffer below is filled in dataset order, but ``splits`` are expressed in the
-            # sampler's `LoadRequest.request` order. ``inv`` maps a request-order position to its buffer position so
-            # the split semantics are independent of how chunks were regrouped across datasets.
-            # ``order`` is a permutation of ``range(n)``, so every used slot is overwritten -- the
-            # reused buffer never carries stale values from a previous request.
+            if is_integer_req:
+                if isinstance(requests_to_load, np.ndarray):
+                    raw_rows = requests_to_load
+                else:
+                    raw_rows = np.array(requests_to_load, dtype=np.int64)
+
+                sort_order = np.argsort(raw_rows, kind="stable")
+                sorted_rows = raw_rows[sort_order]
+                sort_inverse = np.empty_like(sort_order)
+                sort_inverse[sort_order] = np.arange(len(sort_order), dtype=np.intp)
+
+                input_requests = sorted_rows
+            else:
+                input_requests = requests_to_load
+
+            dataset_index_to_rows, order = self._requests_to_dataset_rows(input_requests)
+
+            # buffer_inverse maps dataset-sorted positions to input_requests positions
             n = order.size
-            inv_buffer = np.empty(n, dtype=np.intp)
-            if n > positions.size:
-                positions = np.arange(n, dtype=np.intp)
-            inv = inv_buffer[:n]
-            inv = positions[order]
+            buffer_inverse = np.empty(n, dtype=np.intp)
+            buffer_inverse[order] = np.arange(n, dtype=np.intp)
 
             raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
 
@@ -1031,7 +1070,12 @@ class Loader[
             concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_rows)
             in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(dataset_index_to_rows)
             for split in splits:
-                sel = inv[split]
+                if is_integer_req:
+                    sorted_split = sort_inverse[split]
+                    sel = buffer_inverse[sorted_split]
+                else:
+                    sel = buffer_inverse[split]
+
                 data = in_memory_data[sel]
                 yield {
                     "X": data if self._to is None else convert(data, self._preload_to_gpu, self._to),
