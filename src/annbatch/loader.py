@@ -25,7 +25,7 @@ from annbatch.utils import (
     check_lt_1,
     check_var_shapes,
     convert,
-    load_x_and_obs_and_var,
+    load_all_aligned,
     validate_sampler,
     warn_ignored_obs_aligned,
 )
@@ -355,7 +355,7 @@ class Loader[
         self,
         collection: DatasetCollection,
         *,
-        load_adata: Callable[[zarr.Group], ad.AnnData] = load_x_and_obs_and_var,
+        load_adata: Callable[[zarr.Group], ad.AnnData] = load_all_aligned,
     ) -> Self:
         """Load from an existing :class:`annbatch.DatasetCollection`.
 
@@ -367,11 +367,11 @@ class Loader[
             The collection whose on-disk datasets should be used in this loader.
         load_adata
             A custom load function - recall that whatever is found in :attr:`~anndata.AnnData.X` and :attr:`~anndata.AnnData.obs` will be yielded in batches.
-            The default loads only `X`, `obs`, and `var`. For now any :attr:`~anndata.AnnData.obsm`,
-            :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements present on disk are
-            ignored and a :class:`FutureWarning` is emitted; a future release will additionally load and yield
-            them. To silence that warning (and keep only what you need), pass a custom ``load_adata`` that
-            returns just `X`/`obs`/`var`.
+            The default loads everything observation-aligned, but only `X`, `obs`, and `var` are yielded for now:
+            any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers`
+            elements are dropped and a :class:`FutureWarning` is emitted; a future release will yield them too.
+            To silence that warning (and keep only what you need), pass a custom ``load_adata`` that returns
+            just `X`/`obs`/`var`.
         """
         if collection.is_empty:
             raise ValueError("DatasetCollection is empty")
@@ -417,16 +417,7 @@ class Loader[
         return self
 
     def _add_adata_unchecked(self, adata: ad.AnnData) -> Self:
-        warn_ignored_obs_aligned(
-            [
-                f"{elem}/{key}"
-                for elem, mapping in (("obsm", adata.obsm), ("obsp", adata.obsp), ("layers", adata.layers))
-                for key in mapping
-                # a backed AnnData exposes a `None` key in `.layers` mirroring `X` (not a real layer); drop it
-                if key is not None
-            ],
-            stacklevel=3,
-        )
+        warn_ignored_obs_aligned(adata, stacklevel=3)
         dataset, obs, var = self._prepare_dataset_obs_and_var(adata)
         self._add_dataset_unchecked(dataset, obs, var)
         return self

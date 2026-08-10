@@ -16,6 +16,7 @@ from scipy.sparse import random as sparse_random
 
 from annbatch import write_sharded
 from annbatch.io import DatasetCollection
+from annbatch.utils import _read_backed
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -30,12 +31,12 @@ def load_x_obs_var(g: zarr.Group) -> ad.AnnData:
     """Load only ``X``/``obs``/``var`` from a group, without the transitional obsm/obsp/layers ``FutureWarning``.
 
     Tests that don't exercise ``obsm``/``obsp``/``layers`` pass this as ``load_adata`` to opt out of the
-    (currently warning) default loader :func:`annbatch.utils.load_x_and_obs_and_var`. TODO(obsm): once the
+    (currently warning) default loader :func:`annbatch.utils.load_all_aligned`. TODO(obsm): once the
     loader yields those elements, revisit the call sites of this helper to also cover them.
     """
     var = g["var"]
     return ad.AnnData(
-        X=g["X"] if isinstance(g["X"], zarr.Array) else ad.io.sparse_dataset(g["X"]),
+        X=_read_backed(g["X"]),
         obs=ad.io.read_elem(g["obs"]),
         var=pd.DataFrame(index=pd.Index(ad.io.read_elem(var[var.attrs.get("_index")]))),
     )

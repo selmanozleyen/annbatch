@@ -6,7 +6,7 @@ import re
 import warnings
 from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, overload
+from typing import TYPE_CHECKING, Any, Concatenate, Literal, Protocol, overload
 
 import anndata as ad
 import numpy as np
@@ -243,13 +243,19 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
     raise TypeError(f"Cannot convert {type(input)} to torch.Tensor")
 
 
-def warn_ignored_obs_aligned(ignored: list[str], *, stacklevel: int) -> None:
-    """Warn that observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now.
+def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
+    """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now.
 
-    ``ignored`` is a list of ``"<elem>/<key>"`` names that are being discarded. The warning is
-    emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated calls -
-    e.g. over a whole collection via :meth:`Dataset.add_adatas` - do not spam identical warnings.
+    The warning is emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated
+    calls - e.g. over a whole collection via :meth:`Loader.add_adatas` - do not spam identical warnings.
     """
+    ignored = [
+        f"{elem}/{key}"
+        for elem in ("obsm", "obsp", "layers")
+        for key in getattr(adata, elem)
+        # a backed AnnData exposes a `None` key in `.layers` mirroring `X` (not a real layer); drop it
+        if key is not None
+    ]
     if not ignored:
         return
     msg = (
@@ -263,21 +269,26 @@ def warn_ignored_obs_aligned(ignored: list[str], *, stacklevel: int) -> None:
     warnings.filterwarnings("ignore", message=re.escape(msg), category=FutureWarning)
 
 
-def load_x_and_obs_and_var(g: zarr.Group) -> ad.AnnData:
-    """Load X as a sparse array or dense zarr array and obs from a group.
+def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
+    """Back dense/sparse arrays by the store; read anything else (e.g. a dataframe in `obsm`) into memory."""
+    if isinstance(elem, zarr.Array):
+        return elem
+    if elem.attrs.get("encoding-type") in {"csr_matrix", "csc_matrix"}:
+        return ad.io.sparse_dataset(elem)
+    return ad.io.read_elem(elem)
+
+
+def load_all_aligned(g: zarr.Group) -> ad.AnnData:
+    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible.
 
     .. note::
-        For now only ``X``, ``obs``, and ``var`` are loaded; any observation-aligned ``obsm``, ``obsp``,
-        and ``layers`` elements found on disk are ignored and a :class:`FutureWarning` is emitted. A future
-        release will additionally load and yield them.
+        ``obsm``, ``obsp``, and ``layers`` are loaded but not yet yielded in batches - :class:`~annbatch.Loader`
+        drops them with a :class:`FutureWarning` for now. A future release will yield them as well.
     """
-    warn_ignored_obs_aligned(
-        [f"{elem}/{key}" for elem in ("obsm", "obsp", "layers") if elem in g for key in g[elem]],
-        stacklevel=2,
-    )
     var = g["var"]
     return ad.AnnData(
-        X=g["X"] if isinstance(g["X"], zarr.Array) else ad.io.sparse_dataset(g["X"]),
+        X=_read_backed(g["X"]),
         obs=ad.io.read_elem(g["obs"]),
         var=pd.DataFrame(index=pd.Index(ad.io.read_elem(var[var.attrs.get("_index")]))),
+        **{elem: {k: _read_backed(g[elem][k]) for k in g[elem]} for elem in ("obsm", "obsp", "layers") if elem in g},
     )

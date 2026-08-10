@@ -310,7 +310,7 @@ def expect_transitional_warning(*, present: bool):
 def test_use_collection_transitional_warning(
     simple_collection: tuple[ad.AnnData, DatasetCollection], *, custom_loader: bool
 ):
-    """`use_collection` defaults to `load_x_and_obs_and_var` (warns on obsm/layers); a custom loader opts out."""
+    """`use_collection` defaults to `load_all_aligned` (warns on obsm/layers); a custom loader opts out."""
     _, collection = simple_collection
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
     # the collection has obsm/layers on disk, so the default loader warns while the X/obs/var-only loader does not
