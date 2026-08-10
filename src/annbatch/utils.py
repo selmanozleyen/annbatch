@@ -246,6 +246,9 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
 def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
     """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now.
 
+    TODO(obsm): delete this function - and its call in :meth:`Loader._add_adata_unchecked` - once
+    :class:`~annbatch.Loader` yields these elements.
+
     The warning is emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated
     calls - e.g. over a whole collection via :meth:`Loader.add_adatas` - do not spam identical warnings.
     """
@@ -284,6 +287,8 @@ def load_all_aligned(g: zarr.Group) -> ad.AnnData:
     .. note::
         ``obsm``, ``obsp``, and ``layers`` are loaded but not yet yielded in batches - :class:`~annbatch.Loader`
         drops them with a :class:`FutureWarning` for now. A future release will yield them as well.
+
+    TODO(obsm): drop the note above once these elements are yielded.
     """
     var = g["var"]
     return ad.AnnData(

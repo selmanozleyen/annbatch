@@ -417,6 +417,7 @@ class Loader[
         return self
 
     def _add_adata_unchecked(self, adata: ad.AnnData) -> Self:
+        # TODO(obsm): drop this call - and `warn_ignored_obs_aligned` - once these elements are yielded
         warn_ignored_obs_aligned(adata, stacklevel=3)
         dataset, obs, var = self._prepare_dataset_obs_and_var(adata)
         self._add_dataset_unchecked(dataset, obs, var)
@@ -425,6 +426,7 @@ class Loader[
     def _prepare_dataset_obs_and_var(
         self, adata: ad.AnnData
     ) -> tuple[BackingArray, pd.DataFrame | None, pd.DataFrame | None]:
+        # TODO(obsm): this is where `obsm`/`obsp`/`layers` get dropped - carry them through to yield them
         dataset = adata.X
         obs = adata.obs
         var = adata.var
