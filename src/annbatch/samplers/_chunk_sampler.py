@@ -142,7 +142,7 @@ class _ChunkSampler(Sampler):
     def _iter_from_slices(
         self,
         n_obs: int,
-        slices: list[slice],
+        slices: list[slice] | np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -161,7 +161,7 @@ class _ChunkSampler(Sampler):
 
     def _iter_from_slices_base(
         self,
-        slices: list[slice],
+        slices: list[slice] | np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -180,7 +180,11 @@ class _ChunkSampler(Sampler):
             yield {"requests": request_slices, "splits": split_batch_indices}
         # On the last yield, drop the last uneven batch and create new batch_indices since the in-memory size of this last yield could be divisible by batch_size but smaller than preload_nchunks * chunk_size
         final_slices = slices_per_request[-1]
-        total_obs_in_last_batch = int(sum(s.stop - s.start for s in final_slices))
+        total_obs_in_last_batch = (
+            int(final_slices.size)
+            if self._chunk_size == 1
+            else int(sum(s.stop - s.start for s in final_slices))
+        )
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:
@@ -191,10 +195,12 @@ class _ChunkSampler(Sampler):
         batch_indices = split_given_size(indices, self.batch_size)
         yield {"requests": final_slices, "splits": batch_indices}
 
-    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice] | np.ndarray:
         """Compute slices from start and stop indices.
 
-        Slices are computed such that the last slice may be incomplete.
+        Slices are computed such that the last slice may be incomplete. At
+        ``chunk_size == 1`` an integer index array is returned instead, which the
+        loader consumes directly.
         """
         start, stop = self._resolve_start_stop(n_obs)
         if self._replacement:
@@ -203,9 +209,15 @@ class _ChunkSampler(Sampler):
 
     def _compute_slices_with_replacement(
         self, start: int, stop: int, n_obs: int, rng: np.random.Generator
-    ) -> list[slice]:
+    ) -> list[slice] | np.ndarray:
         """Draw random slice positions with replacement."""
         num_samples = self._resolve_num_samples(n_obs)
+        if self._chunk_size == 1:
+            # One row per chunk is the same draw, and the loader takes an integer
+            # array directly -- see `_requests_to_dataset_rows`. Going through
+            # slices would build a Python object per row here and unpack it with a
+            # one-element `arange` per row there.
+            return rng.integers(start, stop, size=num_samples)
         n_slices, remainder = divmod(num_samples, self._chunk_size)
         start_indices = rng.integers(start, stop - self._chunk_size + 1, size=n_slices)
         res = [slice(int(s), int(s + self._chunk_size)) for s in start_indices]
@@ -214,12 +226,23 @@ class _ChunkSampler(Sampler):
             res.append(slice(start_index, start_index + remainder))
         return res
 
-    def _compute_slices_without_replacement(self, start: int, stop: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_slices_without_replacement(
+        self, start: int, stop: int, rng: np.random.Generator
+    ) -> list[slice] | np.ndarray:
         """Compute slices covering the full range exactly once.
 
         The incomplete slice (slice that is less than chunk_size) is always placed last in iteration order regardless
         of shuffling -- ensuring no observation is duplicated.
         """
+        if self._chunk_size == 1:
+            # Every chunk is one row, so the layout IS the index array: there is no
+            # incomplete tail to place last, and the loader indexes with integers
+            # anyway. Building `slice` objects instead costs one Python object per
+            # observation -- 100M of them, and ~15 GB, for a 100M-row collection.
+            indices = np.arange(start, stop)
+            if self.shuffle:
+                rng.shuffle(indices)
+            return indices
         slice_indices = np.arange(math.ceil((stop - start) / self._chunk_size))
         if self.shuffle:
             rng.shuffle(slice_indices)
