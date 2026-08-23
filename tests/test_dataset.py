@@ -924,3 +924,83 @@ def test_chunks_deprecation_warning(
         batches = list(loader)
 
     assert len(batches) == 1
+
+
+def _backed_csrs(tmp_path: Path, sizes: tuple[int, ...] = (120, 90, 150)):
+    """Several uneven backed CSR datasets, plus the dense matrix they concatenate to."""
+    refs, datasets = [], []
+    for i, n_obs in enumerate(sizes):
+        mtx = sp.random(n_obs, 24, density=0.3, format="csr", random_state=i)
+        group = zarr.open_group(tmp_path / f"p{i}.zarr", mode="w")
+        ad.io.write_elem(group, "X", mtx)
+        refs.append(mtx)
+        datasets.append(ad.io.sparse_dataset(zarr.open_group(tmp_path / f"p{i}.zarr", mode="r")["X"]))
+    return datasets, sp.vstack(refs, format="csr").toarray()
+
+
+@pytest.mark.parametrize(
+    ("chunk_size", "preload_nchunks"), [(1, 64), (8, 8), (32, 2)], ids=["scattered", "mixed", "blocks"]
+)
+def test_backed_csr_batches_match_reference(tmp_path: Path, chunk_size: int, preload_nchunks: int) -> None:
+    """Every batch must be the requested rows of the concatenation, in the requested order.
+
+    Parametrised across the scatter range because the read shape changes with it:
+    ``chunk_size=1`` is a row at a time, ``32`` is contiguous blocks, and the rows are
+    reordered on the way to the store in both cases.
+    """
+    datasets, reference = _backed_csrs(tmp_path)
+    loader = Loader(
+        shuffle=True,
+        chunk_size=chunk_size,
+        preload_nchunks=preload_nchunks,
+        batch_size=16,
+        preload_to_gpu=False,
+        to=None,
+        return_index=True,
+        rng=np.random.default_rng(1),
+    ).add_datasets(datasets)
+
+    seen = 0
+    for batch in loader:
+        index = batch["index"]
+        np.testing.assert_allclose(batch["X"].toarray(), reference[index])
+        seen += index.size
+    assert seen == reference.shape[0]
+
+
+def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch) -> None:
+    """Rows must reach anndata already ascending, or `out=` buys nothing.
+
+    A backed read only goes straight into the caller's buffer when the rows are
+    ascending and distinct; otherwise anndata reads into a full-size temporary and
+    gathers from it. `_requests_to_dataset_rows` sorts within each dataset for exactly
+    this reason, and a stable sort on the dataset key alone -- which is what it used to
+    do -- silently sends every read down the copying path.
+    """
+    import anndata._core.sparse_dataset as sparse_dataset_module
+
+    datasets, _ = _backed_csrs(tmp_path)
+    reads = {"direct": 0, "gathered": 0}
+    select_rows = sparse_dataset_module._select_rows
+
+    def counting_select_rows(rows, indptr, xp=np):
+        selection = select_rows(rows, indptr, xp)
+        reads["direct" if selection.take is None else "gathered"] += 1
+        return selection
+
+    monkeypatch.setattr(sparse_dataset_module, "_select_rows", counting_select_rows)
+
+    loader = Loader(
+        shuffle=True,
+        chunk_size=1,
+        preload_nchunks=64,
+        batch_size=16,
+        preload_to_gpu=False,
+        to=None,
+        rng=np.random.default_rng(1),
+    ).add_datasets(datasets)
+    for _ in loader:
+        pass
+
+    assert reads["direct"] > 0
+    assert reads["gathered"] == 0
