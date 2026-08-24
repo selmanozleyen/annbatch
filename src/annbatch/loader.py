@@ -1017,7 +1017,15 @@ class Loader[
             inv = inv_buffer[:n]
             inv[order] = positions[:n]
 
-            raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
+            # zarr's `sync` takes its timeout as an argument and never reads
+            # `async.timeout` itself -- only `SyncMixin._sync` does that. Called
+            # bare, this waits forever: a read that never completes hangs the
+            # loader permanently with no error and no traceback. Passing the
+            # configured timeout makes the same failure raise where it happened.
+            raw_out: CSRContainer | np.ndarray = zsync.sync(
+                self._index_datasets(dataset_index_to_rows),
+                timeout=zarr.config.get("async.timeout"),
+            )
 
             if is_sparse:
                 in_memory_data = self._sp_module.csr_matrix(
