@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import os
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
-from functools import singledispatchmethod
+from functools import partial, singledispatchmethod
 from importlib.metadata import version
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Literal, Self, cast
@@ -55,10 +54,9 @@ _FETCH_POOL: ThreadPoolExecutor | None = None
 def _fetch_pool() -> ThreadPoolExecutor:
     """The pool the synchronous fetch runs on. A WIDTH, so a knob rather than an arm.
 
-    `asyncio.to_thread` would use the loop's default executor, whose size is
-    `min(32, cpus + 4)` and cannot be set from here -- which makes the one thing this arm
-    is about impossible to sweep. `ANNBATCH_FETCH_THREADS` sets it, and the default is
-    exactly what `to_thread` would have given, so leaving it unset changes nothing.
+    `ANNBATCH_FETCH_THREADS` sets it. The default is `min(32, cpus + 4)`, which is what
+    `asyncio`'s own default executor would have given, so leaving it unset keeps the
+    concurrency the gather-based version had.
 
     Sized once, on first use. Resizing mid-run would put two widths inside one measurement.
     """
@@ -743,7 +741,7 @@ class Loader[
         return out
 
     @singledispatchmethod
-    async def _fetch_data(
+    def _fetch_data(
         self,
         dataset: ZarrArray | ad.abc.CSRDataset,
         rows: np.ndarray,
@@ -769,7 +767,7 @@ class Loader[
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
     @_fetch_data.register
-    async def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
+    def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
         breaks = np.flatnonzero(np.diff(rows) != 1) + 1
         row_runs = np.split(rows, breaks)
         indexer = MultiBasicIndexer(
@@ -783,14 +781,18 @@ class Loader[
             ]
         )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
-        await dataset._async_array._get_selection(
-            indexer,
-            prototype=buffer_prototype,
-            out=buffer_prototype.nd_buffer(out),
+        # Through zarr's bridge rather than awaited. This runs on a WORKER thread, not on
+        # zarr's loop, so blocking on it is safe -- which is the whole point of the arm.
+        zsync.sync(
+            dataset._async_array._get_selection(
+                indexer,
+                prototype=buffer_prototype,
+                out=buffer_prototype.nd_buffer(out),
+            )
         )
 
     @_fetch_data.register
-    async def _fetch_data_numpy_matrix(
+    def _fetch_data_numpy_matrix(
         self,
         dataset: np.ndarray,
         rows: np.ndarray,
@@ -799,7 +801,7 @@ class Loader[
         out[:] = dataset[rows]
 
     @_fetch_data.register
-    async def _fetch_data_csr_matrix(
+    def _fetch_data_csr_matrix(
         self,
         dataset: sp.csr_matrix | sp.csr_array,
         rows: np.ndarray,
@@ -815,31 +817,30 @@ class Loader[
         )
 
     @_fetch_data.register
-    async def _fetch_data_sparse(
+    def _fetch_data_sparse(
         self,
         dataset: ad.abc.CSRDataset,
         rows: np.ndarray,
         out: CSRContainer,
     ) -> None:
-        """ARM: read the rows through anndata's SYNCHRONOUS path, on a thread.
+        """Read the rows through anndata's ordinary interface. Nothing else.
 
-        The parent commit awaits `aread_rows`, which exists because a caller already on
-        zarr's shared event loop cannot call the synchronous form -- it would block the
-        loop thread waiting on work scheduled onto it. A thread is not on that loop, so
-        `asyncio.to_thread` sidesteps the whole problem: the worker blocks, zarr's loop
-        runs the coroutine, and the per-dataset `asyncio.gather` below still overlaps
-        datasets. The pipeline's own workers are concurrent WITHIN each read regardless.
+        `dataset[rows]` -- no async entry point, no `out=`, no zarr privates. It is safe
+        because NOTHING here runs on zarr's event loop any more: `_index_datasets` is an
+        ordinary method and its fetches run on pool workers, so a worker is free to block
+        on the sync bridge. That was the one thing `aread_rows` existed to work around.
 
-        What this cannot keep is `out=`. `aread_rows` reads straight into the caller's
-        buffers; `__getitem__` returns a fresh matrix, so the rows are copied in after.
-        That copy is the price of the arm and is exactly what it is here to measure.
+        Concurrency is unaffected: it comes from the pipeline's own workers WITHIN each
+        read, and from :meth:`_run_fetches` ACROSS datasets.
+
+        The price is `out=`. `aread_rows` reads straight into the caller's buffers;
+        `__getitem__` returns a fresh matrix, so the rows are copied in after. That copy
+        is the cost of the trade and is what the arm is here to measure.
 
         `indptr` is not filled here. It spans every dataset in the batch, so only
-        :meth:`_index_datasets` knows the offsets, and it writes it after the gather.
+        :meth:`_index_datasets` knows the offsets, and it writes it afterwards.
         """
-        mtx = await asyncio.get_running_loop().run_in_executor(
-            _fetch_pool(), dataset.__getitem__, rows
-        )
+        mtx = dataset[rows]
         # Sized from indptr for exactly these rows, so a mismatch means the two
         # disagree about the selection -- louder as an assert than as a short write.
         if mtx.data.shape[0] != out.elems[0].shape[0]:
@@ -851,7 +852,22 @@ class Loader[
         out.elems[0][:] = mtx.data
         out.elems[1][:] = mtx.indices
 
-    async def _index_datasets(
+    def _run_fetches(self, tasks: list) -> None:
+        """Run the per-dataset fetches concurrently, on threads instead of a loop.
+
+        One task per dataset, the same shape as the `asyncio.gather` this replaces. A pool
+        worker is not zarr's loop thread, so each task is free to make ordinary synchronous
+        anndata calls -- which is the entire reason the async fetch interface existed.
+
+        `map` is consumed rather than left lazy: an exception in a worker surfaces on
+        iteration, and an unconsumed generator would swallow it.
+        """
+        if len(tasks) == 1:
+            tasks[0]()          # no pool hop for the single-dataset case
+            return
+        list(_fetch_pool().map(lambda task: task(), tasks))
+
+    def _index_datasets(
         self,
         dataset_index_to_rows: OrderedDict[int, np.ndarray],
     ) -> CSRContainer | np.ndarray:
@@ -867,10 +883,15 @@ class Loader[
         if not self._dtypes_homogeneous:
             per_dataset_outs = self._allocate_per_dataset_outs(dataset_index_to_rows)
             tasks = [
-                self._fetch_data(self._train_datasets[dataset_idx], rows, per_dataset_outs[dataset_idx])
+                partial(
+                    self._fetch_data,
+                    self._train_datasets[dataset_idx],
+                    rows,
+                    per_dataset_outs[dataset_idx],
+                )
                 for dataset_idx, rows in dataset_index_to_rows.items()
             ]
-            await asyncio.gather(*tasks)
+            self._run_fetches(tasks)
             if is_sparse:
                 datasets = self._train_datasets
                 for dataset_idx, rows in dataset_index_to_rows.items():
@@ -906,10 +927,10 @@ class Loader[
             else:
                 out_view = out[row_offset : row_offset + nrows]
 
-            tasks.append(self._fetch_data(self._train_datasets[dataset_idx], rows, out_view))
+            tasks.append(partial(self._fetch_data, self._train_datasets[dataset_idx], rows, out_view))
             row_offset += nrows
 
-        await asyncio.gather(*tasks)
+        self._run_fetches(tasks)
 
         if is_sparse:
             datasets = self._train_datasets
@@ -976,7 +997,7 @@ class Loader[
             inv = inv_buffer[:n]
             inv[order] = positions[:n]
 
-            raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
+            raw_out: CSRContainer | np.ndarray = self._index_datasets(dataset_index_to_rows)
 
             if is_sparse:
                 in_memory_data = self._sp_module.csr_matrix(
