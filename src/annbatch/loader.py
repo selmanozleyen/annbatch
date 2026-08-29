@@ -795,19 +795,33 @@ class Loader[
         rows: np.ndarray,
         out: CSRContainer,
     ) -> None:
-        """Read the rows through anndata, straight into this dataset's slice of `out`.
+        """ARM: read the rows through anndata's SYNCHRONOUS path, on a thread.
 
-        anndata sorts and deduplicates the rows, expands them to coordinates and issues
-        `data` and `indices` together, so what annbatch used to build by hand -- the run
-        split, the per-run indexers, the two-way gather -- now lives in one place with
-        the data model it belongs to. Awaited rather than threaded: this is already
-        inside the per-dataset `asyncio.gather` below, and `aread_rows` is a coroutine
-        precisely so it composes with it.
+        The parent commit awaits `aread_rows`, which exists because a caller already on
+        zarr's shared event loop cannot call the synchronous form -- it would block the
+        loop thread waiting on work scheduled onto it. A thread is not on that loop, so
+        `asyncio.to_thread` sidesteps the whole problem: the worker blocks, zarr's loop
+        runs the coroutine, and the per-dataset `asyncio.gather` below still overlaps
+        datasets. The pipeline's own workers are concurrent WITHIN each read regardless.
+
+        What this cannot keep is `out=`. `aread_rows` reads straight into the caller's
+        buffers; `__getitem__` returns a fresh matrix, so the rows are copied in after.
+        That copy is the price of the arm and is exactly what it is here to measure.
 
         `indptr` is not filled here. It spans every dataset in the batch, so only
         :meth:`_index_datasets` knows the offsets, and it writes it after the gather.
         """
-        await dataset.aread_rows(rows, out=(out.elems[0], out.elems[1]))
+        mtx = await asyncio.to_thread(dataset.__getitem__, rows)
+        # Sized from indptr for exactly these rows, so a mismatch means the two
+        # disagree about the selection -- louder as an assert than as a short write.
+        if mtx.data.shape[0] != out.elems[0].shape[0]:
+            msg = (
+                f"{mtx.data.shape[0]} nnz read against a buffer of "
+                f"{out.elems[0].shape[0]}"
+            )
+            raise ValueError(msg)
+        out.elems[0][:] = mtx.data
+        out.elems[1][:] = mtx.indices
 
     async def _index_datasets(
         self,
