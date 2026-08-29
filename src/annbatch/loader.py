@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from functools import singledispatchmethod
 from importlib.metadata import version
@@ -45,6 +47,30 @@ type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
 zarr_version = Version(version("zarr"))
 
 Default = object()
+
+
+_FETCH_POOL: ThreadPoolExecutor | None = None
+
+
+def _fetch_pool() -> ThreadPoolExecutor:
+    """The pool the synchronous fetch runs on. A WIDTH, so a knob rather than an arm.
+
+    `asyncio.to_thread` would use the loop's default executor, whose size is
+    `min(32, cpus + 4)` and cannot be set from here -- which makes the one thing this arm
+    is about impossible to sweep. `ANNBATCH_FETCH_THREADS` sets it, and the default is
+    exactly what `to_thread` would have given, so leaving it unset changes nothing.
+
+    Sized once, on first use. Resizing mid-run would put two widths inside one measurement.
+    """
+    global _FETCH_POOL
+    if _FETCH_POOL is None:
+        default = min(32, (os.cpu_count() or 1) + 4)
+        width = int(os.environ.get("ANNBATCH_FETCH_THREADS", default))
+        _FETCH_POOL = ThreadPoolExecutor(
+            max_workers=width, thread_name_prefix="annbatch-fetch"
+        )
+        print(f"[annbatch] synchronous fetch pool: {width} threads", flush=True)
+    return _FETCH_POOL
 
 
 def _csr_parts(dataset: BackingArray_T) -> tuple[np.ndarray, np.dtype, np.dtype]:
@@ -811,7 +837,9 @@ class Loader[
         `indptr` is not filled here. It spans every dataset in the batch, so only
         :meth:`_index_datasets` knows the offsets, and it writes it after the gather.
         """
-        mtx = await asyncio.to_thread(dataset.__getitem__, rows)
+        mtx = await asyncio.get_running_loop().run_in_executor(
+            _fetch_pool(), dataset.__getitem__, rows
+        )
         # Sized from indptr for exactly these rows, so a mismatch means the two
         # disagree about the selection -- louder as an assert than as a short write.
         if mtx.data.shape[0] != out.elems[0].shape[0]:
