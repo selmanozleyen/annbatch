@@ -833,24 +833,17 @@ class Loader[
         Concurrency is unaffected: it comes from the pipeline's own workers WITHIN each
         read, and from :meth:`_run_fetches` ACROSS datasets.
 
-        The price is `out=`. `aread_rows` reads straight into the caller's buffers;
-        `__getitem__` returns a fresh matrix, so the rows are copied in after. That copy
-        is the cost of the trade and is what the arm is here to measure.
+        `read_rows` keeps `out=` without keeping asyncio: the decode lands straight in
+        the caller's buffers, which under `preload_to_gpu` are PINNED host memory. The
+        `__getitem__` arm copies the whole batch into pinned afterwards instead -- under
+        1% of a CPU-bound batch, and a much larger share of a GPU-bound one, which is
+        what this third arm exists to price.
 
         `indptr` is not filled here. It spans every dataset in the batch, so only
         :meth:`_index_datasets` knows the offsets, and it writes it afterwards.
         """
-        mtx = dataset[rows]
-        # Sized from indptr for exactly these rows, so a mismatch means the two
-        # disagree about the selection -- louder as an assert than as a short write.
-        if mtx.data.shape[0] != out.elems[0].shape[0]:
-            msg = (
-                f"{mtx.data.shape[0]} nnz read against a buffer of "
-                f"{out.elems[0].shape[0]}"
-            )
-            raise ValueError(msg)
-        out.elems[0][:] = mtx.data
-        out.elems[1][:] = mtx.indices
+        dataset.read_rows(rows, out=(out.elems[0], out.elems[1]))
+        return
 
     def _run_fetches(self, tasks: list) -> None:
         """Run the per-dataset fetches concurrently, on threads instead of a loop.
