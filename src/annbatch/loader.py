@@ -836,12 +836,12 @@ class Loader[
         rows: np.ndarray,
         out: CSRContainer,
     ) -> None:
-        """Read the rows through anndata's ordinary interface. Nothing else.
+        """Read the rows through anndata's synchronous interface. Nothing else.
 
-        `dataset[rows]` -- no async entry point, no `out=`, no zarr privates. It is safe
-        because NOTHING here runs on zarr's event loop any more: `_index_datasets` is an
-        ordinary method and its fetches run on pool workers, so a worker is free to block
-        on the sync bridge. That was the one thing `aread_rows` existed to work around.
+        `read_rows(out=)` -- no async entry point, no zarr privates. It is safe because
+        NOTHING here runs on zarr's event loop any more: `_index_datasets` is an ordinary
+        method and its fetches run on pool workers, so a worker is free to block on the
+        sync bridge. That was the one thing `aread_rows` existed to work around.
 
         Concurrency is unaffected: it comes from the pipeline's own workers WITHIN each
         read, and from :meth:`_run_fetches` ACROSS datasets.
