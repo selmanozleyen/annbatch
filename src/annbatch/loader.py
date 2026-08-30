@@ -593,12 +593,17 @@ class Loader[
             # per slice followed by a concatenate of them all. The loop form's iteration
             # count is the SLICE count, and at chunk_size 1 that is one slice per row --
             # so it scaled with the batch rather than with the number of runs in it.
-            bounds = np.fromiter(
-                ((s.start, s.stop) for s in requests),
-                dtype=np.dtype((np.int64, 2)),
-                count=len(requests),
+            # Two scalar `fromiter`s, NOT one with a `(int64, 2)` subarray dtype: that
+            # form makes numpy unpack a Python tuple per slice, which measured SLOWER
+            # than the concatenate-of-aranges it replaced -- 18.5k -> 16.0k rows/s on a
+            # strided draw, consistently across chunk sizes.
+            slice_starts = np.fromiter(
+                (s.start for s in requests), dtype=np.int64, count=len(requests)
             )
-            slice_starts, lengths = bounds[:, 0], bounds[:, 1] - bounds[:, 0]
+            stops = np.fromiter(
+                (s.stop for s in requests), dtype=np.int64, count=len(requests)
+            )
+            lengths = stops - slice_starts
             offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(lengths)])
             global_index = np.arange(int(offsets[-1]), dtype=np.int64)
             global_index -= np.repeat(offsets[:-1], lengths)
