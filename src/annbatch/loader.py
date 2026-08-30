@@ -565,7 +565,20 @@ class Loader[
         if isinstance(requests, np.ndarray) and np.issubdtype(requests.dtype, np.integer):
             global_index = requests
         else:
-            global_index = np.concatenate([np.arange(s.start, s.stop) for s in requests])
+            # One flat ramp, rebased per slice, rather than an `arange` and an allocation
+            # per slice followed by a concatenate of them all. The loop form's iteration
+            # count is the SLICE count, and at chunk_size 1 that is one slice per row --
+            # so it scaled with the batch rather than with the number of runs in it.
+            bounds = np.fromiter(
+                ((s.start, s.stop) for s in requests),
+                dtype=np.dtype((np.int64, 2)),
+                count=len(requests),
+            )
+            slice_starts, lengths = bounds[:, 0], bounds[:, 1] - bounds[:, 0]
+            offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(lengths)])
+            global_index = np.arange(int(offsets[-1]), dtype=np.int64)
+            global_index -= np.repeat(offsets[:-1], lengths)
+            global_index += np.repeat(slice_starts, lengths)
 
         # Locate each requested row in its dataset by binary-searching the dataset boundaries,
         sizes = np.fromiter(
