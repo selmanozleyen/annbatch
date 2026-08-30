@@ -13,16 +13,15 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import zarr
-import zarr.core.sync as zsync
 from packaging.version import Version
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
 from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
+from anndata._core.multi_range import read_ranges
 from annbatch.utils import (
     CSRContainer,
-    MultiBasicIndexer,
     check_lt_1,
     check_var_shapes,
     convert,
@@ -786,28 +785,17 @@ class Loader[
 
     @_fetch_data.register
     def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
+        # The runs, and nothing else. anndata owns the multi-range read itself now --
+        # the indexer, the chunk-projection rebasing and the zarr privates all live
+        # there, in one copy the CSR path shares. This was a second, near-identical
+        # implementation of the same construct, free to drift from it.
+        #
+        # Synchronous on purpose: this runs on a WORKER thread, not on zarr's loop, so
+        # blocking on the sync bridge is safe.
         breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        row_runs = np.split(rows, breaks)
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer(
-                    (slice(int(r[0]), int(r[-1]) + 1), Ellipsis),
-                    shape=dataset.metadata.shape,
-                    chunk_grid=dataset.metadata.chunk_grid if zarr_version <= Version("3.1.6") else dataset._chunk_grid,
-                )
-                for r in row_runs
-            ]
-        )
-        buffer_prototype = zarr.core.buffer.default_buffer_prototype()
-        # Through zarr's bridge rather than awaited. This runs on a WORKER thread, not on
-        # zarr's loop, so blocking on it is safe -- which is the whole point of the arm.
-        zsync.sync(
-            dataset._async_array._get_selection(
-                indexer,
-                prototype=buffer_prototype,
-                out=buffer_prototype.nd_buffer(out),
-            )
-        )
+        runs = [slice(int(r[0]), int(r[-1]) + 1) for r in np.split(rows, breaks)]
+        prototype = zarr.core.buffer.default_buffer_prototype()
+        read_ranges(dataset, runs, out=prototype.nd_buffer(out))
 
     @_fetch_data.register
     def _fetch_data_numpy_matrix(

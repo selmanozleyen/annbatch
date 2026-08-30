@@ -77,30 +77,6 @@ class CSRContainer:
     dtype: np.dtype
 
 
-# TODO: make this part of the public zarr or zarrs-python API.
-# We can do chunk coalescing in zarrs based on integer arrays, so I think
-# there would make sense with ezclump or similar.
-# Another "solution" would be for zarrs to support integer indexing properly, if that pipeline works,
-# or make this an "experimental setting" and to use integer indexing for the zarr-python pipeline.
-# See: https://github.com/zarr-developers/zarr-python/issues/3175 for why this is better than simpler alternatives.
-class MultiBasicIndexer(zarr.core.indexing.Indexer):
-    """Custom indexer to enable joint fetching of disparate slices"""
-
-    def __init__(self, indexers: list[zarr.core.indexing.Indexer]):
-        self.shape = (sum(i.shape[0] for i in indexers), *indexers[0].shape[1:])
-        self.drop_axes = indexers[0].drop_axes  # maybe?
-        self.indexers = indexers
-
-    def __iter__(self):
-        total = 0
-        for i in self.indexers:
-            for c in i:
-                out_selection = c[2]
-                gap = out_selection[0].stop - out_selection[0].start
-                yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
-                total += gap
-
-
 def _spawn_worker_rng(rng: np.random.Generator, worker_id: int) -> np.random.Generator:
     """Create a worker-specific RNG using the sequence-of-integers seeding pattern.
 
