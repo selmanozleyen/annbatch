@@ -807,6 +807,29 @@ class Loader[
         `read_ranges` both go.
         """
         prototype = zarr.core.buffer.default_buffer_prototype()
+
+        # ANNBATCH_DENSE_FORM=runs describes the batch as one SLICE PER RUN instead of one
+        # integer array. Bench-only, and it exists to break a confound: every slice-producing
+        # path measured so far also crossed anndata's sync bridge, so "slices help" and "the
+        # bridge hurts" were never separated. This form has the slices and no bridge.
+        #
+        # Why it might matter: at cs=64 the rows are 16 clean runs, and a slice lets
+        # zarrs-python's `_chunk_unit_args` take its SPAN path -- a coordinate and a length per
+        # inner chunk. An integer array forces per-element description of the same read, and
+        # profiling put the whole cs=64 deficit there: 0.253 s cumulative against 0.108 s, with
+        # FEWER calls.
+        if os.environ.get("ANNBATCH_DENSE_FORM") == "runs":
+            breaks_r = np.flatnonzero(np.diff(rows) != 1) + 1
+            at = 0
+            for part in np.split(rows, breaks_r):
+                n = part.size
+                dataset.get_basic_selection(
+                    (slice(int(part[0]), int(part[-1]) + 1), slice(None)),
+                    out=prototype.nd_buffer(out[at : at + n]),
+                )
+                at += n
+            return
+
         dataset.get_orthogonal_selection((rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
