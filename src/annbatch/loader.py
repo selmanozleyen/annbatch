@@ -426,7 +426,6 @@ class Loader[
     def _prepare_dataset_obs_and_var(
         self, adata: ad.AnnData
     ) -> tuple[BackingArray, pd.DataFrame | None, pd.DataFrame | None]:
-        # TODO(obsm): this is where `obsm`/`obsp`/`layers` get dropped - carry them through to yield them
         dataset = adata.X
         obs = adata.obs
         var = adata.var
