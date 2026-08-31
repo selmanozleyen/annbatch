@@ -244,7 +244,7 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
 
 
 def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
-    """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now.
+    """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now, but will be loaded if present in the future.
 
     :class:`~annbatch.Loader` yields these elements.
 
