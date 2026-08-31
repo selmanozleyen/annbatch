@@ -281,8 +281,7 @@ def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
-    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible.
-    """
+    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible."""
     var = g["var"]
     return ad.AnnData(
         X=_read_backed(g["X"]),
