@@ -246,8 +246,6 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
 def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
     """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now, but will be loaded if present in the future.
 
-    :class:`~annbatch.Loader` yields these elements.
-
     The warning is emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated
     calls - e.g. over a whole collection via :meth:`Loader.add_adatas` - do not spam identical warnings.
     """
@@ -272,16 +270,24 @@ def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
 
 
 def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
-    """Back dense/sparse arrays by the store; read anything else (e.g. a dataframe in `obsm`) into memory."""
+    """Back a dense or sparse array by the store; read a dataframe (which cannot be backed) into memory."""
     if isinstance(elem, zarr.Array):
         return elem
-    if isinstance(elem, zarr.Group):
+    encoding_type = elem.attrs.get("encoding-type")
+    if encoding_type in {"csr_matrix", "csc_matrix"}:
         return ad.io.sparse_dataset(elem)
-    raise TypeError(f"Unrecognized backed type: {type(elem)}")
+    if encoding_type == "dataframe":
+        return ad.io.read_elem(elem)
+    raise TypeError(f"Unrecognized encoding type {encoding_type!r} for {elem.name}")
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
-    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible."""
+    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible.
+
+    Everything is loaded although :class:`~annbatch.Loader` yields only ``X``/``obs``/``var`` for now, so that
+    dropping the extras happens in exactly one place - :meth:`Loader._add_adata_unchecked` - and yielding them
+    later is a change to that method alone.
+    """
     var = g["var"]
     return ad.AnnData(
         X=_read_backed(g["X"]),
