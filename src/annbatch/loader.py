@@ -367,11 +367,8 @@ class Loader[
             The collection whose on-disk datasets should be used in this loader.
         load_adata
             A custom load function - recall that whatever is found in :attr:`~anndata.AnnData.X` and :attr:`~anndata.AnnData.obs` will be yielded in batches.
-            The default loads everything observation-aligned, but only `X`, `obs`, and `var` are yielded for now:
-            any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers`
-            elements are dropped and a :class:`FutureWarning` is emitted; a future release will yield them too.
-            To silence that warning (and keep only what you need), pass a custom ``load_adata`` that returns
-            just `X`/`obs`/`var`.
+            Only `X`, `obs`, and `var` are yielded for now; a future release will additionally yield observation-aligned
+            :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements.
         """
         if collection.is_empty:
             raise ValueError("DatasetCollection is empty")
