@@ -19,8 +19,6 @@ from zarr import Array as ZarrArray
 
 from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
-from anndata._core.multi_range import read_ranges
-from anndata._core.sparse_dataset import _MIN_MEAN_RUN_ROWS
 from annbatch.utils import (
     CSRContainer,
     check_lt_1,
@@ -784,50 +782,32 @@ class Loader[
         """
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
-    @staticmethod
-    def _dense_gate_rows() -> int:
-        return int(os.environ.get("ANNBATCH_DENSE_GATE_ROWS", str(_MIN_MEAN_RUN_ROWS)))
-
     @_fetch_data.register
     def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
-        # The runs, and nothing else. anndata owns the multi-range read itself now --
-        # the indexer, the chunk-projection rebasing and the zarr privates all live
-        # there, in one copy the CSR path shares. This was a second, near-identical
-        # implementation of the same construct, free to drift from it.
-        #
-        # Synchronous on purpose: this runs on a WORKER thread, not on zarr's loop, so
-        # blocking on the sync bridge is safe.
-        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        prototype = zarr.core.buffer.default_buffer_prototype()
+        """One selection, handed to the codec pipeline whole.
 
-        # GATED, the way the CSR path has been since anndata's `_coordinate_runs`. Describing
-        # a read as ranges pays when the rows come in runs and costs when they do not, and the
-        # dense path was taking it unconditionally.
-        #
-        # Measured at 14 plates, our annbatch against main's, same zarrs-python either side:
-        # ranges WIN a strided draw by +0.17x to +0.51x and LOSE a random one by -0.12x to
-        # -0.47x. The mechanism is not the run count -- both build one indexer per run, 36,860
-        # against 36,864 -- it is that this path blocks per range where the ordinary one
-        # overlaps I/O across the fourteen datasets. On the losing cells it used 3.07 cores of
-        # a 32-thread fetch pool: blocked, not busy.
-        #
-        # So take ranges only when there are few enough of them to be worth the round trip.
-        # The same shape of test, and the same constant, as the CSR side.
-        # Sweepable, the same shape as zarrs' own `ZARRS_RAW_MAX_READS_PER_CHUNK`: this is a
-        # THRESHOLD on the data, not a flag that picks a path, so it stays a knob. 0 forces
-        # ranges always (the behaviour before the gate); a huge value forces the whole-
-        # selection read always, which is the question of whether `read_ranges` earns its
-        # place at all.
-        if rows.size <= (breaks.size + 1) * self._dense_gate_rows():
-            # Too fragmented. `get_orthogonal_selection` writes straight into `out` and reaches
-            # the codec pipeline as ONE selection, so the read path groups it by inner chunk
-            # itself rather than being handed a run per row.
-            dataset.get_orthogonal_selection(
-                (rows, slice(None)), out=prototype.nd_buffer(out)
-            )
-            return
-        runs = [slice(int(r[0]), int(r[-1]) + 1) for r in np.split(rows, breaks)]
-        read_ranges(dataset, runs, out=prototype.nd_buffer(out))
+        This used to derive RUNS from the rows and read them as ranges, which meant a
+        `BasicIndexer` per run -- one per ROW on a fragmented draw, 1,024 a batch. Main's
+        annbatch does the same through `MultiBasicIndexer`. Handing zarr a single
+        `get_orthogonal_selection` instead lets it group the rows by chunk itself, and the
+        read path takes them from there.
+
+        Swept before deleting the range form, all in one allocation because separate `srun`s
+        vary ~10% and produced a crossover that was not there. `dense_r` random, rows/s:
+
+            mean rows/run gate      3        32     always
+            cs=4                46,753   110,727   103,904
+            cs=16              107,416   114,731   124,809
+            cs=64              161,596   164,649   159,520
+            sequential         217,264   220,900   227,763
+
+        Ranges never win. At cs=4 the gated form is 2.3x SLOWER, and even a fully sequential
+        draw -- one run for the whole batch, the case ranges exist for -- is marginally faster
+        read whole. So there is no threshold to tune and no second path to keep: the gate and
+        `read_ranges` both go.
+        """
+        prototype = zarr.core.buffer.default_buffer_prototype()
+        dataset.get_orthogonal_selection((rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
     def _fetch_data_numpy_matrix(
