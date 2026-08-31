@@ -784,6 +784,10 @@ class Loader[
         """
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
+    @staticmethod
+    def _dense_gate_rows() -> int:
+        return int(os.environ.get("ANNBATCH_DENSE_GATE_ROWS", str(_MIN_MEAN_RUN_ROWS)))
+
     @_fetch_data.register
     def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
         # The runs, and nothing else. anndata owns the multi-range read itself now --
@@ -809,7 +813,12 @@ class Loader[
         #
         # So take ranges only when there are few enough of them to be worth the round trip.
         # The same shape of test, and the same constant, as the CSR side.
-        if rows.size <= (breaks.size + 1) * _MIN_MEAN_RUN_ROWS:
+        # Sweepable, the same shape as zarrs' own `ZARRS_RAW_MAX_READS_PER_CHUNK`: this is a
+        # THRESHOLD on the data, not a flag that picks a path, so it stays a knob. 0 forces
+        # ranges always (the behaviour before the gate); a huge value forces the whole-
+        # selection read always, which is the question of whether `read_ranges` earns its
+        # place at all.
+        if rows.size <= (breaks.size + 1) * self._dense_gate_rows():
             # Too fragmented. `get_orthogonal_selection` writes straight into `out` and reaches
             # the codec pipeline as ONE selection, so the read path groups it by inner chunk
             # itself rather than being handed a run per row.
