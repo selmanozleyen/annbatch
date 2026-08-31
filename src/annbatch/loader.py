@@ -20,6 +20,7 @@ from zarr import Array as ZarrArray
 from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
 from anndata._core.multi_range import read_ranges
+from anndata._core.sparse_dataset import _MIN_MEAN_RUN_ROWS
 from annbatch.utils import (
     CSRContainer,
     check_lt_1,
@@ -793,8 +794,30 @@ class Loader[
         # Synchronous on purpose: this runs on a WORKER thread, not on zarr's loop, so
         # blocking on the sync bridge is safe.
         breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        runs = [slice(int(r[0]), int(r[-1]) + 1) for r in np.split(rows, breaks)]
         prototype = zarr.core.buffer.default_buffer_prototype()
+
+        # GATED, the way the CSR path has been since anndata's `_coordinate_runs`. Describing
+        # a read as ranges pays when the rows come in runs and costs when they do not, and the
+        # dense path was taking it unconditionally.
+        #
+        # Measured at 14 plates, our annbatch against main's, same zarrs-python either side:
+        # ranges WIN a strided draw by +0.17x to +0.51x and LOSE a random one by -0.12x to
+        # -0.47x. The mechanism is not the run count -- both build one indexer per run, 36,860
+        # against 36,864 -- it is that this path blocks per range where the ordinary one
+        # overlaps I/O across the fourteen datasets. On the losing cells it used 3.07 cores of
+        # a 32-thread fetch pool: blocked, not busy.
+        #
+        # So take ranges only when there are few enough of them to be worth the round trip.
+        # The same shape of test, and the same constant, as the CSR side.
+        if rows.size <= (breaks.size + 1) * _MIN_MEAN_RUN_ROWS:
+            # Too fragmented. `get_orthogonal_selection` writes straight into `out` and reaches
+            # the codec pipeline as ONE selection, so the read path groups it by inner chunk
+            # itself rather than being handed a run per row.
+            dataset.get_orthogonal_selection(
+                (rows, slice(None)), out=prototype.nd_buffer(out)
+            )
+            return
+        runs = [slice(int(r[0]), int(r[-1]) + 1) for r in np.split(rows, breaks)]
         read_ranges(dataset, runs, out=prototype.nd_buffer(out))
 
     @_fetch_data.register
