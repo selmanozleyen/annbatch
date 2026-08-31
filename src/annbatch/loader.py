@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from functools import partial, singledispatchmethod
@@ -49,53 +47,6 @@ Default = object()
 
 
 _FETCH_POOL: ThreadPoolExecutor | None = None
-
-
-_IO_POOL: ThreadPoolExecutor | None = None
-_LOOPS = threading.local()
-
-
-def _io_pool() -> ThreadPoolExecutor:
-    """The executor every fetch worker's event loop offloads blocking IO to.
-
-    zarr reaches the filesystem through `asyncio.to_thread`, which uses the RUNNING loop's
-    default executor. Give each worker its own loop and each would build its own pool --
-    fourteen pools of up to 32 threads. One shared executor, sized here, is the point of
-    owning the loops at all: the concurrency is ours to set rather than asyncio's default.
-
-    `ANNBATCH_IO_THREADS` sets it; the default matches what asyncio would have chosen, so
-    leaving it unset changes the width and not the behaviour.
-    """
-    global _IO_POOL
-    if _IO_POOL is None:
-        default = min(32, (os.cpu_count() or 1) + 4)
-        _IO_POOL = ThreadPoolExecutor(
-            max_workers=int(os.environ.get("ANNBATCH_IO_THREADS", default)),
-            thread_name_prefix="annbatch-io",
-        )
-    return _IO_POOL
-
-
-def _run_here(coro):
-    """Drive a coroutine on THIS thread's own event loop, never on zarr's shared one.
-
-    `zarr.core.sync.sync()` submits to a single process-wide loop running on the `zarr_io`
-    daemon thread and blocks the caller on `run_coroutine_threadsafe`. Every read in the
-    process funnels through that one thread: measured at 257 crossings a batch against
-    main's 21, with the fetch pool sitting at 3.07 of 32 cores -- blocked, not busy.
-
-    A loop per worker removes the funnel. Nothing crosses threads, nothing queues behind
-    another dataset's read, and the width that matters is `_io_pool`, which is ours.
-
-    The loop is thread-local and kept: creating one per call would rebuild the executor
-    binding every time. `set_default_executor` is what stops each loop growing its own pool.
-    """
-    loop = getattr(_LOOPS, "loop", None)
-    if loop is None:
-        loop = asyncio.new_event_loop()
-        loop.set_default_executor(_io_pool())
-        _LOOPS.loop = loop
-    return loop.run_until_complete(coro)
 
 
 def _fetch_pool() -> ThreadPoolExecutor:
@@ -879,13 +830,7 @@ class Loader[
                 at += n
             return
 
-        # Async form on our own loop, for the same reason: the sync wrapper is `sync(...)`
-        # onto the shared `zarr_io` thread.
-        _run_here(
-            dataset._async_array.get_orthogonal_selection(
-                (rows, slice(None)), out=prototype.nd_buffer(out)
-            )
-        )
+        dataset.get_orthogonal_selection((rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
     def _fetch_data_numpy_matrix(
@@ -938,10 +883,7 @@ class Loader[
         `indptr` is not filled here. It spans every dataset in the batch, so only
         :meth:`_index_datasets` knows the offsets, and it writes it afterwards.
         """
-        # `read_rows` is `zarr_sync(aread_rows(...))`, which blocks this worker on zarr's
-        # single shared loop. Await the same coroutine on OUR loop instead: same read, same
-        # `out` contract, no funnel.
-        _run_here(dataset.aread_rows(rows, out=(out.elems[0], out.elems[1])))
+        dataset.read_rows(rows, out=(out.elems[0], out.elems[1]))
         return
 
     def _run_fetches(self, tasks: list) -> None:
