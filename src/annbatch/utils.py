@@ -246,7 +246,6 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
 def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
     """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now.
 
-    TODO(obsm): delete this function - and its call in :meth:`Loader._add_adata_unchecked` - once
     :class:`~annbatch.Loader` yields these elements.
 
     The warning is emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated
@@ -276,19 +275,13 @@ def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
     """Back dense/sparse arrays by the store; read anything else (e.g. a dataframe in `obsm`) into memory."""
     if isinstance(elem, zarr.Array):
         return elem
-    if elem.attrs.get("encoding-type") in {"csr_matrix", "csc_matrix"}:
+    if isinstance(elem, zarr.Group):
         return ad.io.sparse_dataset(elem)
-    return ad.io.read_elem(elem)
+    raise TypeError(f"Unrecognized backed type: {type(elem)}")
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
     """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible.
-
-    .. note::
-        ``obsm``, ``obsp``, and ``layers`` are loaded but not yet yielded in batches - :class:`~annbatch.Loader`
-        drops them with a :class:`FutureWarning` for now. A future release will yield them as well.
-
-    TODO(obsm): drop the note above once these elements are yielded.
     """
     var = g["var"]
     return ad.AnnData(

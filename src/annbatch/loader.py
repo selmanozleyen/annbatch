@@ -411,7 +411,7 @@ class Loader[
             adata
                 A :class:`anndata.AnnData` object, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
                 :attr:`~anndata.AnnData.var` must match the ``var`` of any previously added datasets.
-                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them).
+                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them if present in the passed in `adata`).
         """
         self._add_adata_unchecked(adata)
         return self
