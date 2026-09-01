@@ -288,7 +288,6 @@ def load_all_aligned(g: zarr.Group) -> ad.AnnData:
     """
 
     def read(elem: zarr.Array | zarr.Group) -> Any:
-        # `_read_backed` only promises dense/sparse, so read the rest (e.g. an `obsm` dataframe) in-memory here
         backable = isinstance(elem, zarr.Array) or elem.attrs.get("encoding-type") in {"csr_matrix", "csc_matrix"}
         return _read_backed(elem) if backable else ad.io.read_elem(elem)
 
