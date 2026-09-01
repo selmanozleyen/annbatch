@@ -269,15 +269,12 @@ def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
     warnings.filterwarnings("ignore", message=re.escape(msg), category=FutureWarning)
 
 
-_BACKABLE_SPARSE_ENCODINGS = frozenset({"csr_matrix", "csc_matrix"})
-
-
 def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
     """Back a dense or sparse array by the store."""
     if isinstance(elem, zarr.Array):
         return elem
     encoding_type = elem.attrs.get("encoding-type")
-    if encoding_type in _BACKABLE_SPARSE_ENCODINGS:
+    if encoding_type in {"csr_matrix", "csc_matrix"}:
         return ad.io.sparse_dataset(elem)
     raise TypeError(f"Unrecognized encoding type {encoding_type} for {elem.name}")
 
@@ -291,7 +288,8 @@ def load_all_aligned(g: zarr.Group) -> ad.AnnData:
     """
 
     def read(elem: zarr.Array | zarr.Group) -> Any:
-        backable = isinstance(elem, zarr.Array) or elem.attrs.get("encoding-type") in _BACKABLE_SPARSE_ENCODINGS
+        # `_read_backed` only promises dense/sparse, so read the rest (e.g. an `obsm` dataframe) in-memory here
+        backable = isinstance(elem, zarr.Array) or elem.attrs.get("encoding-type") in {"csr_matrix", "csc_matrix"}
         return _read_backed(elem) if backable else ad.io.read_elem(elem)
 
     var = g["var"]
