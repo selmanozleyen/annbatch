@@ -17,6 +17,7 @@ import zarr
 from annbatch import Loader, write_sharded
 from annbatch.abc import Sampler
 from annbatch.samplers import SequentialSampler
+from annbatch.utils import load_all_aligned
 from tests.conftest import load_x_obs_var
 
 try:
@@ -299,25 +300,51 @@ def test_use_collection_twice(simple_collection: tuple[ad.AnnData, DatasetCollec
         ds.use_collection(simple_collection[1], load_adata=load_x_obs_var)
 
 
-# TODO(obsm): this helper and the three tests below go away once `obsm`/`obsp`/`layers` are yielded -
-# replace them with tests asserting the elements actually come out in the batches.
+def test_load_all_aligned_backs_arrays_and_reads_dataframes(tmp_path: Path):
+    """Everything backable stays backed; an `obsm` dataframe - which cannot be backed - is read in-memory."""
+    n_obs, n_var = 8, 5
+    obs_idx = pd.Index([f"cell_{i}" for i in range(n_obs)])
+    adata = ad.AnnData(
+        X=np.random.default_rng(0).random((n_obs, n_var)).astype("f4"),
+        obs=pd.DataFrame({"group": pd.Categorical(["a"] * n_obs)}, index=obs_idx),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_var)]),
+        obsm={"arr": np.zeros((n_obs, 3), dtype="f4"), "df": pd.DataFrame({"num": np.arange(n_obs)}, index=obs_idx)},
+        obsp={"conn": sp.eye(n_obs, format="csr", dtype="f4")},
+        layers={"sparse": sp.random(n_obs, n_var, density=0.3, format="csr", dtype="f4")},
+    )
+    adata.write_zarr(tmp_path / "adata.zarr")
+
+    loaded = load_all_aligned(zarr.open_group(tmp_path / "adata.zarr", mode="r"))
+
+    # the dataframe cannot be backed, so it comes back in memory and equal to what was written
+    pd.testing.assert_frame_equal(loaded.obsm["df"], adata.obsm["df"])
+    # dense and sparse stay backed by the store rather than being materialized
+    assert isinstance(loaded.X, zarr.Array)
+    assert isinstance(loaded.obsm["arr"], zarr.Array)
+    assert isinstance(loaded.obsp["conn"], ad.abc.CSRDataset)
+    assert isinstance(loaded.layers["sparse"], ad.abc.CSRDataset)
+    np.testing.assert_allclose(loaded.X[...], adata.X)
+    np.testing.assert_allclose(loaded.obsp["conn"][...].toarray(), adata.obsp["conn"].toarray())
+    np.testing.assert_allclose(loaded.layers["sparse"][...].toarray(), adata.layers["sparse"].toarray())
+
+
 @contextlib.contextmanager
-def expect_transitional_warning(*, present: bool):
-    transitional_msg = "Only `X`, `obs`, and `var` are kept"
-    with pytest.warns(FutureWarning, match=transitional_msg) if present else contextlib.nullcontext():
+def expect_warning_about_additional_aligned_elems(*, present: bool):
+    msg = "Only `X`, `obs`, and `var` are kept"
+    with pytest.warns(FutureWarning, match=msg) if present else contextlib.nullcontext():
         yield
 
 
-@pytest.mark.parametrize("custom_loader", [False, True], ids=["default", "custom-loader"])
-def test_use_collection_transitional_warning(
-    simple_collection: tuple[ad.AnnData, DatasetCollection], *, custom_loader: bool
+@pytest.mark.parametrize("use_custom_loader", [False, True], ids=["default", "use-custom-loader"])
+def test_use_collection_warns_about_additional_aligned_elems(
+    simple_collection: tuple[ad.AnnData, DatasetCollection], *, use_custom_loader: bool
 ):
     """`use_collection` defaults to `load_all_aligned` (warns on obsm/layers); a custom loader opts out."""
     _, collection = simple_collection
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
     # the collection has obsm/layers on disk, so the default loader warns while the X/obs/var-only loader does not
-    load_adata = {"load_adata": lambda g: open_dense(g, use_anndata=True)} if custom_loader else {}
-    with expect_transitional_warning(present=not custom_loader):
+    load_adata = {"load_adata": lambda g: open_dense(g, use_anndata=True)} if use_custom_loader else {}
+    with expect_warning_about_additional_aligned_elems(present=not use_custom_loader):
         loader.use_collection(collection, **load_adata)
 
 
@@ -332,7 +359,7 @@ def test_add_adata_warns_with_extras(
         adata = ad.AnnData(X=adata.X, obs=adata.obs, var=adata.var)
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
 
-    with expect_transitional_warning(present=has_extras):
+    with expect_warning_about_additional_aligned_elems(present=has_extras):
         getattr(loader, method)(adata if method == "add_adata" else [adata])
 
 
