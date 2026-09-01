@@ -269,16 +269,17 @@ def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
     warnings.filterwarnings("ignore", message=re.escape(msg), category=FutureWarning)
 
 
+_BACKABLE_SPARSE_ENCODINGS = frozenset({"csr_matrix", "csc_matrix"})
+
+
 def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
-    """Back a dense or sparse array by the store; read a dataframe (which cannot be backed) into memory."""
+    """Back a dense or sparse array by the store."""
     if isinstance(elem, zarr.Array):
         return elem
     encoding_type = elem.attrs.get("encoding-type")
-    if encoding_type in {"csr_matrix", "csc_matrix"}:
+    if encoding_type in _BACKABLE_SPARSE_ENCODINGS:
         return ad.io.sparse_dataset(elem)
-    if encoding_type == "dataframe":
-        return ad.io.read_elem(elem)
-    raise TypeError(f"Unrecognized encoding type {encoding_type!r} for {elem.name}")
+    raise TypeError(f"Unrecognized encoding type {encoding_type} for {elem.name}")
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
@@ -288,10 +289,15 @@ def load_all_aligned(g: zarr.Group) -> ad.AnnData:
     dropping the extras happens in exactly one place - :meth:`Loader._add_adata_unchecked` - and yielding them
     later is a change to that method alone.
     """
+
+    def read(elem: zarr.Array | zarr.Group) -> Any:
+        backable = isinstance(elem, zarr.Array) or elem.attrs.get("encoding-type") in _BACKABLE_SPARSE_ENCODINGS
+        return _read_backed(elem) if backable else ad.io.read_elem(elem)
+
     var = g["var"]
     return ad.AnnData(
         X=_read_backed(g["X"]),
         obs=ad.io.read_elem(g["obs"]),
         var=pd.DataFrame(index=pd.Index(ad.io.read_elem(var[var.attrs.get("_index")]))),
-        **{elem: {k: _read_backed(g[elem][k]) for k in g[elem]} for elem in ("obsm", "obsp", "layers") if elem in g},
+        **{elem: {k: read(g[elem][k]) for k in g[elem]} for elem in ("obsm", "obsp", "layers") if elem in g},
     )
