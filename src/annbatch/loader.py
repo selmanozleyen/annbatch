@@ -19,6 +19,7 @@ from zarr import Array as ZarrArray
 
 from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
+from annbatch._zarrista import ZarristaCSRElems, open_csr_elems, read_runs_into_async
 from annbatch.utils import (
     CSRContainer,
     MultiBasicIndexer,
@@ -183,6 +184,10 @@ class Loader[
     _return_index: bool = False
     _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool = True
+    # Read the bulk CSR arrays through zarrista rather than zarr-python. An ARM, not a
+    # tuning knob: it selects a different library for the same reads, so a run that sets it
+    # is not comparable to one that does not except within the same job.
+    _use_zarrista: bool = False
     _to: Literal["torch", "jax"] | None = None
     _sparse_dataset_elem_cache: dict[int, CSRDatasetElems]
     _batch_sampler: Sampler
@@ -199,11 +204,19 @@ class Loader[
         return_index: bool = False,
         batch_size: int | None = None,
         preload_to_gpu: bool = find_spec("cupy") is not None,
+        use_zarrista: bool = False,
         drop_last: bool | None = None,
         to_torch: bool | None = None,
         to: Literal["torch", "jax"] | None = Default,  # type: ignore
         rng: np.random.Generator | None = None,
     ):
+        if use_zarrista and find_spec("zarrista") is None:
+            raise ImportError(
+                "use_zarrista=True but zarrista is not installed: `pip install zarrista`. "
+                "It is a separate binding to the zarrs crate, not a zarr-python backend, so "
+                "there is no config switch that reaches it."
+            )
+        self._use_zarrista = use_zarrista
         # args that are passed after resolving defaults
         core_sampler_args = {
             "chunk_size": chunk_size,
@@ -773,6 +786,10 @@ class Loader[
         if isinstance(ds := self._train_datasets[idx], ZarrArray):
             raise ValueError(f"Requested sparse dataset at idx {idx} of {self._train_datasets} but found dense array")
         indptr = await ds.group._async_group.getitem("indptr")
+        if self._use_zarrista:
+            # Only the bulk arrays move. `indptr` is read the same way on both arms, so the
+            # comparison is the read path and not the setup around it.
+            return await open_csr_elems(ds.group, await indptr.getitem(Ellipsis))
         return CSRDatasetElems(
             *(
                 await asyncio.gather(
@@ -877,6 +894,29 @@ class Loader[
                 prototype=buffer_prototype,
                 out=buffer_prototype.nd_buffer(out.elems[1]),
             ),
+        )
+
+    @_fetch_data.register
+    async def _fetch_data_zarrista(
+        self,
+        dataset: ZarristaCSRElems,
+        rows: np.ndarray,
+        out: CSRContainer,
+    ) -> None:
+        """`_fetch_data_sparse`, with the two bulk reads served by zarrista.
+
+        Deliberately the same arithmetic as the zarr-python arm above -- the same runs, the
+        same `indptr` limits, the same output buffer -- so the only difference measured is who
+        reads the bytes and whether they land in our buffer directly or via one memcpy.
+        """
+        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+        row_runs = np.split(rows, breaks)
+        indptr, indices, data = dataset
+        indptr_indices = [indptr[slice(s[0], s[-1] + 2)] for s in row_runs]
+        indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
+        await asyncio.gather(
+            read_runs_into_async(data, indptr_limits, out.elems[0]),
+            read_runs_into_async(indices, indptr_limits, out.elems[1]),
         )
 
     async def _index_datasets(
