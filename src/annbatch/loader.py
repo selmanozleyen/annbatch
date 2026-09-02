@@ -17,9 +17,9 @@ from packaging.version import Version
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
 
+from annbatch._zarrista import ZarristaCSRElems, open_csr_elems, read_runs_into_async
 from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
-from annbatch._zarrista import ZarristaCSRElems, open_csr_elems, read_runs_into_async
 from annbatch.utils import (
     CSRContainer,
     MultiBasicIndexer,
@@ -189,7 +189,7 @@ class Loader[
     # is not comparable to one that does not except within the same job.
     _use_zarrista: bool = False
     _to: Literal["torch", "jax"] | None = None
-    _sparse_dataset_elem_cache: dict[int, CSRDatasetElems]
+    _sparse_dataset_elem_cache: dict[int, CSRDatasetElems | ZarristaCSRElems]
     _batch_sampler: Sampler
     _collection_added: bool = False
     _dtypes_homogeneous: bool = True
@@ -516,6 +516,14 @@ class Loader[
                 )
         if not isinstance(dataset, BackingArray_T.__value__):
             raise TypeError(f"Cannot add dataset of type {type(dataset)}")
+        if self._use_zarrista and not isinstance(dataset, ad.abc.CSRDataset):
+            # A knob that was set is not a knob that arrived. The zarrista arm only reaches
+            # the BACKED CSR path -- a dense or in-memory dataset would silently be served by
+            # zarr-python and the run would be labelled an arm it never was.
+            raise TypeError(
+                f"use_zarrista=True only serves backed CSR datasets, got {type(dataset).__name__}. "
+                "The zarrista arm reads `data` and `indices`; there is no dense path yet."
+            )
         if isinstance(dataset, ad.abc.CSRDataset) and not dataset.backend == "zarr":
             raise TypeError(
                 "Cannot add CSRDataset backed by h5ad at the moment: see https://github.com/zarr-developers/VirtualiZarr/pull/790"

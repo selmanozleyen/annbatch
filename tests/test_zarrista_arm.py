@@ -1,44 +1,53 @@
-"""Does the zarrista arm return the SAME BYTES as the zarr-python arm?
+"""The zarrista arm returns what the zarr-python arm returns, and is actually zarrista.
 
-Correctness before speed, and correctness stated as equality against the arm already trusted
--- not against a hand-computed expectation, which is a second thing that can be wrong.
-
-Both arms read the same store, with the same sampler seed, so a difference is the read path.
+Equality against the arm already trusted, not against a hand-computed expectation -- which
+would be a second thing that can be wrong. And a call counter beside it, because an arm that
+silently fell back to zarr-python would pass every equality test ever written and be worthless.
 """
 
-import sys
-import tempfile
-from pathlib import Path
+from __future__ import annotations
 
-import anndata as ad
 import numpy as np
+import pytest
 import scipy.sparse as sp
-import zarr
-from annbatch import Loader
-from annbatch.samplers import RandomSampler
 
-N_ROWS, N_COLS, DENSITY = 4000, 200, 0.05
+zarrista = pytest.importorskip("zarrista")
+
+import anndata as ad  # noqa: E402
+import zarr  # noqa: E402
+
+from annbatch import Loader  # noqa: E402
+from annbatch._zarrista import ZarristaCSRElems, coalesce  # noqa: E402
+from annbatch.samplers import RandomSampler  # noqa: E402
+
+N_COLS = 64
 
 
-def build_store(root: Path) -> list[Path]:
-    """Three small CSR plates, written the way the real ones are: sharded zarr v3."""
+@pytest.fixture
+def plates(tmp_path):
+    """Three CSR plates, one of them with empty rows -- including the first and the last."""
     paths = []
-    rng = np.random.default_rng(0)
     for plate in range(3):
-        x = sp.random(N_ROWS, N_COLS, density=DENSITY, format="csr", random_state=plate,
+        x = sp.random(400, N_COLS, density=0.08, format="csr", random_state=plate,
                       dtype=np.float32)
-        path = root / f"plate{plate}.zarr"
-        adata = ad.AnnData(X=x, obs=None, var=None)
-        adata.write_zarr(path)
+        if plate == 1:
+            # Empty rows are the case the offset bookkeeping is most likely to get wrong, and
+            # the first and last rows are where an off-by-one shows up.
+            lil = x.tolil()
+            for r in (0, 7, 14, 399):
+                lil.rows[r], lil.data[r] = [], []
+            x = lil.tocsr()
+        path = tmp_path / f"plate{plate}.zarr"
+        ad.AnnData(X=x).write_zarr(path)
         paths.append(path)
-    assert rng is not None
     return paths
 
 
-def read_all(paths: list[Path], *, use_zarrista: bool, seed: int) -> tuple[np.ndarray, int]:
-    """One pass over a fixed row draw, returning the concatenated batch values."""
+def _read(paths, *, use_zarrista, chunk_size, seed=17, rows=384):
     datasets = [ad.io.sparse_dataset(zarr.open_group(p, mode="r")["X"]) for p in paths]
-    sampler = RandomSampler(chunk_size=4, preload_nchunks=16, batch_size=64,
+    # the preload must hold a batch: at chunk_size=1 eight chunks is eight rows
+    sampler = RandomSampler(chunk_size=chunk_size, preload_nchunks=max(8, 64 // chunk_size),
+                            batch_size=32,
                             replacement=False, rng=np.random.default_rng(seed))
     loader = Loader(batch_sampler=sampler, preload_to_gpu=False, to=None,
                     use_zarrista=use_zarrista)
@@ -49,33 +58,82 @@ def read_all(paths: list[Path], *, use_zarrista: bool, seed: int) -> tuple[np.nd
         arr = x.toarray() if sp.issparse(x) else np.asarray(x)
         out.append(arr)
         n += arr.shape[0]
-        if n >= 512:
+        if n >= rows:
             break
-    return np.concatenate(out, axis=0), n
+    return np.concatenate(out, axis=0), loader
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        paths = build_store(root)
-        print(f"built {len(paths)} plates of {N_ROWS}x{N_COLS} at density {DENSITY}")
-
-        zp, n_zp = read_all(paths, use_zarrista=False, seed=17)
-        print(f"zarr-python arm: {n_zp} rows, {zp.shape}, sum {zp.sum():.4f}")
-
-        zt, n_zt = read_all(paths, use_zarrista=True, seed=17)
-        print(f"zarrista arm:    {n_zt} rows, {zt.shape}, sum {zt.sum():.4f}")
-
-        if zp.shape != zt.shape:
-            print(f"FAIL: shapes differ {zp.shape} vs {zt.shape}")
-            return 1
-        if not np.array_equal(zp, zt):
-            bad = int((zp != zt).sum())
-            print(f"FAIL: {bad} of {zp.size} elements differ")
-            return 1
-        print(f"OK: both arms returned identical bytes over {zp.size:,} elements")
-        return 0
+@pytest.mark.parametrize("chunk_size", [1, 4, 32])
+def test_arms_agree(plates, chunk_size):
+    """Both arms return identical bytes, at every draw granularity."""
+    expected, _ = _read(plates, use_zarrista=False, chunk_size=chunk_size)
+    actual, _ = _read(plates, use_zarrista=True, chunk_size=chunk_size)
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual, expected)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def test_zarrista_actually_ran(plates, monkeypatch):
+    """The arm is the arm.
+
+    Patched at the zarrista boundary, not at `Loader._fetch_data_zarrista`:
+    `singledispatchmethod` captured the function at decoration time, so patching the method
+    counts nothing while zarrista is demonstrably being called.
+    """
+    calls = {"n": 0}
+    original = zarrista.Array.retrieve_array_subset
+
+    def counted(self, selection):
+        calls["n"] += 1
+        return original(self, selection)
+
+    monkeypatch.setattr(zarrista.Array, "retrieve_array_subset", counted)
+    _, loader = _read(plates, use_zarrista=True, chunk_size=4)
+    assert calls["n"] > 0, "use_zarrista=True but zarrista was never called"
+    assert isinstance(loader._get_elem_from_cache(0), ZarristaCSRElems)
+
+
+def test_flag_refuses_what_it_cannot_serve(tmp_path):
+    """A knob that was set must be a knob that arrived: dense has no zarrista path yet."""
+    z = zarr.create_array(store=tmp_path / "dense.zarr", name="X", shape=(64, N_COLS),
+                          chunks=(16, N_COLS), dtype="float32", overwrite=True)
+    z[:] = np.zeros((64, N_COLS), dtype=np.float32)
+    loader = Loader(chunk_size=4, preload_nchunks=4, batch_size=8, shuffle=True,
+                    preload_to_gpu=False, to=None, use_zarrista=True)
+    with pytest.raises(TypeError, match="only serves backed CSR"):
+        loader.add_datasets([z])
+
+
+def test_coalesce_is_order_independent():
+    """Runs arrive shuffled -- `_group_rows` orders by dataset, not by row.
+
+    A merged range that assumed ascending input produced a negative index into its own
+    result and silently read nothing, which numpy reported as a broadcast error three frames
+    away. Each run therefore carries the offset it must land at.
+    """
+    unit = 100
+    runs = [(0, slice(250, 260)), (10, slice(10, 20)), (20, slice(255, 265)), (30, slice(0, 5))]
+    groups = coalesce(runs, unit)
+    # every non-empty run survives exactly once, with its offset intact
+    seen = sorted((off, s.start, s.stop) for _, members in groups for off, s in members)
+    assert seen == [(0, 250, 260), (10, 10, 20), (20, 255, 265), (30, 0, 5)]
+    # and every member lies inside the range it was merged into
+    for merged, members in groups:
+        for _, limit in members:
+            assert merged.start <= limit.start and limit.stop <= merged.stop
+
+
+def test_coalesce_merges_within_a_unit_only():
+    """Merging must never pull in a decode unit that was not already needed."""
+    unit = 100
+    # two runs in unit 0, one far away in unit 5
+    groups = coalesce([(0, slice(0, 10)), (10, slice(50, 60)), (20, slice(500, 510))], unit)
+    assert len(groups) == 2
+    assert groups[0][0] == slice(0, 60)
+    assert groups[1][0] == slice(500, 510)
+
+
+def test_empty_runs_do_not_shift_offsets():
+    """An empty row reads nothing but must not move what follows it."""
+    groups = coalesce([(0, slice(5, 5)), (0, slice(10, 20)), (10, slice(30, 30))], 100)
+    members = [(off, s.start, s.stop) for _, mem in groups for off, s in mem]
+    assert members == [(0, 10, 20)]
