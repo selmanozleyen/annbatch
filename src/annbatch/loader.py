@@ -368,7 +368,7 @@ class Loader[
         load_adata
             A custom load function - recall that whatever is found in :attr:`~anndata.AnnData.X` and :attr:`~anndata.AnnData.obs` will be yielded in batches.
             Only `X`, `obs`, and `var` are yielded for now; a future release will additionally yield observation-aligned
-            :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements.
+            :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements.
         """
         if collection.is_empty:
             raise ValueError("DatasetCollection is empty")
@@ -392,7 +392,7 @@ class Loader[
         ----------
             adatas
                 List of :class:`anndata.AnnData` objects, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
-                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them).
+                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them).
         """
         check_lt_1([len(adatas)], ["Number of adatas"])
         for adata in adatas:
@@ -408,7 +408,7 @@ class Loader[
             adata
                 A :class:`anndata.AnnData` object, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
                 :attr:`~anndata.AnnData.var` must match the ``var`` of any previously added datasets.
-                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm`, :attr:`~anndata.AnnData.obsp`, and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them if present in the passed in `adata`).
+                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them if present in the passed in `adata`).
         """
         self._add_adata_unchecked(adata)
         return self

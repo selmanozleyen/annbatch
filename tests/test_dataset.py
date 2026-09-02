@@ -300,8 +300,8 @@ def test_use_collection_twice(simple_collection: tuple[ad.AnnData, DatasetCollec
         ds.use_collection(simple_collection[1], load_adata=load_x_obs_var)
 
 
-def test_load_all_aligned_backs_arrays_and_reads_dataframes(tmp_path: Path):
-    """Everything backable stays backed; an `obsm` dataframe - which cannot be backed - is read in-memory."""
+def test_load_all_aligned_backs_arrays_and_skips_the_rest(tmp_path: Path):
+    """Everything backable stays backed; an `obsm` dataframe - which the loader cannot yield anyway - is skipped."""
     n_obs, n_var = 8, 5
     obs_idx = pd.Index([f"cell_{i}" for i in range(n_obs)])
     adata = ad.AnnData(
@@ -309,29 +309,26 @@ def test_load_all_aligned_backs_arrays_and_reads_dataframes(tmp_path: Path):
         obs=pd.DataFrame({"group": pd.Categorical(["a"] * n_obs)}, index=obs_idx),
         var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_var)]),
         obsm={"arr": np.zeros((n_obs, 3), dtype="f4"), "df": pd.DataFrame({"num": np.arange(n_obs)}, index=obs_idx)},
-        obsp={"conn": sp.eye(n_obs, format="csr", dtype="f4")},
         layers={"sparse": sp.random(n_obs, n_var, density=0.3, format="csr", dtype="f4")},
     )
     adata.write_zarr(tmp_path / "adata.zarr")
 
     loaded = load_all_aligned(zarr.open_group(tmp_path / "adata.zarr", mode="r"))
 
-    # the dataframe cannot be backed, so it comes back in memory and equal to what was written
-    pd.testing.assert_frame_equal(loaded.obsm["df"], adata.obsm["df"])
+    # the dataframe cannot be backed, so it is left behind rather than read into memory
+    assert "df" not in loaded.obsm
     # dense and sparse stay backed by the store rather than being materialized
     assert isinstance(loaded.X, zarr.Array)
     assert isinstance(loaded.obsm["arr"], zarr.Array)
-    assert isinstance(loaded.obsp["conn"], ad.abc.CSRDataset)
     assert isinstance(loaded.layers["sparse"], ad.abc.CSRDataset)
     np.testing.assert_allclose(loaded.X[...], adata.X)
-    np.testing.assert_allclose(loaded.obsp["conn"][...].toarray(), adata.obsp["conn"].toarray())
     np.testing.assert_allclose(loaded.layers["sparse"][...].toarray(), adata.layers["sparse"].toarray())
 
 
 @contextlib.contextmanager
-def expect_warning_about_additional_aligned_elems(*, present: bool):
+def expect_warning_about_additional_aligned_elems(*, is_expected: bool):
     msg = "Only `X`, `obs`, and `var` are kept"
-    with pytest.warns(FutureWarning, match=msg) if present else contextlib.nullcontext():
+    with pytest.warns(FutureWarning, match=msg) if is_expected else contextlib.nullcontext():
         yield
 
 
@@ -344,43 +341,43 @@ def test_use_collection_warns_about_additional_aligned_elems(
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
     # the collection has obsm/layers on disk, so the default loader warns while the X/obs/var-only loader does not
     load_adata = {"load_adata": lambda g: open_dense(g, use_anndata=True)} if use_custom_loader else {}
-    with expect_warning_about_additional_aligned_elems(present=not use_custom_loader):
+    with expect_warning_about_additional_aligned_elems(is_expected=not use_custom_loader):
         loader.use_collection(collection, **load_adata)
 
 
-@pytest.mark.parametrize("has_extras", [True, False], ids=["with-extras", "without-extras"])
+@pytest.mark.parametrize("has_additional_aligned_elems", [True, False], ids=["with-additional", "without-additional"])
 @pytest.mark.parametrize("method", ["add_adata", "add_adatas"])
-def test_add_adata_warns_with_extras(
-    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path], *, method: str, has_extras: bool
+def test_add_adata_warns_about_additional_aligned_elems(
+    adata_with_zarr_path_same_var_space: tuple[ad.AnnData, Path], *, method: str, has_additional_aligned_elems: bool
 ):
     """`add_adata`/`add_adatas` warn iff the in-memory AnnData carries obsm/layers that get dropped for now."""
     adata = adata_with_zarr_path_same_var_space[0]  # has obsm/3d and layers/sparse
-    if not has_extras:
+    if not has_additional_aligned_elems:
         adata = ad.AnnData(X=adata.X, obs=adata.obs, var=adata.var)
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
 
-    with expect_warning_about_additional_aligned_elems(present=has_extras):
+    with expect_warning_about_additional_aligned_elems(is_expected=has_additional_aligned_elems):
         getattr(loader, method)(adata if method == "add_adata" else [adata])
 
 
-def test_add_adatas_warns_exactly_once_about_each_extra():
-    """`add_adatas` warns once *per unique* dropped element: distinct extras each warn, duplicates are deduped."""
+def test_add_adatas_warns_exactly_once_about_each_additional_aligned_elem():
+    """`add_adatas` warns once *per unique* dropped element: distinct elements each warn, duplicates are deduped."""
     n_obs, n_var = 40, 100
     var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_var)])
     x = np.random.default_rng().random((n_obs, n_var)).astype("f4")
     adata_obsm = ad.AnnData(X=x.copy(), var=var, obsm={"pca": np.zeros((n_obs, 5), dtype="f4")})
-    adata_obsp = ad.AnnData(X=x.copy(), var=var, obsp={"conn": sp.eye(n_obs, format="csr", dtype="f4")})
+    adata_layer = ad.AnnData(X=x.copy(), var=var, layers={"counts": x.copy()})
     adata_obsm_again = ad.AnnData(X=x.copy(), var=var, obsm={"pca": np.zeros((n_obs, 5), dtype="f4")})
 
     loader = Loader(chunk_size=10, preload_nchunks=4, to=None, preload_to_gpu=False)
     with pytest.warns(FutureWarning) as record:
-        loader.add_adatas([adata_obsm, adata_obsp, adata_obsm_again])
+        loader.add_adatas([adata_obsm, adata_layer, adata_obsm_again])
 
     msgs = [str(w.message) for w in record if issubclass(w.category, FutureWarning)]
-    # `obsm/pca` is carried by two adatas but warned about once; `obsp/conn` warns once -> two warnings total
+    # `obsm/pca` is carried by two adatas but warned about once; `layers/counts` warns once -> two warnings total
     assert len(msgs) == 2
     assert sum("obsm/pca" in m for m in msgs) == 1
-    assert sum("obsp/conn" in m for m in msgs) == 1
+    assert sum("layers/counts" in m for m in msgs) == 1
 
 
 @pytest.mark.gpu

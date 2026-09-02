@@ -244,14 +244,14 @@ def _to_torch(input: OutputInMemoryArray_T, preload_to_gpu: bool) -> Tensor:
 
 
 def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
-    """Warn that ``adata``'s observation-aligned ``obsm``/``obsp``/``layers`` elements are dropped for now, but will be loaded if present in the future.
+    """Warn that ``adata``'s observation-aligned ``obsm``/``layers`` elements are dropped for now, but will be loaded if present in the future.
 
     The warning is emitted only once per unique message (mirroring anndata's ``warn_once``) so repeated
     calls - e.g. over a whole collection via :meth:`Loader.add_adatas` - do not spam identical warnings.
     """
     ignored = [
         f"{elem}/{key}"
-        for elem in ("obsm", "obsp", "layers")
+        for elem in ("obsm", "layers")
         for key in getattr(adata, elem)
         # a backed AnnData exposes a `None` key in `.layers` mirroring `X` (not a real layer); drop it
         if key is not None
@@ -274,27 +274,31 @@ def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
     if isinstance(elem, zarr.Array):
         return elem
     encoding_type = elem.attrs.get("encoding-type")
-    if encoding_type in {"csr_matrix", "csc_matrix"}:
+    if encoding_type == "csr_matrix":
         return ad.io.sparse_dataset(elem)
     raise TypeError(f"Unrecognized encoding type {encoding_type} for {elem.name}")
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
-    """Load ``X``, ``obs``, ``var`` and every observation-aligned element of a group, backed where possible.
+    """Load ``X``, ``obs``, ``var`` and the ``obsm``/``layers`` keys a store can back.
 
-    Everything is loaded although :class:`~annbatch.Loader` yields only ``X``/``obs``/``var`` for now, so that
-    dropping the extras happens in exactly one place - :meth:`Loader._add_adata_unchecked` - and yielding them
-    later is a change to that method alone.
+    Everything backable is loaded although :class:`~annbatch.Loader` yields only ``X``/``obs``/``var`` for now,
+    so that dropping the extras happens in exactly one place - :meth:`Loader._add_adata_unchecked` - and yielding
+    them later is a change to that method alone. Only dense arrays and CSR matrices are taken; anything else
+    (a dataframe or an awkward array in ``obsm``, say) the loader could not yield anyway, so it is skipped.
     """
-
-    def read(elem: zarr.Array | zarr.Group) -> Any:
-        backable = isinstance(elem, zarr.Array) or elem.attrs.get("encoding-type") in {"csr_matrix", "csc_matrix"}
-        return _read_backed(elem) if backable else ad.io.read_elem(elem)
-
     var = g["var"]
     return ad.AnnData(
         X=_read_backed(g["X"]),
         obs=ad.io.read_elem(g["obs"]),
         var=pd.DataFrame(index=pd.Index(ad.io.read_elem(var[var.attrs.get("_index")]))),
-        **{elem: {k: read(g[elem][k]) for k in g[elem]} for elem in ("obsm", "obsp", "layers") if elem in g},
+        **{
+            elem: {
+                k: _read_backed(v)
+                for k, v in g[elem].members()
+                if isinstance(v, zarr.Array) or v.attrs.get("encoding-type") == "csr_matrix"
+            }
+            for elem in ("obsm", "layers")
+            if elem in g
+        },
     )

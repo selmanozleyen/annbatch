@@ -28,9 +28,9 @@ if find_spec("jax"):
 
 
 def load_x_obs_var(g: zarr.Group) -> ad.AnnData:
-    """Load only ``X``/``obs``/``var`` from a group, without the obsm/obsp/layers ``FutureWarning``.
+    """Load only ``X``/``obs``/``var`` from a group, without the obsm/layers ``FutureWarning``.
 
-    Tests that don't exercise ``obsm``/``obsp``/``layers`` pass this as ``load_adata`` to opt out of the
+    Tests that don't exercise ``obsm``/``layers`` pass this as ``load_adata`` to opt out of the
     (currently warning) default loader :func:`annbatch.utils.load_all_aligned`. TODO(obsm): once the
     loader yields those elements, revisit the call sites of this helper to also cover them.
     """
