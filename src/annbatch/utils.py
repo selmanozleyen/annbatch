@@ -271,12 +271,14 @@ def warn_ignored_obs_aligned(adata: ad.AnnData, *, stacklevel: int) -> None:
 
 def _read_backed(elem: zarr.Array | zarr.Group) -> Any:
     """Back a dense or sparse array by the store."""
-    if isinstance(elem, zarr.Array):
-        return elem
     encoding_type = elem.attrs.get("encoding-type")
-    if encoding_type == "csr_matrix":
-        return ad.io.sparse_dataset(elem)
-    raise TypeError(f"Unrecognized encoding type {encoding_type} for {elem.name}")
+    match encoding_type, type(elem):
+        case "array", zarr.Array:
+            return elem
+        case "csr_matrix", zarr.Group:
+            return ad.io.sparse_dataset(elem)
+        case _, _:
+            raise TypeError(f"Unrecognized encoding type {encoding_type} for {elem.name}")
 
 
 def load_all_aligned(g: zarr.Group) -> ad.AnnData:
@@ -296,7 +298,7 @@ def load_all_aligned(g: zarr.Group) -> ad.AnnData:
             elem: {
                 k: _read_backed(v)
                 for k, v in g[elem].members()
-                if isinstance(v, zarr.Array) or v.attrs.get("encoding-type") == "csr_matrix"
+                if v.attrs.get("encoding-type") in {"csr_matrix", "array"}
             }
             for elem in ("obsm", "layers")
             if elem in g
