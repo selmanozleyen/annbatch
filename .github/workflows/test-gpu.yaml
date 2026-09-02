@@ -51,6 +51,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for removing the 'run-gpu-ci' label
+      id-token: write  # for codecov OIDC
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +59,12 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
+
+      # https://github.com/scverse/gpu-ci-config/issues/4#issuecomment-5511975344
+      - name: Update gh CLI
+        run: |
+          sudo apt update
+          sudo apt install gh=2.99.0
 
       - name: Nvidia SMI sanity check
         run: nvidia-smi
@@ -76,7 +83,7 @@ jobs:
           echo "max_python_version=$max_version" >> $GITHUB_OUTPUT
 
       - name: Install UV
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           python-version: ${{ steps.max-python.outputs.max_python_version }}
@@ -95,11 +102,12 @@ jobs:
           uv run coverage combine
           uv run coverage xml
 
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
-          files: test-data/coverage.xml
+          use_oidc: true
+
 
       - name: Remove 'run-gpu-ci' Label
         if: always() && contains(github.event.pull_request.labels.*.name, 'run-gpu-ci')
