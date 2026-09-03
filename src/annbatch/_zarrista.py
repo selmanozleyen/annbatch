@@ -23,6 +23,7 @@ upstream `retrieve_array_subset_into` would be worth before anyone writes one.
 from __future__ import annotations
 
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -177,7 +178,14 @@ def coalesce(runs: list[tuple[int, slice]], unit: int) -> list[tuple[slice, list
     return groups
 
 
-def read_runs_into(arr, limits: list[slice], out: np.ndarray, width: int = 8) -> None:  # noqa: ANN001
+#: How many zarrista calls are in flight at once. A bench knob, because the right value is a
+#: property of the machine and the draw, not of this code: at chunk_size=1 a batch is ~2,700
+#: calls and at 64 it is ~35, and a width tuned for one is wrong for the other. Measured
+#: rather than guessed -- an arm compared at an arbitrary width is not a fair comparison.
+FANOUT_WIDTH = int(os.environ.get("ZARRISTA_WIDTH", "8"))
+
+
+def read_runs_into(arr, limits: list[slice], out: np.ndarray, width: int = FANOUT_WIDTH) -> None:  # noqa: ANN001
     """Read each 1-D run of `arr` and lay the results out at their own offsets.
 
     This is the shape the CSR path always has: scattered ROWS become contiguous RANGES in the
@@ -231,7 +239,7 @@ def read_runs_into(arr, limits: list[slice], out: np.ndarray, width: int = 8) ->
             serve(group)
 
 
-async def read_runs_into_async(arr, limits: list[slice], out: np.ndarray, width: int = 8) -> None:
+async def read_runs_into_async(arr, limits: list[slice], out: np.ndarray, width: int = FANOUT_WIDTH) -> None:
     """`read_runs_into` on a worker thread, so two of these actually overlap.
 
     annbatch gathers the `data` and `indices` reads, and on the zarr-python arm those are
