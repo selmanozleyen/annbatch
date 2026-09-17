@@ -20,6 +20,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 from annbatch.samplers import ClassSampler, WeightedClassSampler
 from annbatch.samplers._utils import WorkerInfo
@@ -293,6 +294,53 @@ def test_class_weights_and_run_lengths_stay_independent(sampler_cls: type[ClassS
     assert abs(np.mean(classes == 0) - 0.75) < 0.01, "class shares must follow class_weights"
     assert abs(np.mean(starts[classes == 0] < 300) - 291 / 312) < 0.01, "class 0 runs by length"
     assert abs(np.mean(starts[classes == 1] < 500) - 191 / 202) < 0.01, "class 1 runs by length"
+
+
+def _batch_classes(sampler: ClassSampler, codes: np.ndarray) -> np.ndarray:
+    """Class of every batch a full pass yields; asserts each batch is class-pure."""
+    classes = []
+    for batch in _batch_codes(sampler, codes):
+        unique = np.unique(batch)
+        assert unique.size == 1, "every batch must lie within a single class"
+        classes.append(int(unique[0]))
+    return np.array(classes)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize(
+    ("chunk_size", "batch_size", "preload_nchunks"),
+    [
+        pytest.param(10, 10, 4, id="batch_eq_chunk"),  # group_chunks=1, 4 batches per window
+        pytest.param(10, 20, 4, id="batch_two_chunks"),  # group_chunks=2, 2 batches per window
+    ],
+)
+def test_batch_classes_are_uniform_iid(chunk_size: int, batch_size: int, preload_nchunks: int, seed: int):
+    # batch_size is a multiple of chunk_size in both shapes, which is what makes a group one
+    # batch and the per-batch class sequence i.i.d. uniform. Seeds are fixed, so the p-values
+    # are deterministic and 1e-3 guards against a gross regression (one class per *window*,
+    # say, would leave consecutive batches correlated) rather than testing small biases.
+    codes = np.repeat([0, 1, 2, 3], 250)
+    sampler = make_sampler(
+        pd.Categorical(codes),
+        num_samples=40_000,
+        chunk_size=chunk_size,
+        batch_size=batch_size,
+        preload_nchunks=preload_nchunks,
+        seed=seed,
+    )
+    drawn = _batch_classes(sampler, codes)
+    n_classes = 4
+    assert drawn.size == sampler.n_batches(0)
+
+    # uniform marginal
+    counts = np.bincount(drawn, minlength=n_classes)
+    assert counts.size == n_classes, "no class outside the vocabulary was drawn"
+    assert stats.chisquare(counts).pvalue > 1e-3, f"class counts are not uniform: {counts.tolist()}"
+
+    # independent across batches: the lag-1 transition table shows no association
+    transitions = np.bincount(drawn[:-1] * n_classes + drawn[1:], minlength=n_classes**2)
+    table = transitions.reshape(n_classes, n_classes)
+    assert stats.chi2_contingency(table).pvalue > 1e-3, f"consecutive batches are dependent:\n{table}"
 
 
 def test_noncontiguous_class_samples_all_runs(sampler_cls: type[ClassSampler]):
