@@ -16,6 +16,7 @@ from scipy.sparse import random as sparse_random
 
 from annbatch import write_sharded
 from annbatch.io import DatasetCollection
+from annbatch.samplers import ClassSampler
 from annbatch.utils import _read_backed
 
 if TYPE_CHECKING:
@@ -39,6 +40,29 @@ def load_x_obs_var(g: zarr.Group) -> ad.AnnData:
         X=_read_backed(g["X"]),
         obs=ad.io.read_elem(g["obs"]),
         var=pd.DataFrame(index=pd.Index(ad.io.read_elem(var[var.attrs.get("_index")]))),
+    )
+
+
+def make_class_sampler(
+    classes,
+    *,
+    cls: type[ClassSampler] = ClassSampler,
+    num_samples: int = 1000,
+    chunk_size: int = 10,
+    preload_nchunks: int = 4,
+    batch_size: int = 10,
+    seed: int = 0,
+    **kwargs,
+) -> ClassSampler:
+    """Build a class sampler with sane defaults so each test only states what matters."""
+    return cls(
+        chunk_size=chunk_size,
+        preload_nchunks=preload_nchunks,
+        batch_size=batch_size,
+        classes=classes,
+        num_samples=num_samples,
+        rng=np.random.default_rng(seed),
+        **kwargs,
     )
 
 
