@@ -48,6 +48,14 @@ class ClassSampler(Sampler):
     and the sampler raises at construction, naming the offending classes by their
     label.
 
+    *Batch independence.* A class is drawn once per ``lcm(chunk_size, batch_size)`` rows, which is
+    exactly one batch when ``batch_size`` is a multiple of ``chunk_size``. Otherwise one draw
+    covers ``chunk_size // gcd(chunk_size, batch_size)`` consecutive batches, which all carry the
+    same class: 2 batches for ``chunk_size=10, batch_size=5``, and 6 for ``chunk_size=6,
+    batch_size=5``. Batches stay class-pure and their classes still follow ``class_weights``
+    either way, but the number of independent draws is then smaller than the number of batches,
+    so batches are correlated. Pass a multiple of ``chunk_size`` to give every batch its own draw.
+
     *Mask.* Assigning :attr:`mask` restricts sampling to a contiguous observation
     range ``[start, stop)``. The RLE is rebuilt over that window (slice starts stay
     in global coordinates) and cached on the resolved ``(start, stop)`` pair, so
@@ -99,7 +107,8 @@ class ClassSampler(Sampler):
         Number of chunks to load per iteration.
     batch_size
         Number of observations per batch. ``chunk_size * preload_nchunks`` must be divisible
-        by it; it need not divide or be a multiple of ``chunk_size``.
+        by it; it need not divide or be a multiple of ``chunk_size``, though only a multiple
+        gives every batch its own class draw (see the batch independence note above).
     classes
         A :class:`pandas.Categorical` with one entry per observation, e.g.
         ``df["cell_type"].values`` when the column already has a categorical dtype.
