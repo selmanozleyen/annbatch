@@ -24,6 +24,7 @@ import pytest
 from annbatch.samplers import ClassSampler, WeightedClassSampler
 from annbatch.samplers._utils import WorkerInfo
 from tests.conftest import load_x_obs_var
+from tests.conftest import make_class_sampler as make_sampler
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,29 +34,6 @@ if TYPE_CHECKING:
 def sampler_cls(request) -> type[ClassSampler]:
     """Both samplers, for everything that is not about within-batch coherence."""
     return request.param
-
-
-def make_sampler(
-    classes: pd.Categorical,
-    *,
-    cls: type[ClassSampler] = ClassSampler,
-    num_samples: int = 1000,
-    chunk_size: int = 10,
-    preload_nchunks: int = 4,
-    batch_size: int = 10,
-    seed: int = 0,
-    **kwargs,
-) -> ClassSampler:
-    """Build a sampler with sane defaults so each test only states what matters."""
-    return cls(
-        chunk_size=chunk_size,
-        preload_nchunks=preload_nchunks,
-        batch_size=batch_size,
-        classes=classes,
-        num_samples=num_samples,
-        rng=np.random.default_rng(seed),
-        **kwargs,
-    )
 
 
 def _chunk_classes(chunks: list[slice], codes: np.ndarray) -> list[int]:
@@ -231,6 +209,8 @@ def test_chunks_are_class_coherent(codes: np.ndarray):
         pytest.param(10, 10, 4, id="batch_eq_chunk"),
         pytest.param(10, 5, 4, id="batch_lt_chunk"),
         pytest.param(20, 5, 3, id="many_batches_per_chunk"),
+        pytest.param(5, 10, 4, id="batch_two_chunks"),
+        pytest.param(5, 20, 4, id="batch_four_chunks"),
     ],
 )
 def test_batch_class_composition(
@@ -469,6 +449,7 @@ def test_n_batches(
         pytest.param(10, 10, 4, 400, True, id="drop_last_exact"),  # drop_last is a no-op when it divides evenly
         pytest.param(10, 10, 2, 95, True, id="drop_last_remainder_chunk"),  # batch==chunk, drops trailing chunk
         pytest.param(10, 10, 2, 95, False, id="keep_remainder_chunk"),  # same, partial last batch kept
+        pytest.param(10, 10, 4, 45, True, id="drop_last_empties_window"),  # trailing window is one short batch
         # batch_size >= chunk_size: a batch spans several same-class chunks
         pytest.param(10, 20, 4, 400, False, id="batch_two_chunks"),
         pytest.param(10, 20, 4, 410, False, id="batch_two_chunks_partial"),  # final 10-row batch kept
@@ -511,6 +492,7 @@ def test_sampling_invariants(
     for lr in sampler.sample(n):
         requests.extend(lr["requests"])
         concat = np.concatenate([codes[s.start : s.stop] for s in lr["requests"]])
+        assert len(lr["splits"]) > 0, "a request must never carry an empty split list"
         rows = np.concatenate(lr["splits"])
         assert np.unique(rows).size == rows.size and rows.max() < concat.size, (
             "splits must index distinct rows of their window"
