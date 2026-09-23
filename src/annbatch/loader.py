@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from functools import singledispatchmethod
 from importlib.metadata import version
 from importlib.util import find_spec
-from itertools import accumulate
 from typing import TYPE_CHECKING, Literal, NamedTuple, Self, cast
 from warnings import warn
 
@@ -25,9 +24,10 @@ from annbatch.utils import (
     MultiBasicIndexer,
     check_lt_1,
     check_var_shapes,
-    load_x_and_obs_and_var,
-    to_torch,
+    convert,
+    load_all_aligned,
     validate_sampler,
+    warn_ignored_obs_aligned,
 )
 
 from .compat import IterableDataset
@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 type concat_strategies = Literal["concat-shuffle", "shuffle-concat"]
 zarr_version = Version(version("zarr"))
 
+Default = object()
+
 
 class CSRDatasetElems(NamedTuple):
     """Container for cached objects that will be indexed into to generate CSR matrices"""
@@ -52,6 +54,34 @@ class CSRDatasetElems(NamedTuple):
     indptr: np.ndarray
     indices: zarr.AsyncArray
     data: zarr.AsyncArray
+
+
+if find_spec("numba"):
+    import numba
+
+    @numba.njit(parallel=True, cache=True, nogil=True)
+    def _csr_subset_rows(src_data, src_indices, src_indptr, rows, out_data, out_indices):  # type: ignore
+        n_rows = rows.shape[0]
+        row_nnz = np.empty(n_rows, dtype=np.int64)
+        for i in range(n_rows):
+            r = rows[i]
+            row_nnz[i] = src_indptr[r + 1] - src_indptr[r]
+        out_offsets = np.empty(n_rows + 1, dtype=np.int64)
+        out_offsets[0] = 0
+        for i in range(n_rows):
+            out_offsets[i + 1] = out_offsets[i] + row_nnz[i]
+        for i in numba.prange(n_rows):
+            r = rows[i]
+            src_start = src_indptr[r]
+            dst_start = out_offsets[i]
+            n = row_nnz[i]
+            for j in range(n):
+                out_data[dst_start + j] = src_data[src_start + j]
+                out_indices[dst_start + j] = src_indices[src_start + j]
+else:  # pragma: no cover
+
+    def _csr_subset_rows(src_data, src_indices, src_indptr, rows, out_data, out_indices):
+        raise ImportError("numba must be installed for in-memory sparse data: `pip install annbatch[numba]`")
 
 
 def _cupy_dtype(dtype: np.dtype) -> np.dtype:
@@ -68,13 +98,11 @@ class Loader[
 ](IterableDataset):
     """A loader for on-disk data anndata stores.
 
-    This loader batches together slice requests to the underlying stores to achieve higher performance.
-    This custom code to do this task will be upstreamed into anndata at some point and no longer rely on private zarr apis.
+    This loader by default batches together slice requests (`chunk_size` parameter) to the underlying stores to achieve higher performance.
+    You can also use `chunk_size==1` for perfect random sampling (for relevant samplers), although this comes at a performance penalty for on-disk (and likely in-memory) data as well.
+    Custom samplers are supported via the `batch_sampler` argument.
+    We thus recommend using :class:`~annbatch.DatasetCollection` to preshuffle your data (or pre-shuffling in-memory).
     The loader is agnostic to the on-disk chunking/sharding, but it may be advisable to align with the in-memory chunk size for dense.
-
-    The dataset class on its own is quite performant for "chunked loading" i.e., `chunk_size > 1`.
-    When `chunk_size == 1`, a :class:`torch.utils.data.DataLoader` should wrap the dataset object.
-    In this case, be sure to use `spawn` multiprocessing in the wrapping loader.
 
     If `preload_to_gpu` to True and `to_torch` is False, the yielded type is a `cupy` matrix.
     If `to_torch` is True, the yielded type is a :class:`torch.Tensor`.
@@ -108,25 +136,22 @@ class Loader[
             Whether or not to use cupy for non-io array operations like vstack and indexing once the data is in memory internally.
             This option entails greater GPU memory usage, but is faster at least for sparse operations.
             :func:`torch.vstack` does not support CSR sparse matrices, hence the current use of `cupy` internally (which also means `torch` is an optional dep).
+            Furthermore, there is no way to allocate pinned memory for jax arrays.
             Setting this to `False` is advisable when using the :class:`torch.utils.data.DataLoader` wrapper or potentially with dense data due to memory pressure.
-            For top performance, this should be used in conjuction with `to_torch` and then :meth:`torch.Tensor.to_dense` if you wish to densify.
-            :meth:`cupy.cuda.MemoryPool.free_all_blocks` (i.e., the method of the pool of :func:`cupy.get_default_memory_pool()`) is called aggresively to keep memory usage low.
+            For top performance, this should be used in conjunction with `to_torch` and then :meth:`torch.Tensor.to_dense` if you wish to densify.
+            :meth:`cupy.cuda.MemoryPool.free_all_blocks` (i.e., the method of the pool of :func:`cupy.get_default_memory_pool()`) is called aggressively to keep memory usage low.
             If you are using your own memory pool or allocator, you may have to free blocks on your own.
         to_torch
             Whether to return `torch.Tensor` as the output.
             Data transferred should be 0-copy independent of source, and transfer to cuda when applicable is non-blocking.
             Defaults to True if `torch` is installed.
-        concat_strategy
-            .. deprecated:: 0.1.4
-                We now write directly from disk to the in-memory buffer from which data is yielded.
-                This has optimal memory and compute performance obviating the need for this argument.
-                It will be removed in the next minor release.
 
-            The strategy for how in-memory, preloaded data should be concatenated and yielded.
-            With `concat-shuffle`, preloaded data is concatenated and then subsetted/shuffled (higher memory usage, but faster, at least for sparse data)
-            With `shuffle-concat`, preloaded data is first shuffled/subsetted chunk-by-chunk and then concatenated (lower memory usage, potentially faster for dense data)
-            The default is automatically chosen - `concat-shuffle` if the data added to the loader is sparse and otherwise `shuffle-concat`.
-            See
+            .. deprecated:: 0.2.1
+                Use `to` instead
+        to
+            The output library for which you would like your array output.
+            The default is no-op, but use `None` to smooth the transition for when `to_torch` was implicitly `True` i.e.,
+            if you don't want a warning, have `torch` installed, but don't want :func:`Loader.__iter__` to yield :class:`torch.Tensor`, set this to `None`.
 
 
     Examples
@@ -159,11 +184,11 @@ class Loader[
     _return_index: bool = False
     _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool = True
-    _to_torch: bool = True
-    _dataset_elem_cache: dict[int, CSRDatasetElems]
+    _to: Literal["torch", "jax"] | None = None
+    _sparse_dataset_elem_cache: dict[int, CSRDatasetElems]
     _batch_sampler: Sampler
-    _dataset_intervals: pd.IntervalIndex | None = None
     _collection_added: bool = False
+    _dtypes_homogeneous: bool = True
 
     def __init__(
         self,
@@ -176,16 +201,10 @@ class Loader[
         batch_size: int | None = None,
         preload_to_gpu: bool = find_spec("cupy") is not None,
         drop_last: bool | None = None,
-        to_torch: bool = find_spec("torch") is not None,
-        concat_strategy: None | concat_strategies = None,
+        to_torch: bool | None = None,
+        to: Literal["torch", "jax"] | None = Default,  # type: ignore
         rng: np.random.Generator | None = None,
     ):
-        if concat_strategy is not None:
-            warn(
-                "concat_strategy has no effect and will be removed in an upcoming release thanks to writing directly to output buffers.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         # args that are passed after resolving defaults
         core_sampler_args = {
             "chunk_size": chunk_size,
@@ -213,20 +232,45 @@ class Loader[
                 )
             else:
                 self._batch_sampler = SequentialSampler(**resolved_core_args)
-        if to_torch and not find_spec("torch"):
+        if to is Default:
+            if to_torch is None:
+                to_torch = find_spec("torch") is not None
+                if to_torch:
+                    warn(
+                        "`to_torch`'s implicit use of torch when installed will be replaced by the explicit `to: Literal['jax', 'torch']` argument",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+            else:
+                true_msg = "`to_torch`'s will be replaced by the explicit `to: Literal['jax', 'torch']` argument."
+                if to_torch:
+                    warn(true_msg, DeprecationWarning, stacklevel=2)
+                else:
+                    false_msg = true_msg + " To explicitly disable torch conversion, use `to=None`."
+                    warn(false_msg, DeprecationWarning, stacklevel=2)
+
+        elif isinstance(to_torch, bool):
+            raise ValueError("Don't provide both `to_torch` and `to`")
+        if (to_torch or to == "torch") and not find_spec("torch"):
             raise ImportError("Could not find torch dependency. Try `pip install torch`.")
+        if to == "jax" and not find_spec("jax"):
+            raise ImportError("Could not find jax dependency. Try `pip install jax`.")
         if preload_to_gpu and not find_spec("cupy"):
-            raise ImportError("Follow the directions at https://docs.cupy.dev/en/stable/install.html to install cupy.")
+            raise ImportError(
+                "Could not find cupy dependency. Follow the directions at https://docs.cupy.dev/en/stable/install.html to install cupy."
+            )
+        if to_torch and to is Default:
+            to = "torch"
 
         self._return_index = return_index
         self._preload_to_gpu = preload_to_gpu
-        self._to_torch = to_torch
+        self._to = to
         self._train_datasets = []
         self._shapes = []
-        self._dataset_elem_cache = {}
+        self._sparse_dataset_elem_cache = {}
 
     def __len__(self) -> int:
-        return self._batch_sampler.n_iters(self.n_obs)
+        return self._batch_sampler.n_batches(self.n_obs)
 
     @property
     def _sp_module(self) -> ModuleType:
@@ -311,7 +355,7 @@ class Loader[
         self,
         collection: DatasetCollection,
         *,
-        load_adata: Callable[[zarr.Group], ad.AnnData] = load_x_and_obs_and_var,
+        load_adata: Callable[[zarr.Group], ad.AnnData] = load_all_aligned,
     ) -> Self:
         """Load from an existing :class:`annbatch.DatasetCollection`.
 
@@ -323,8 +367,8 @@ class Loader[
             The collection whose on-disk datasets should be used in this loader.
         load_adata
             A custom load function - recall that whatever is found in :attr:`~anndata.AnnData.X` and :attr:`~anndata.AnnData.obs` will be yielded in batches.
-            Default is to just load `X` and all of `obs`.
-            This default behavior can degrade performance if you don't need all columns in `obs` - it is recommended to use the `load_adata` argument.
+            Only `X`, `obs`, and `var` are yielded for now; a future release will additionally yield observation-aligned
+            :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements.
         """
         if collection.is_empty:
             raise ValueError("DatasetCollection is empty")
@@ -347,25 +391,33 @@ class Loader[
         Parameters
         ----------
             adatas
-                List of :class:`anndata.AnnData` objects, with :class:`zarr.Array` or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
+                List of :class:`anndata.AnnData` objects, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
+                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them).
         """
         check_lt_1([len(adatas)], ["Number of adatas"])
         for adata in adatas:
-            dataset, obs, var = self._prepare_dataset_obs_and_var(adata)
-            self._add_dataset_unchecked(dataset, obs, var)
+            self._add_adata_unchecked(adata)
         return self
 
+    @validate_sampler
     def add_adata(self, adata: ad.AnnData) -> Self:
         """Append an adata to this dataset.
 
         Parameters
         ----------
             adata
-                A :class:`anndata.AnnData` object, with :class:`zarr.Array` or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
+                A :class:`anndata.AnnData` object, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
                 :attr:`~anndata.AnnData.var` must match the ``var`` of any previously added datasets.
+                Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them if present in the passed in `adata`).
         """
+        self._add_adata_unchecked(adata)
+        return self
+
+    def _add_adata_unchecked(self, adata: ad.AnnData) -> Self:
+        # TODO(obsm): drop this call - and `warn_ignored_obs_aligned` - once these elements are yielded
+        warn_ignored_obs_aligned(adata, stacklevel=3)
         dataset, obs, var = self._prepare_dataset_obs_and_var(adata)
-        self.add_dataset(dataset, obs, var)
+        self._add_dataset_unchecked(dataset, obs, var)
         return self
 
     def _prepare_dataset_obs_and_var(
@@ -411,7 +463,10 @@ class Loader[
 
     @validate_sampler
     def add_dataset(
-        self, dataset: BackingArray, obs: pd.DataFrame | None = None, var: pd.DataFrame | None = None
+        self,
+        dataset: BackingArray,
+        obs: pd.DataFrame | None = None,
+        var: pd.DataFrame | None = None,
     ) -> Self:
         """Append a dataset to this dataset.
 
@@ -429,7 +484,10 @@ class Loader[
         return self
 
     def _add_dataset_unchecked(
-        self, dataset: BackingArray, obs: pd.DataFrame | None = None, var: pd.DataFrame | None = None
+        self,
+        dataset: BackingArray,
+        obs: pd.DataFrame | None = None,
+        var: pd.DataFrame | None = None,
     ) -> Self:
         if len(self._train_datasets) > 0:
             if self._obs is None and obs is not None:
@@ -458,12 +516,22 @@ class Loader[
             raise TypeError(
                 "Cannot add CSRDataset backed by h5ad at the moment: see https://github.com/zarr-developers/VirtualiZarr/pull/790"
             )
+        if isinstance(dataset, sp.csr_matrix | sp.csr_array) and not find_spec("numba"):
+            raise ImportError("numba must be installed for in-memory sparse data: `pip install annbatch[numba]`")
         if not isinstance(obs, pd.DataFrame) and obs is not None:
             raise TypeError("obs must be a pandas DataFrame")
         if not isinstance(var, pd.DataFrame) and var is not None:
             raise TypeError("var must be a pandas DataFrame")
         datasets = self._train_datasets + [dataset]
         check_var_shapes(datasets)
+        self._dtypes_homogeneous = self._datasets_share_dtype(datasets)
+        if self._train_datasets and not self._dtypes_homogeneous:
+            warn(
+                f"Adding dataset with dtype {dataset.dtype!r} that differs from the existing dataset dtype(s) "
+                f"(first dataset: {self._train_datasets[0].dtype!r}). Heterogeneous dtypes incur extra per-batch "
+                "allocation and dtype promotion in the loader; consider casting all datasets to a common dtype.",
+                stacklevel=2,
+            )
         self._shapes = self._shapes + [dataset.shape]
         self._train_datasets = datasets
         if self._obs is not None:  # obs exist
@@ -478,91 +546,58 @@ class Loader[
                 "All datasets must have identical var DataFrames. "
                 "The var of the new dataset does not match the existing var."
             )
-        self._update_dataset_intervals()
         return self
 
-    def _update_dataset_intervals(self) -> None:
-        if len(self._shapes) == 0:
-            self._dataset_intervals = None
-            return
-        # Build intervals [start, end) for each dataset
-        cumsum = list(accumulate(shape[0] for shape in self._shapes))
-        starts = [0] + cumsum[:-1]
-        ends = cumsum
-        self._dataset_intervals = pd.IntervalIndex.from_arrays(starts, ends, closed="left")
-
-    def _get_relative_obs_indices(self, index: slice, *, use_original_space: bool = False) -> list[tuple[slice, int]]:
-        """Generate a slice relative to a dataset given a global slice index over all datasets.
-
-        For a given slice indexer of axis 0, return a new slice relative to the on-disk
-        data it represents given the number of total observations as well as the index of
-        the underlying data on disk from the argument `sparse_datasets` to the initializer.
-
-        For example, given slice index (10, 15), for 4 datasets each with size 5 on axis zero,
-        this function returns ((0,5), 2) representing slice (0,5) along axis zero of sparse dataset 2.
+    def _requests_to_dataset_rows(self, requests: list[slice] | np.ndarray) -> OrderedDict[int, np.ndarray]:
+        """Given a ndarray or list of slices, give the lookup between on-disk datasets and row indices relative to that dataset.
 
         Parameters
         ----------
-            index
-                The queried slice.
-            use_original_space
-                Whether the slices should be reindexed against the anndata objects.
+            requests
+                Slices or array of integers relative to the on-disk datasets.
 
         Returns
         -------
-            A slice relative to the dataset it represents as well as the index of said dataset in `sparse_datasets`.
+            A lookup between the dataset and its row indices, ordered by keys, and the permutation
+            ``order`` mapping each in-memory buffer position to its index in the original chunk order
+            (the buffer is filled in dataset order, so ``order`` is what undoes that reordering).
         """
-        if self._dataset_intervals is None:
-            return []
+        if isinstance(requests, np.ndarray) and np.issubdtype(requests.dtype, np.integer):
+            global_index = requests
+        else:
+            global_index = np.concatenate([np.arange(s.start, s.stop) for s in requests])
 
-        min_idx = index.start
-        max_idx = index.stop
+        # Locate each requested row in its dataset by binary-searching the dataset boundaries,
+        sizes = np.fromiter(
+            (shape[0] for shape in self._shapes),
+            dtype=np.int64,
+            count=len(self._shapes),
+        )
+        ends = np.cumsum(sizes)
+        starts = ends - sizes
+        dataset_of_row = np.searchsorted(ends, global_index, side="right")
 
-        slices = []
-        overlapping_mask = self._dataset_intervals.overlaps(pd.Interval(min_idx, max_idx, closed="left"))
-        for (array_start, array_end), dataset_idx in zip(
-            self._dataset_intervals[overlapping_mask].to_tuples(), np.flatnonzero(overlapping_mask), strict=True
-        ):
-            start = max(min_idx, array_start)
-            stop = min(max_idx, array_end)
-            if use_original_space:
-                slices.append((slice(start, stop), dataset_idx))
-            else:
-                relative_start = start - array_start
-                relative_stop = stop - array_start
-                slices.append((slice(relative_start, relative_stop), dataset_idx))
-        return slices
+        # Group rows by dataset: a stable sort keeps the within-dataset order
+        order = np.argsort(dataset_of_row, kind="stable")
+        grouped = dataset_of_row[order]
+        group_start = np.concatenate([[0], np.flatnonzero(np.diff(grouped)) + 1])
+        group_end = np.append(group_start[1:], grouped.size)
 
-    def _slices_to_slices_with_array_index(
-        self, slices: list[slice], *, use_original_space: bool = False
-    ) -> OrderedDict[int, list[slice]]:
-        """Given a list of slices, give the lookup between on-disk datasets and slices relative to that dataset.
+        result: OrderedDict[int, np.ndarray] = OrderedDict()
+        for gs, ge in zip(group_start, group_end, strict=True):
+            ds = int(grouped[gs])
+            result[ds] = global_index[order[gs:ge]] - starts[ds]
+        return result, order
 
-        In the codebase we use slice and chunk interchangeably. Not to be confused with the zarr chunking/sharding terminology.
+    def _alloc(self, shape: tuple[int, ...], dtype: np.dtype, *, use_pinned: bool) -> np.ndarray:
+        if use_pinned:
+            import cupyx as cpx
 
-        Parameters
-        ----------
-            slices
-                Slices to relative to the on-disk datasets.
-            use_original_space
-                Whether the slices should be reindexed against the anndata objects.
+            return cpx.empty_pinned(shape, dtype)
+        return np.empty(shape, dtype)
 
-        Returns
-        -------
-            A lookup between the dataset and its indexing slices, ordered by keys.
-        """
-        dataset_index_to_slices: defaultdict[int, list[slice]] = defaultdict(list)
-        for slice_ in slices:
-            for relative_obs_indices in self._get_relative_obs_indices(slice_, use_original_space=use_original_space):
-                dataset_index_to_slices[relative_obs_indices[1]] += [relative_obs_indices[0]]
-        keys = sorted(dataset_index_to_slices.keys())
-        dataset_index_to_slices_sorted = OrderedDict()
-        for k in keys:
-            dataset_index_to_slices_sorted[k] = dataset_index_to_slices[k]
-        return dataset_index_to_slices_sorted
-
-    def _allocate_out(self, dataset_index_to_slices: OrderedDict[int, list[slice]]) -> CSRContainer | np.ndarray:
-        """Preallocate a single contiguous output buffer covering all datasets and slices.
+    def _allocate_out(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> CSRContainer | np.ndarray:
+        """Preallocate a single contiguous output buffer covering all datasets and rows.
 
         For sparse data the buffer is a :class:`~annbatch.utils.CSRContainer` whose ``data``
         and ``indices`` arrays span the total number of non-zeros (derived from the cached
@@ -572,45 +607,124 @@ class Loader[
 
         Must be called after :meth:`_ensure_sparse_cache` for sparse datasets.
         """
-        total_rows = sum(s.stop - s.start for slices in dataset_index_to_slices.values() for s in slices)
+        total_rows = sum(len(rows) for rows in dataset_index_to_rows.values())
 
-        def _alloc(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
-            if self._preload_to_gpu:
-                import cupyx as cpx
-
-                return cpx.empty_pinned(shape, dtype)
-            return np.empty(shape, dtype)
-
-        if issubclass(self.dataset_type, ad.abc.CSRDataset):
+        if (is_backed := issubclass(self.dataset_type, ad.abc.CSRDataset)) or issubclass(
+            self.dataset_type, sp.csr_array | sp.csr_matrix
+        ):
+            datasets = self._sparse_dataset_elem_cache if is_backed else self._train_datasets
             total_nnz = sum(
-                int(self._dataset_elem_cache[idx].indptr[s.stop] - self._dataset_elem_cache[idx].indptr[s.start])
-                for idx, slices in dataset_index_to_slices.items()
-                for s in slices
+                int((datasets[idx].indptr[rows + 1] - datasets[idx].indptr[rows]).sum())
+                for idx, rows in dataset_index_to_rows.items()
             )
-            first_idx = next(iter(dataset_index_to_slices))
-            data_dtype = self._dataset_elem_cache[first_idx].data.dtype
-            indices_dtype = self._dataset_elem_cache[first_idx].indices.dtype
-            indptr_dtype = self._dataset_elem_cache[first_idx].indptr.dtype
+            first_idx = next(iter(dataset_index_to_rows))
+            data_dtype = datasets[first_idx].data.dtype
+            indices_dtype = datasets[first_idx].indices.dtype
+            indptr_dtype = datasets[first_idx].indptr.dtype
             return CSRContainer(
                 elems=(
-                    _alloc((total_nnz,), data_dtype),
-                    _alloc((total_nnz,), indices_dtype),
+                    self._alloc((total_nnz,), data_dtype, use_pinned=self._preload_to_gpu),
+                    self._alloc((total_nnz,), indices_dtype, use_pinned=self._preload_to_gpu),
                     np.empty(total_rows + 1, dtype=indptr_dtype),
                 ),
                 shape=(total_rows, self.n_var),
                 dtype=data_dtype,
             )
         else:
-            first_idx = next(iter(dataset_index_to_slices))
+            first_idx = next(iter(dataset_index_to_rows))
             dtype = self._train_datasets[first_idx].dtype
             shape_res = self._train_datasets[first_idx].shape[1:]
-            return _alloc((total_rows, *shape_res), dtype)
+            return self._alloc((total_rows, *shape_res), dtype, use_pinned=self._preload_to_gpu)
+
+    @staticmethod
+    def _datasets_share_dtype(datasets: list[BackingArray]) -> bool:
+        """Whether all given dataset-like objects share the same dtype(s)."""
+        if len(datasets) <= 1:
+            return True
+
+        def dtypes_of(d):
+            if isinstance(d, ad.abc.CSRDataset):
+                return (d.group["data"].dtype, d.group["indices"].dtype)
+            if hasattr(d, "data") and hasattr(d, "indices"):
+                return (d.data.dtype, d.indices.dtype)
+            return (d.dtype,)
+
+        first = dtypes_of(datasets[0])
+        return all(dtypes_of(d) == first for d in datasets[1:])
+
+    def _allocate_per_dataset_outs(
+        self, dataset_index_to_rows: OrderedDict[int, np.ndarray]
+    ) -> OrderedDict[int, CSRContainer | np.ndarray]:
+        """Allocate one output buffer per dataset, each using that dataset's native dtype(s).
+
+        Used when datasets have differing dtypes — the per-dataset buffers are concatenated
+        into a final buffer of the promoted dtype by :meth:`_concatenate_outs`.
+        Must be called after :meth:`_ensure_sparse_cache` for backed-sparse datasets.
+        """
+        is_backed_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        is_sparse = is_backed_sparse or issubclass(self.dataset_type, sp.csr_array | sp.csr_matrix)
+        outs: OrderedDict[int, CSRContainer | np.ndarray] = OrderedDict()
+        if is_sparse:
+            datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
+            for idx, rows in dataset_index_to_rows.items():
+                ds = datasets[idx]
+                nnz = int((ds.indptr[rows + 1] - ds.indptr[rows]).sum())
+                outs[idx] = CSRContainer(
+                    elems=(
+                        self._alloc((nnz,), ds.data.dtype, use_pinned=False),
+                        self._alloc((nnz,), ds.indices.dtype, use_pinned=False),
+                        self._alloc((len(rows) + 1,), np.min_scalar_type(nnz), use_pinned=False),
+                    ),
+                    shape=(len(rows), self.n_var),
+                    dtype=ds.data.dtype,
+                )
+        else:
+            for idx, rows in dataset_index_to_rows.items():
+                ds = self._train_datasets[idx]
+                outs[idx] = self._alloc((len(rows), *ds.shape[1:]), ds.dtype, use_pinned=False)
+        return outs
+
+    def _concatenate_outs(self, outs: OrderedDict[int, CSRContainer | np.ndarray]) -> CSRContainer | np.ndarray:
+        """Concatenate per-dataset buffers into a single buffer with promoted dtype(s)."""
+        values = list(outs.values())
+        if isinstance(values[0], CSRContainer):
+            data_dtype = np.result_type(*[o.elems[0].dtype for o in values])
+            indices_dtype = np.result_type(*[o.elems[1].dtype for o in values])
+            total_nnz = sum(o.elems[0].size for o in values)
+            total_rows = sum(o.shape[0] for o in values)
+            data = self._alloc((total_nnz,), data_dtype, use_pinned=self._preload_to_gpu)
+            indices = self._alloc((total_nnz,), indices_dtype, use_pinned=self._preload_to_gpu)
+            indptr = self._alloc((total_rows + 1,), np.min_scalar_type(total_nnz), use_pinned=self._preload_to_gpu)
+            indptr[0] = 0
+            nnz_offset = 0
+            row_offset = 0
+            for o in values:
+                n = o.elems[0].size
+                r = o.shape[0]
+                data[nnz_offset : nnz_offset + n] = o.elems[0]
+                indices[nnz_offset : nnz_offset + n] = o.elems[1]
+                indptr[row_offset + 1 : row_offset + r + 1] = o.elems[2][1:] + nnz_offset
+                nnz_offset += n
+                row_offset += r
+            return CSRContainer(
+                elems=(data, indices, indptr),
+                shape=(total_rows, self.n_var),
+                dtype=data_dtype,
+            )
+        dtype = np.result_type(*[o.dtype for o in values])
+        total_rows = sum(o.shape[0] for o in values)
+        out = self._alloc((total_rows, *values[0].shape[1:]), dtype, use_pinned=self._preload_to_gpu)
+        offset = 0
+        for o in values:
+            out[offset : offset + o.shape[0]] = o
+            offset += o.shape[0]
+        return out
 
     @singledispatchmethod
     async def _fetch_data(
         self,
         dataset: ZarrArray | CSRDatasetElems,
-        slices: list[slice],
+        rows: np.ndarray,
         out: CSRContainer | np.ndarray,
     ) -> None:
         """Fetch data from an on-disk store into a preallocated buffer.
@@ -619,8 +733,8 @@ class Loader[
         ----------
         dataset
             The underlying store.
-        slices
-            The slices to fetch.
+        rows
+            Array of integer row indices within this dataset to fetch.
         out
             Preallocated buffer to write into — a contiguous view of the full
             output buffer allocated by :meth:`_allocate_out`.
@@ -633,15 +747,17 @@ class Loader[
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
     @_fetch_data.register
-    async def _fetch_data_dense(self, dataset: ZarrArray, slices: list[slice], out: np.ndarray) -> None:
+    async def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
+        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+        row_runs = np.split(rows, breaks)
         indexer = MultiBasicIndexer(
             [
                 zarr.core.indexing.BasicIndexer(
-                    (s, Ellipsis),
+                    (slice(int(r[0]), int(r[-1]) + 1), Ellipsis),
                     shape=dataset.metadata.shape,
                     chunk_grid=dataset.metadata.chunk_grid if zarr_version <= Version("3.1.6") else dataset._chunk_grid,
                 )
-                for s in slices
+                for r in row_runs
             ]
         )
         buffer_prototype = zarr.core.buffer.default_buffer_prototype()
@@ -678,16 +794,16 @@ class Loader[
 
     async def _ensure_sparse_cache(self) -> None:
         """Build up the cache of datasets i.e., in-memory indptr, and backed indices and data."""
-        arr_idxs = [idx for idx in range(len(self._train_datasets)) if idx not in self._dataset_elem_cache]
+        arr_idxs = [idx for idx in range(len(self._train_datasets)) if idx not in self._sparse_dataset_elem_cache]
         all_elems: list[CSRDatasetElems] = await asyncio.gather(
             *(
                 self._create_sparse_elems(idx)
                 for idx in range(len(self._train_datasets))
-                if idx not in self._dataset_elem_cache
+                if idx not in self._sparse_dataset_elem_cache
             )
         )
         for idx, elems in zip(arr_idxs, all_elems, strict=True):
-            self._dataset_elem_cache[idx] = elems
+            self._sparse_dataset_elem_cache[idx] = elems
 
     def _get_elem_from_cache(self, dataset_idx: int) -> CSRDatasetElems | ZarrArray:
         """Return the arrays (zarr or otherwise) needed to represent on-disk data at a given index.
@@ -701,21 +817,49 @@ class Loader[
         -------
             The arrays representing the sparse data.
         """
-        if dataset_idx not in self._dataset_elem_cache:
+        if dataset_idx not in self._sparse_dataset_elem_cache:
             raise ValueError("Cache not prepared")
-        return self._dataset_elem_cache[dataset_idx]
+        return self._sparse_dataset_elem_cache[dataset_idx]
+
+    @_fetch_data.register
+    async def _fetch_data_numpy_matrix(
+        self,
+        dataset: np.ndarray,
+        rows: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        out[:] = dataset[rows]
+
+    @_fetch_data.register
+    async def _fetch_data_csr_matrix(
+        self,
+        dataset: sp.csr_matrix | sp.csr_array,
+        rows: np.ndarray,
+        out: CSRContainer,
+    ) -> None:
+        _csr_subset_rows(
+            dataset.data,
+            dataset.indices,
+            dataset.indptr,
+            np.ascontiguousarray(rows),
+            out.elems[0],
+            out.elems[1],
+        )
 
     @_fetch_data.register
     async def _fetch_data_sparse(
         self,
         dataset: CSRDatasetElems,
-        slices: list[slice],
+        rows: np.ndarray,
         out: CSRContainer,
     ) -> None:
         # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
         # for the inspiration of this function.
+        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+        row_runs = np.split(rows, breaks)
         indptr, indices, data = dataset
-        indptr_limits = [slice(int(indptr[s.start]), int(indptr[s.stop])) for s in slices]
+        indptr_indices = [indptr[slice(s[0], s[-1] + 2)] for s in row_runs]
+        indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
         indexer_data, indexer_indices = (
             MultiBasicIndexer(
                 [
@@ -746,47 +890,70 @@ class Loader[
 
     async def _index_datasets(
         self,
-        dataset_index_to_slices: OrderedDict[int, list[slice]],
+        dataset_index_to_rows: OrderedDict[int, np.ndarray],
     ) -> CSRContainer | np.ndarray:
         """Preallocate one output buffer, dispatch concurrent fetches into per-dataset views, then return the buffer.
 
         Parameters
         ----------
-            dataset_index_to_slices
-                A lookup of the list-placement index of a dataset to the request slices.
+            dataset_index_to_rows
+                A lookup of the list-placement index of a dataset to the sorted row indices to fetch.
         """
-        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
-        if is_sparse:
+        is_backed_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        is_sparse = is_backed_sparse or issubclass(self.dataset_type, sp.csr_array | sp.csr_matrix)
+        if is_backed_sparse:
             await self._ensure_sparse_cache()
 
-        out = self._allocate_out(dataset_index_to_slices)
+        if not self._dtypes_homogeneous:
+            per_dataset_outs = self._allocate_per_dataset_outs(dataset_index_to_rows)
+            tasks = [
+                self._fetch_data(
+                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
+                    rows,
+                    per_dataset_outs[dataset_idx],
+                )
+                for dataset_idx, rows in dataset_index_to_rows.items()
+            ]
+            await asyncio.gather(*tasks)
+            if is_sparse:
+                datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
+                for dataset_idx, rows in dataset_index_to_rows.items():
+                    sub_out = per_dataset_outs[dataset_idx]
+                    cached_indptr = datasets[dataset_idx].indptr
+                    per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                    sub_out.elems[2][0] = 0
+                    np.cumsum(per_row_nnz, out=sub_out.elems[2][1:])
+            return self._concatenate_outs(per_dataset_outs)
+
+        out = self._allocate_out(dataset_index_to_rows)
 
         tasks = []
         row_offset = 0
         nnz_offset = 0
 
-        for dataset_idx, slices in dataset_index_to_slices.items():
-            nrows = sum(s.stop - s.start for s in slices)
+        for dataset_idx, rows in dataset_index_to_rows.items():
+            nrows = len(rows)
             if is_sparse:
-                cached_indptr = self._dataset_elem_cache[dataset_idx].indptr
-                nnnz = sum(int(cached_indptr[s.stop] - cached_indptr[s.start]) for s in slices)
+                datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
+                cached_indptr = datasets[dataset_idx].indptr
+                nnz = int((cached_indptr[rows + 1] - cached_indptr[rows]).sum())
                 out_view: CSRContainer | np.ndarray = CSRContainer(
                     elems=(
-                        out.elems[0][nnz_offset : nnz_offset + nnnz],
-                        out.elems[1][nnz_offset : nnz_offset + nnnz],
+                        out.elems[0][nnz_offset : nnz_offset + nnz],
+                        out.elems[1][nnz_offset : nnz_offset + nnz],
                         out.elems[2][row_offset : row_offset + nrows + 1],
                     ),
                     shape=(nrows, self.n_var),
                     dtype=out.dtype,
                 )
-                nnz_offset += nnnz
+                nnz_offset += nnz
             else:
                 out_view = out[row_offset : row_offset + nrows]
 
             tasks.append(
                 self._fetch_data(
-                    self._get_elem_from_cache(dataset_idx) if is_sparse else self._train_datasets[dataset_idx],
-                    slices,
+                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
+                    rows,
                     out_view,
                 )
             )
@@ -795,18 +962,18 @@ class Loader[
         await asyncio.gather(*tasks)
 
         if is_sparse:
+            datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
             running_nnz = 0
             row_pos = 0
             out.elems[2][0] = 0
-            for dataset_idx, slices in dataset_index_to_slices.items():
-                cached_indptr = self._dataset_elem_cache[dataset_idx].indptr
-                for s in slices:
-                    nrows_s = s.stop - s.start
-                    out.elems[2][row_pos + 1 : row_pos + nrows_s + 1] = (
-                        cached_indptr[s.start + 1 : s.stop + 1] - cached_indptr[s.start] + running_nnz
-                    )
-                    running_nnz += int(cached_indptr[s.stop] - cached_indptr[s.start])
-                    row_pos += nrows_s
+            for dataset_idx, rows in dataset_index_to_rows.items():
+                cached_indptr = datasets[dataset_idx].indptr
+                per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                dest = out.elems[2][row_pos + 1 : row_pos + len(rows) + 1]
+                np.cumsum(per_row_nnz, out=dest)
+                dest += running_nnz
+                running_nnz = dest[-1]
+                row_pos += len(rows)
 
         return out
 
@@ -827,13 +994,39 @@ class Loader[
             [len(self._train_datasets), self.n_obs],
             ["Number of datasets", "Number of observations"],
         )
-        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
+        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset | sp.csr_matrix | sp.csr_array)
+        # Create `positions` variable so we don't need to run `np.arange` (O(n)) every time
+        positions = np.empty(0, dtype=np.intp)
         for load_request in self._batch_sampler.sample(self.n_obs):
-            chunks_to_load = load_request["chunks"]
+            requests_to_load = load_request.get("requests", None)
+            if requests_to_load is None:
+                requests_to_load = load_request.get("chunks", None)
+                if requests_to_load is not None:
+                    # this is for backwards compat.
+                    warn(
+                        "The `chunks` key in the load request is deprecated and will be removed in a future version. Please use `requests` instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    raise KeyError("load_request must contain either 'requests' or 'chunks'.")
             splits = load_request["splits"]
-            dataset_index_to_slices = self._slices_to_slices_with_array_index(chunks_to_load, use_original_space=False)
 
-            raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_slices))
+            dataset_index_to_rows, order = self._requests_to_dataset_rows(requests_to_load)
+
+            # The buffer below is filled in dataset order, but ``splits`` are expressed in the
+            # sampler's `LoadRequest.request` order. ``inv`` maps a request-order position to its buffer position so
+            # the split semantics are independent of how chunks were regrouped across datasets.
+            # ``order`` is a permutation of ``range(n)``, so every used slot is overwritten -- the
+            # reused buffer never carries stale values from a previous request.
+            n = order.size
+            inv_buffer = np.empty(n, dtype=np.intp)
+            if n > positions.size:
+                positions = np.arange(n, dtype=np.intp)
+            inv = inv_buffer[:n]
+            inv[order] = positions[:n]
+
+            raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
 
             if is_sparse:
                 in_memory_data = self._sp_module.csr_matrix(
@@ -844,40 +1037,31 @@ class Loader[
             else:
                 in_memory_data = self._np_module.asarray(raw_out)
 
-            concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_slices)
-            in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(chunks_to_load)
+            concatenated_obs: None | pd.DataFrame = self._maybe_accumulate_obs(dataset_index_to_rows)
+            in_memory_indices: None | np.ndarray = self._maybe_accumulate_indices(dataset_index_to_rows)
             for split in splits:
-                data = in_memory_data[split]
+                sel = inv[split]
+                data = in_memory_data[sel]
                 yield {
-                    "X": data if not self._to_torch else to_torch(data, self._preload_to_gpu),
-                    "obs": concatenated_obs.iloc[split] if concatenated_obs is not None else None,
+                    "X": data if self._to is None else convert(data, self._preload_to_gpu, self._to),
+                    "obs": concatenated_obs.iloc[sel] if concatenated_obs is not None else None,
                     "var": self._var,
-                    "index": in_memory_indices[split] if in_memory_indices is not None else None,
+                    "index": in_memory_indices[sel] if in_memory_indices is not None else None,
                 }
 
             # https://github.com/cupy/cupy/issues/9625
             if self._preload_to_gpu and is_sparse:
                 self._np_module.get_default_memory_pool().free_all_blocks()
 
-    def _maybe_accumulate_obs(self, dataset_index_to_slices: OrderedDict[int, list[slice]]) -> pd.DataFrame | None:
-        """Gather obs labels for the loaded slices if possible."""
+    def _maybe_accumulate_obs(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> pd.DataFrame | None:
+        """Gather obs labels for the loaded rows if possible."""
         if self._obs is None:
             return None
-        return pd.concat(
-            [
-                self._obs[idx].iloc[np.concatenate([np.arange(s.start, s.stop) for s in slices])]
-                for idx, slices in dataset_index_to_slices.items()
-            ]
-        )
+        return pd.concat([self._obs[idx].iloc[rows] for idx, rows in dataset_index_to_rows.items()])
 
-    def _maybe_accumulate_indices(self, slices: list[slice]) -> np.ndarray | None:
-        """Gather original indices for the loaded slices if possible."""
+    def _maybe_accumulate_indices(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> np.ndarray | None:
+        """Gather original indices for the loaded rows if possible."""
         if self._return_index is False:
             return None
-        dataset_index_to_slices = self._slices_to_slices_with_array_index(slices, use_original_space=True)
-        return np.concatenate(
-            [
-                np.concatenate([np.arange(s.start, s.stop) for s in dataset_index_to_slices[idx]])
-                for idx in dataset_index_to_slices
-            ]
-        )
+        dataset_offsets = np.concatenate(([0], np.cumsum([shape[0] for shape in self._shapes])))
+        return np.concatenate([rows + dataset_offsets[idx] for idx, rows in dataset_index_to_rows.items()])

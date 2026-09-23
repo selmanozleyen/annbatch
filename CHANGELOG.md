@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning][].
 
 [keep a changelog]: https://keepachangelog.com/en/1.0.0/
 [semantic versioning]: https://semver.org/spec/v2.0.0.html
+## Unreleased
+
+### Fixed
+
+- {class}`~annbatch.samplers.ClassSampler` picked one of a class's runs uniformly instead of picking uniformly among its chunk starts, oversampling the rows of short runs.
+
+## [0.2.2]
+
+### Feature
+
+- Only `X`, `obs`, and `var` are currently yielded when reading a {class}`~annbatch.DatasetCollection` or adding data via {meth}`~annbatch.Loader.add_adata`/{meth}`~annbatch.Loader.add_adatas`. When observation-aligned {attr}`~anndata.AnnData.obsm` or {attr}`~anndata.AnnData.layers` elements are present, they are not yielded for now and a {class}`FutureWarning` is emitted; a **future release will yield them as well**. To silence the warning, drop these elements beforehand (e.g. via a custom `load_adata` for {meth}`~annbatch.Loader.use_collection`). {attr}`~anndata.AnnData.obsp` is not yielded at all: it is `obs`-aligned on both axes, so a row batch of it is `n_batch` x `n_batch`.
+
+### Fixed
+
+- {class}`~annbatch.samplers.ClassSampler` was producing potentially corrupted, multi-class samples despite its promise of "pure" batches.
+
+## [0.2.1]
+
+### Feature
+- A new `to` argument will replace `to_torch` (now deprecated) in {class}`~annbatch.Loader`. `to_torch` previously had automatic recognition of `torch` and would yield batches with {class}`torch.Tensor` if it were installed. The new `to` argument requires explicit setting as one of `torch` or `jax` (or `None` to disable automatic `torch` inference until `to_torch` is removed). `preload_to_gpu` will remain an in-memory shuffle-accelerator but now will go 0-copy to jax if `to="jax"` as well using `dlpack` (just as it did for `torch`).
+
+## [0.2.0]
+
+### Feature
+- Add a `merge` argument to {meth}`annbatch.DatasetCollection.add_adatas` to handle how columns in {attr}`~anndata.AnnData.var` are handled when creating the on-disk dataset.
+- Now {attr}`annbatch.types.LoadRequest.requests` (formerly `annbatch.types.LoadRequest.chunks`) can also be a numpy array of integers.
+- Support in memory matrices ({class}`scipy.sparse.csr_matrix`, {class}`scipy.sparse.csr_array`, {class}`numpy.ndarray`) requiring `numba` for the sparse cases (new additional dependency group for `numba` included).
+- Added {class}`annbatch.samplers.ClassSampler`: a replacement sampler that takes a {class}`pandas.Categorical` (e.g. `adata.obs["cell_type"].astype("category")`). Sampling is with replacement; for each batch, classes are drawn by `class_weights` (uniform by default).
+
+### Breaking
+- Removal of deprecated `annbatch.ChunkSampler`
+- Deprecated `n_iters` method of {class}`~annbatch.abc.Sampler` in favor of `n_batches` to match the actual semantics of the returned value.
+- Added `n_batches` method to {class}`~annbatch.abc.Sampler` and all sampler implementations.
+- Remove deprecated `concat_strategy` argument from {class}`~annbatch.Loader`
+- {attr}`annbatch.types.LoadRequest.splits` now index in **request order** -- position `j` is the `j`-th observation when the request's `chunks` are concatenated in the order given. Previously, `splits` had to index into the loader's internal dataset-grouped memory layout. The {class}`~annbatch.Loader` now remaps splits to that layout itself, so custom samplers must produce chunk-order splits and stop compensating for the dataset reordering.
+- Deprecated `annbatch.types.LoadRequest.chunks` in favor of {attr}`annbatch.types.LoadRequest.requests`.
+
+### Fixed
+- Handling of different data types i.e., `float32` vs `float64` in the same {class}`~annbatch.Loader`
+
+## [0.1.6]
+
+### Performance
+- New internal use of {class}`numpy.ndarray` for indexing means the small chunk sizes (i.e., perfect random sampling) is much more performant.
+
+### Docs
+- New docs including a logo!
 
 ## [0.1.5]
 
@@ -24,11 +71,11 @@ and this project adheres to [Semantic Versioning][].
 ## [0.1.3]
 
 ### Features
-- Added {class}`annbatch.samplers.RandomSampler` and {class}`annbatch.samplers.SequentialSampler` as replacements for {class}`annbatch.ChunkSampler`.
+- Added {class}`annbatch.samplers.RandomSampler` and {class}`annbatch.samplers.SequentialSampler` as replacements for `annbatch.ChunkSampler`.
 - Exposed {class}`annbatch.samplers.DistributedSampler` for distributed training.
 
 ### Breaking
-- Deprecated {class}`annbatch.ChunkSampler` in favor of {class}`annbatch.samplers.RandomSampler` and {class}`annbatch.samplers.SequentialSampler`.
+- Deprecated `annbatch.ChunkSampler` in favor of {class}`annbatch.samplers.RandomSampler` and {class}`annbatch.samplers.SequentialSampler`.
 
 ## [0.1.2]
 
@@ -59,7 +106,7 @@ and this project adheres to [Semantic Versioning][].
 
 ## [0.0.8]
 
-- {class}`~annbatch.Loader` acccepts an `rng` argument now
+- {class}`~annbatch.Loader` accepts an `rng` argument now
 
 ## [0.0.7]
 
@@ -80,7 +127,7 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 - Introduced an {class}`annbatch.abc.Sampler` abstract base class. Users can implement and pass any class instance that is a subclass to the ``batch_sampler`` argument of {class}`annbatch.Loader`.
-- Exposed the older default sampling scheme as {class}`annbatch.ChunkSampler`, which is used internally to match older behavior when ``batch_sampler`` isn't provided to {class}`annbatch.Loader`.
+- Exposed the older default sampling scheme as `annbatch.ChunkSampler`, which is used internally to match older behavior when ``batch_sampler`` isn't provided to {class}`annbatch.Loader`.
 
 ## [0.0.4]
 

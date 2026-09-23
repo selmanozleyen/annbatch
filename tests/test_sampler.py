@@ -1,4 +1,4 @@
-"""Tests for RandomSampler, SequentialSampler, ChunkSampler, and DistributedSampler."""
+"""Tests for RandomSampler, SequentialSampler, and DistributedSampler."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from annbatch.abc import Sampler
-from annbatch.samplers import ChunkSampler, DistributedSampler, RandomSampler, SequentialSampler
+from annbatch.samplers import DistributedSampler, RandomSampler, SequentialSampler
 from annbatch.samplers._utils import WorkerInfo
 
 if TYPE_CHECKING:
@@ -22,22 +22,22 @@ if TYPE_CHECKING:
 
 
 def collect_indices(sampler: Sampler, n_obs: int) -> tuple[list[int], list[slice], list[np.ndarray]]:
-    """Helper to collect loaded indices, chunks, and splits from sampler."""
+    """Helper to collect loaded indices, requests, and splits from sampler."""
     indices: list[int] = []
-    chunks: list[slice] = []
+    requests: list[slice] = []
     splits: list[np.ndarray] = []
     for load_request in sampler.sample(n_obs):
         assert len(load_request["splits"]) > 0, "splits must be non-empty"
         assert all(len(s) > 0 for s in load_request["splits"]), "splits must be non-empty"
-        assert len(load_request["chunks"]) > 0, "chunks must be non-empty"
-        assert all(c.stop - c.start > 0 for c in load_request["chunks"]), "chunks must be non-empty"
+        assert len(load_request["requests"]) > 0, "requests must be non-empty"
+        assert all(c.stop - c.start > 0 for c in load_request["requests"]), "requests must be non-empty"
         splits.extend(load_request["splits"])
 
-        for c in load_request["chunks"]:
-            chunks.append(c)
+        for c in load_request["requests"]:
+            requests.append(c)
             indices.extend(range(c.start, c.stop))
 
-    return indices, chunks, splits
+    return indices, requests, splits
 
 
 @pytest.fixture(params=[RandomSampler, SequentialSampler])
@@ -128,11 +128,11 @@ def test_mask_coverage(
     sampler.validate(n_obs)
 
 
-def test_batch_sizes_match_expected_pattern(chunk_sampler_cls: type[ChunkSampler]):
+def test_batch_sizes_match_expected_pattern(chunk_sampler_cls: type[Sampler]):
     """Test that batch sizes match expected pattern."""
     n_obs, chunk_size, preload_nchunks, batch_size = 103, 10, 2, 5
-    # last chunk is incomplete and is also the last batch in the load request
-    expected_last_chunk_size = 3
+    # last slice is incomplete and is also the last batch in the load request
+    expected_last_slice_size = 3
     expected_last_batch_size = 3
     expected_last_num_splits = 1
     expected_num_load_requests = 6
@@ -146,18 +146,18 @@ def test_batch_sizes_match_expected_pattern(chunk_sampler_cls: type[ChunkSampler
     all_requests: list[LoadRequest] = list(sampler.sample(n_obs))
     assert len(all_requests) == expected_num_load_requests
     for req_idx, load_request in enumerate(all_requests[:-1]):
-        assert all(chunk.stop - chunk.start == chunk_size for chunk in load_request["chunks"]), (
-            f"chunk size mismatch at request {req_idx}:",
-            f"chunks: {load_request['chunks']}",
+        assert all(chunk.stop - chunk.start == chunk_size for chunk in load_request["requests"]), (
+            f"slice size mismatch at request {req_idx}:",
+            f"requests: {load_request['requests']}",
         )
         assert all(len(split) == batch_size for split in load_request["splits"]), (
             f"batch size mismatch at request {req_idx}:splits: {load_request['splits']}"
         )
     last_request = all_requests[-1]
     assert len(last_request["splits"]) == expected_last_num_splits, "last request num splits mismatch"
-    assert all(chunk.stop - chunk.start == expected_last_chunk_size for chunk in last_request["chunks"]), (
-        "last request chunk size mismatch",
-        f"chunks: {last_request['chunks']}",
+    assert all(chunk.stop - chunk.start == expected_last_slice_size for chunk in last_request["requests"]), (
+        "last request slice size mismatch",
+        f"requests: {last_request['requests']}",
     )
     assert all(len(split) == expected_last_batch_size for split in last_request["splits"]), (
         "last request batch size mismatch",
@@ -208,7 +208,7 @@ def test_workers_cover_full_dataset_without_overlap(
             worker_indices, _, _ = collect_indices(sampler, n_obs)
             all_worker_indices.append(worker_indices)
 
-    # All workers should have disjoint chunks
+    # All workers should have disjoint slices
     for i in range(num_workers):
         for j in range(i + 1, num_workers):
             assert set(all_worker_indices[i]).isdisjoint(all_worker_indices[j])
@@ -418,9 +418,11 @@ def test_drop_last_false_with_multiple_workers_raises():
         ),
     ],
 )
-def test_n_iters_property(sampler: Sampler, n_obs: int, expected: int):
-    """Test that n_iters() returns the correct value for different configurations."""
-    assert sampler.n_iters(n_obs) == expected
+def test_n_batches_property(sampler: Sampler, n_obs: int, expected: int):
+    """Test that n_batches() returns the correct value for different configurations."""
+    assert sampler.n_batches(n_obs) == expected
+    with pytest.warns(DeprecationWarning, match="n_iters is deprecated"):
+        assert sampler.n_iters(n_obs) == expected
 
 
 # =============================================================================
@@ -479,10 +481,10 @@ def test_num_samples_invariants(
         return
 
     expected_batches = math.ceil(num_samples / batch_size)
-    _, all_chunks, splits = collect_indices(sampler, n_obs)
+    _, all_requests, splits = collect_indices(sampler, n_obs)
     assert len(splits) == expected_batches, f"Expected {expected_batches} batches, got {len(splits)}"
 
-    for chunk in all_chunks:
+    for chunk in all_requests:
         assert chunk.stop - chunk.start <= chunk_size, f"Oversized chunk: {chunk}"
         assert chunk.start >= start, f"Chunk start {chunk.start} < mask start {start}"
         assert chunk.stop <= stop, f"Chunk stop {chunk.stop} > mask stop {stop}"
@@ -533,7 +535,7 @@ class SimpleSampler(Sampler):
     def shuffle(self) -> bool | None:
         return self._shuffle
 
-    def n_iters(self, n_obs: int) -> int:
+    def n_batches(self, n_obs: int) -> int:
         if self._batch_size is None or self._batch_size == 0:
             return 1
         return math.ceil(n_obs / self._batch_size)
@@ -544,20 +546,20 @@ class SimpleSampler(Sampler):
 
     def _sample(self, n_obs: int):
         """Yield LoadRequests with or without splits."""
-        chunk_size = 10
-        chunks = []
-        for start in range(0, n_obs, chunk_size):
-            stop = min(start + chunk_size, n_obs)
+        slice_size = 10
+        slices = []
+        for start in range(0, n_obs, slice_size):
+            stop = min(start + slice_size, n_obs)
             if self._provide_splits:
-                # Yield one LoadRequest per chunk with splits
-                yield {"chunks": [slice(start, stop)], "splits": [np.arange(stop - start)]}
+                # Yield one LoadRequest per slice with splits
+                yield {"requests": [slice(start, stop)], "splits": [np.arange(stop - start)]}
             else:
-                # Accumulate chunks
-                chunks.append(slice(start, stop))
+                # Accumulate slices
+                slices.append(slice(start, stop))
 
-        # Yield accumulated chunks without splits
+        # Yield accumulated slices without splits
         if not self._provide_splits:
-            yield {"chunks": chunks}
+            yield {"requests": slices}
 
 
 @pytest.mark.parametrize(
@@ -607,17 +609,6 @@ def test_automatic_batching_respects_shuffle_flag(shuffle: bool):
         assert all_indices != list(range(n_obs)), "Indices should be shuffled"
     else:
         assert all_indices == list(range(n_obs)), "Indices should be sequential"
-
-
-# =============================================================================
-# ChunkSampler deprecation warning
-# =============================================================================
-
-
-def test_chunk_sampler_deprecation_warning():
-    """Test that ChunkSampler emits a DeprecationWarning."""
-    with pytest.deprecated_call(match="ChunkSampler is deprecated"):
-        ChunkSampler(chunk_size=10, preload_nchunks=2, batch_size=5)
 
 
 @pytest.mark.parametrize(
@@ -846,8 +837,8 @@ class TestDistributedSampler:
                 f"Rank {rank}: batch shuffling should be reproducible with same seed"
             )
 
-    def test_n_iters_matches_actual_batch_count(self, make_distributed_sampler: Callable[..., DistributedSampler]):
-        """n_iters should match the actual number of yielded batches."""
+    def test_n_batches_matches_actual_batch_count(self, make_distributed_sampler: Callable[..., DistributedSampler]):
+        """n_batches should match the actual number of yielded batches."""
         n_obs, world_size = 205, 3
         chunk_size, preload_nchunks, batch_size = 10, 2, 10
 
@@ -861,10 +852,10 @@ class TestDistributedSampler:
                 enforce_equal_batches=True,
                 drop_last=True,
             )
-            expected = sampler.n_iters(n_obs)
+            expected = sampler.n_batches(n_obs)
             _, _, splits = collect_indices(sampler, n_obs)
             actual = len(splits)
-            assert actual == expected, f"rank {rank}: n_iters={expected}, actual={actual}"
+            assert actual == expected, f"rank {rank}: n_batches={expected}, actual={actual}"
 
     def test_wraps_sequential_sampler(self, make_distributed_sampler: Callable[..., DistributedSampler]):
         """Distributed wrapper should also work with SequentialSampler."""

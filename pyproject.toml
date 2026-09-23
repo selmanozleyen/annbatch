@@ -21,6 +21,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
 ]
 dynamic = [ "version" ]
 dependencies = [
@@ -40,32 +41,15 @@ optional-dependencies.cupy-cuda12 = [
 optional-dependencies.cupy-cuda13 = [
   "cupy-cuda13x[ctk]",
 ]
-optional-dependencies.dev = [
-  "pre-commit",
-  "twine>=4.0.2",
+optional-dependencies.jax = [ "jax" ]
+optional-dependencies.jax-cuda12 = [
+  "jax[cuda12]",
 ]
-optional-dependencies.doc = [
-  "docutils>=0.8,!=0.18.*,!=0.19.*",
-  "ipykernel",
-  "ipython",
-  "myst-nb>=1.1",
-  "pandas",
-  "scanpydoc[theme,typehints]>=0.15.3",
-  # https://github.com/sphinx-toolbox/sphinx-toolbox/issues/201
-  "sphinx>=8.1,<=8.2.3",
-  "sphinx-autodoc-typehints",
-  "sphinx-book-theme>=1",
-  "sphinx-copybutton",
-  "sphinx-issues>=5.0.1",
-  "sphinx-tabs",
-  "sphinx-toolbox>=3.8",
-  "sphinxcontrib-bibtex>=1",
-  "sphinxext-opengraph",
+optional-dependencies.jax-cuda13 = [
+  "jax[cuda13]",
 ]
-optional-dependencies.test = [
-  "annbatch[zarrs]",
-  "coverage",
-  "pytest",
+optional-dependencies.numba = [
+  "numba",
 ]
 optional-dependencies.torch = [
   "torch>=2",
@@ -78,36 +62,68 @@ urls.Documentation = "https://annbatch.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/annbatch"
 urls.Source = "https://github.com/scverse/annbatch"
 
+# Non-runtime dependencies (PEP 735 dependency groups), not published as extras.
+[dependency-groups]
+dev = [
+  "prek",
+  "twine>=4.0.2",
+]
+test = [
+  "annbatch[zarrs]",
+  "coverage",
+  "pytest",
+]
+doc = [
+  "docutils>=0.8,!=0.18.*,!=0.19.*",
+  "ipykernel",
+  "ipython",
+  "myst-nb>=1.1",
+  "pandas",
+  "scanpydoc[theme,typehints]>=0.15.3",
+  "sphinx>=8.1,<9",
+  "sphinx-autodoc-typehints",
+  "sphinx-book-theme>=1",
+  "sphinx-copybutton",
+  "sphinx-design>=0.6",
+  "sphinx-issues>=5.0.1",
+  "sphinx-tabs",
+  "sphinx-toolbox>=3.8",
+  "sphinxcontrib-bibtex>=1",
+  "sphinxext-opengraph",
+]
+
 [tool.hatch]
+version.source = "vcs"
 envs.default.installer = "uv"
-envs.default.features = [ "dev" ]
-envs.docs.features = [ "doc" ]
+envs.default.dependency-groups = [ "dev" ]
 envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
-envs.docs.scripts.open = "python -m webbrowser -t docs/_build/html/index.html"
 envs.docs.scripts.clean = "git clean -fdX -- {args:docs}"
-envs.hatch-test.features = [ "test" ]
+envs.docs.scripts.open = "python -m webbrowser -t docs/_build/html/index.html"
+envs.docs.dependency-groups = [ "doc" ]
 envs.hatch-test.python = "3.14"
 envs.hatch-test.matrix = [
-  { deps = [ "min-low", "pre", "torch", "min-high" ] },
+  { deps = [ "min-low", "pre", "torch", "min-high", "numba", "jax" ] },
 ]
 # If the matrix variable `deps` is set to "pre",
 # set the environment variable `UV_PRERELEASE` to "allow".
 envs.hatch-test.overrides.matrix.deps.env-vars = [
-  { key = "UV_PRERELEASE", value = "allow", if = [ "pre" ] },
-  { if = [ "pre" ], key = "UV_CONSTRAINT", value = "pre-deps.txt" }
-]
-envs.hatch-test.overrides.matrix.deps.pre-install-commands = [
-  { if = [
-    "pre",
-  ], value = "echo 'zarr @ git+https://github.com/zarr-developers/zarr-python.git' > pre-deps.txt" }
-]
-envs.hatch-test.overrides.matrix.deps.python = [
-  { if = [ "min-low" ], value = "3.12" },
+  { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] },
+  { value = "pre-deps.txt", if = [ "pre" ], key = "UV_CONSTRAINT" }
 ]
 envs.hatch-test.overrides.matrix.deps.features = [
-  { if = [ "torch" ], value = "torch" },
+  { value = "torch", if = [ "torch" ] },
+  { value = "numba", if = [ "numba" ] },
+  { value = "jax", if = [ "jax" ] },
 ]
-version.source = "vcs"
+envs.hatch-test.overrides.matrix.deps.pre-install-commands = [
+  { value = "echo 'zarr @ git+https://github.com/zarr-developers/zarr-python.git' > pre-deps.txt", if = [
+    "pre",
+  ] }
+]
+envs.hatch-test.overrides.matrix.deps.python = [
+  { value = "3.12", if = [ "min-low" ] },
+]
+envs.hatch-test.dependency-groups = [ "test" ]
 
 [tool.ruff]
 line-length = 120
@@ -148,41 +164,43 @@ lint.per-file-ignores."docs/*" = [ "I" ]
 lint.per-file-ignores."tests/*" = [ "D" ]
 lint.pydocstyle.convention = "numpy"
 
+[tool.codespell]
+ignore-words-list = "theis,coo,homogenous,GroupT,datas"
+skip = ".git,*.pdf,*.svg"
+
 [tool.mypy]
 [[tool.mypy.overrides]]
-overrides = [ { module = [ "anndata.*", "cupyx.*", "cupy.*", "torch.*", "h5py.*" ], ignore_missing_imports = true } ]
+overrides = [ { module = [ "anndata.*", "cupy.*", "cupyx.*", "h5py.*", "torch.*" ], ignore_missing_imports = true } ]
 
 [tool.pytest]
-ini_options.markers = [ "gpu: mark test to run on GPU" ]
 ini_options.testpaths = [ "tests" ]
+ini_options.markers = [ "gpu: mark test to run on GPU" ]
 ini_options.xfail_strict = true
+ini_options.filterwarnings = [
+  "error",
+  "ignore:(Observation|Variable) names are not unique. To make them unique:UserWarning",
+  "ignore:.*FixedLengthUTF32:zarr.core.dtype.common.UnstableSpecificationWarning",
+  "ignore:.*Structured:zarr.core.dtype.common.UnstableSpecificationWarning",
+  "ignore::anndata._warnings.ImplicitModificationWarning",
+  "ignore::scipy.sparse.SparseEfficiencyWarning",
+  "ignore:Consolidated metadata is:UserWarning",
+  "ignore:Only some AnnData objects have `.raw` attribute:UserWarning",
+]
 # https://github.com/pytest-dev/pytest/issues/10965
 # addopts = [
 #   "--import-mode=importlib", # allow using test files with same name
 # ]
-ini_options.filterwarnings = [
-  "error",
-  # AnnData
-  "default:(Observation|Variable) names are not unique. To make them unique:UserWarning",
-  "default:Consolidated metadata is:UserWarning",
-  "default::anndata._warnings.ImplicitModificationWarning",
-  "default:Only some AnnData objects have `.raw` attribute:UserWarning",
-  # Zarr
-  "default:.*Structured:zarr.core.dtype.common.UnstableSpecificationWarning",
-  "default:.*FixedLengthUTF32:zarr.core.dtype.common.UnstableSpecificationWarning",
-  # scipy
-  "default::scipy.sparse.SparseEfficiencyWarning",
-]
 
 [tool.coverage]
+run.source = [ "annbatch" ]
 run.omit = [
   "**/test_*.py",
 ]
 run.patch = [ "subprocess" ]
-run.source = [ "annbatch" ]
 
 [tool.cruft]
 skip = [
+  ".git",
   "tests",
   "src/**/__init__.py",
   "src/**/basic.py",
@@ -190,5 +208,5 @@ skip = [
   "docs/changelog.md",
   "docs/references.bib",
   "docs/references.md",
-  "docs/notebooks/example.ipynb",
+  "docs/tutorials/quickstart.ipynb",
 ]
