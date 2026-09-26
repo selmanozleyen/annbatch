@@ -807,6 +807,11 @@ class Loader[
         `read_ranges` both go.
         """
         prototype = zarr.core.buffer.default_buffer_prototype()
+        # A zarr with a range selection takes the rows as one range each: its codec pipeline can
+        # read them without an indexer, which the per-run `BasicIndexer` above never could.
+        if hasattr(dataset, "get_range_selection"):
+            dataset.get_range_selection(rows, np.ones_like(rows), out=prototype.nd_buffer(out))
+            return
         dataset.get_orthogonal_selection((rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
