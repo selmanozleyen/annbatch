@@ -14,6 +14,7 @@ import pytest
 from annbatch.abc import Sampler
 from annbatch.samplers import DistributedSampler, RandomSampler, SequentialSampler
 from annbatch.samplers._utils import WorkerInfo
+from annbatch.utils import as_runs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -21,21 +22,22 @@ if TYPE_CHECKING:
     from annbatch.types import LoadRequest
 
 
-def collect_indices(sampler: Sampler, n_obs: int) -> tuple[list[int], list[slice], list[np.ndarray]]:
+def collect_indices(sampler: Sampler, n_obs: int) -> tuple[list[int], list[tuple[int, int]], list[np.ndarray]]:
     """Helper to collect loaded indices, requests, and splits from sampler."""
     indices: list[int] = []
-    requests: list[slice] = []
+    requests: list[tuple[int, int]] = []
     splits: list[np.ndarray] = []
     for load_request in sampler.sample(n_obs):
         assert len(load_request["splits"]) > 0, "splits must be non-empty"
         assert all(len(s) > 0 for s in load_request["splits"]), "splits must be non-empty"
-        assert len(load_request["requests"]) > 0, "requests must be non-empty"
-        assert all(c.stop - c.start > 0 for c in load_request["requests"]), "requests must be non-empty"
+        runs = as_runs(load_request["requests"])
+        assert len(runs) > 0, "requests must be non-empty"
+        assert (runs[:, 1] > runs[:, 0]).all(), "requests must be non-empty"
         splits.extend(load_request["splits"])
 
-        for c in load_request["requests"]:
-            requests.append(c)
-            indices.extend(range(c.start, c.stop))
+        for start, stop in runs.tolist():
+            requests.append((start, stop))
+            indices.extend(range(start, stop))
 
     return indices, requests, splits
 
@@ -146,7 +148,7 @@ def test_batch_sizes_match_expected_pattern(chunk_sampler_cls: type[Sampler]):
     all_requests: list[LoadRequest] = list(sampler.sample(n_obs))
     assert len(all_requests) == expected_num_load_requests
     for req_idx, load_request in enumerate(all_requests[:-1]):
-        assert all(chunk.stop - chunk.start == chunk_size for chunk in load_request["requests"]), (
+        assert (np.diff(as_runs(load_request["requests"])) == chunk_size).all(), (
             f"slice size mismatch at request {req_idx}:",
             f"requests: {load_request['requests']}",
         )
@@ -155,7 +157,7 @@ def test_batch_sizes_match_expected_pattern(chunk_sampler_cls: type[Sampler]):
         )
     last_request = all_requests[-1]
     assert len(last_request["splits"]) == expected_last_num_splits, "last request num splits mismatch"
-    assert all(chunk.stop - chunk.start == expected_last_slice_size for chunk in last_request["requests"]), (
+    assert (np.diff(as_runs(last_request["requests"])) == expected_last_slice_size).all(), (
         "last request slice size mismatch",
         f"requests: {last_request['requests']}",
     )
@@ -482,10 +484,10 @@ def test_num_samples_invariants(
     _, all_requests, splits = collect_indices(sampler, n_obs)
     assert len(splits) == expected_batches, f"Expected {expected_batches} batches, got {len(splits)}"
 
-    for chunk in all_requests:
-        assert chunk.stop - chunk.start <= chunk_size, f"Oversized chunk: {chunk}"
-        assert chunk.start >= start, f"Chunk start {chunk.start} < mask start {start}"
-        assert chunk.stop <= stop, f"Chunk stop {chunk.stop} > mask stop {stop}"
+    for chunk_start, chunk_stop in all_requests:
+        assert chunk_stop - chunk_start <= chunk_size, f"Oversized chunk: {chunk_start}:{chunk_stop}"
+        assert chunk_start >= start, f"Chunk start {chunk_start} < mask start {start}"
+        assert chunk_stop <= stop, f"Chunk stop {chunk_stop} > mask stop {stop}"
 
 
 # =============================================================================
@@ -888,3 +890,16 @@ class TestDistributedSampler:
             for j in range(i + 1, world_size):
                 assert set(all_indices[i]).isdisjoint(set(all_indices[j]))
         assert set().union(*all_indices) == set(range(n_obs))
+
+
+def test_request_forms_describe_the_same_rows():
+    """Runs, a list of slices and a 1-D index array are one request, and expand to its rows."""
+    from annbatch.utils import rows_of_runs
+
+    runs = np.array([[5, 8], [0, 1], [20, 24]])
+    want = [5, 6, 7, 0, 20, 21, 22, 23]
+    for form in (runs, [slice(5, 8), slice(0, 1), slice(20, 24)]):
+        np.testing.assert_array_equal(as_runs(form), runs)
+        assert rows_of_runs(as_runs(form)).tolist() == want
+    assert rows_of_runs(as_runs(np.array(want))).tolist() == want
+    assert rows_of_runs(np.empty((0, 2), dtype=np.int64)).size == 0

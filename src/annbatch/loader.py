@@ -22,10 +22,12 @@ from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
     CSRContainer,
     MultiBasicIndexer,
+    as_runs,
     check_lt_1,
     check_var_shapes,
     convert,
     load_all_aligned,
+    rows_of_runs,
     validate_sampler,
     warn_ignored_obs_aligned,
 )
@@ -517,7 +519,7 @@ class Loader[
         Parameters
         ----------
             requests
-                Slices or array of integers relative to the on-disk datasets.
+                Runs of rows, slices, or an array of row indices, relative to the on-disk datasets.
 
         Returns
         -------
@@ -525,10 +527,10 @@ class Loader[
             ``order`` mapping each in-memory buffer position to its index in the original chunk order
             (the buffer is filled in dataset order, so ``order`` is what undoes that reordering).
         """
-        if isinstance(requests, np.ndarray) and np.issubdtype(requests.dtype, np.integer):
+        if isinstance(requests, np.ndarray) and requests.ndim == 1:
             global_index = requests
         else:
-            global_index = np.concatenate([np.arange(s.start, s.stop) for s in requests])
+            global_index = rows_of_runs(as_runs(requests))
 
         # Locate each requested row in its dataset by binary-searching the dataset boundaries,
         sizes = np.fromiter(

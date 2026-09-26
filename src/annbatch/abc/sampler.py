@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from annbatch.utils import split_given_size
+from annbatch.utils import as_runs, split_given_size
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -115,7 +115,8 @@ class Sampler(ABC):
                     raise ValueError("shuffle must be set when splits are not provided in LoadRequest")
 
                 # Calculate total observations from requests
-                total_obs = sum(chunk.stop - chunk.start for chunk in load_request["requests"])
+                runs = as_runs(load_request["requests"])
+                total_obs = int((runs[:, 1] - runs[:, 0]).sum())
 
                 # Generate indices with optional shuffling and split into batches
                 indices = np.random.permutation(total_obs) if shuffle else np.arange(total_obs)
