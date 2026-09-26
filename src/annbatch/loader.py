@@ -21,6 +21,7 @@ from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
     CSRContainer,
+    as_runs,
     check_lt_1,
     check_var_shapes,
     convert,
@@ -609,7 +610,7 @@ class Loader[
         Parameters
         ----------
             requests
-                Slices or array of integers relative to the on-disk datasets.
+                Runs of rows, slices, or an array of row indices, relative to the on-disk datasets.
 
         Returns
         -------
@@ -618,15 +619,12 @@ class Loader[
             original request order (the buffer is filled in dataset order, so ``order`` is what
             undoes that reordering).
         """
-        if isinstance(requests, np.ndarray) and np.issubdtype(requests.dtype, np.integer):
+        if isinstance(requests, np.ndarray) and requests.ndim == 1:
             run_starts = requests.astype(np.int64, copy=False)
             run_lengths = np.ones_like(run_starts)
         else:
-            # Two scalar `fromiter`s, NOT one with a `(int64, 2)` subarray dtype: that form
-            # makes numpy unpack a Python tuple per slice, which measured slower.
-            run_starts = np.fromiter((s.start for s in requests), dtype=np.int64, count=len(requests))
-            stops = np.fromiter((s.stop for s in requests), dtype=np.int64, count=len(requests))
-            run_lengths = stops - run_starts
+            runs = as_runs(requests)
+            run_starts, run_lengths = runs[:, 0], runs[:, 1] - runs[:, 0]
         keep = run_lengths > 0
         run_starts, run_lengths = run_starts[keep], run_lengths[keep]
         # Where each run's rows land in request order.

@@ -142,7 +142,7 @@ class _ChunkSampler(Sampler):
     def _iter_from_slices(
         self,
         n_obs: int,
-        slices: list[slice] | np.ndarray,
+        slices: np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -161,7 +161,7 @@ class _ChunkSampler(Sampler):
 
     def _iter_from_slices_base(
         self,
-        slices: list[slice] | np.ndarray,
+        slices: np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -183,7 +183,7 @@ class _ChunkSampler(Sampler):
         total_obs_in_last_batch = (
             int(final_slices.size)
             if self._chunk_size == 1
-            else int(sum(s.stop - s.start for s in final_slices))
+            else int((final_slices[:, 1] - final_slices[:, 0]).sum())
         )
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
@@ -195,12 +195,12 @@ class _ChunkSampler(Sampler):
         batch_indices = split_given_size(indices, self.batch_size)
         yield {"requests": final_slices, "splits": batch_indices}
 
-    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice] | np.ndarray:
-        """Compute slices from start and stop indices.
+    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> np.ndarray:
+        """The chunks, as an ``(n, 2)`` array of ``[start, stop)`` runs; the last may be incomplete.
 
-        Slices are computed such that the last slice may be incomplete. At
-        ``chunk_size == 1`` an integer index array is returned instead, which the
-        loader consumes directly.
+        Built as arrays throughout: a `slice` per chunk is one Python object per row, and the
+        loader only takes the starts and stops back out of it. At ``chunk_size == 1`` a flat
+        integer index array instead, which the loader also consumes directly.
         """
         start, stop = self._resolve_start_stop(n_obs)
         if self._replacement:
@@ -209,8 +209,8 @@ class _ChunkSampler(Sampler):
 
     def _compute_slices_with_replacement(
         self, start: int, stop: int, n_obs: int, rng: np.random.Generator
-    ) -> list[slice] | np.ndarray:
-        """Draw random slice positions with replacement."""
+    ) -> np.ndarray:
+        """Draw random chunk positions with replacement."""
         num_samples = self._resolve_num_samples(n_obs)
         if self._chunk_size == 1:
             # One row per chunk is the same draw, and the loader takes an integer
@@ -219,16 +219,14 @@ class _ChunkSampler(Sampler):
             # one-element `arange` per row there.
             return rng.integers(start, stop, size=num_samples)
         n_slices, remainder = divmod(num_samples, self._chunk_size)
-        start_indices = rng.integers(start, stop - self._chunk_size + 1, size=n_slices)
-        res = [slice(int(s), int(s + self._chunk_size)) for s in start_indices]
+        starts = rng.integers(start, stop - self._chunk_size + 1, size=n_slices, dtype=np.int64)
+        runs = np.column_stack([starts, starts + self._chunk_size])
         if remainder > 0 and not self._drop_last:
-            start_index = rng.integers(start, stop - remainder + 1)
-            res.append(slice(start_index, start_index + remainder))
-        return res
+            start_index = rng.integers(start, stop - remainder + 1, dtype=np.int64)
+            runs = np.vstack([runs, [[start_index, start_index + remainder]]])
+        return runs
 
-    def _compute_slices_without_replacement(
-        self, start: int, stop: int, rng: np.random.Generator
-    ) -> list[slice] | np.ndarray:
+    def _compute_slices_without_replacement(self, start: int, stop: int, rng: np.random.Generator) -> np.ndarray:
         """Compute slices covering the full range exactly once.
 
         The incomplete slice (slice that is less than chunk_size) is always placed last in iteration order regardless
@@ -252,5 +250,4 @@ class _ChunkSampler(Sampler):
         incomplete = (stop - start) % self._chunk_size
         offsets[pivot_index + 1] = incomplete if incomplete else self._chunk_size
         offsets = np.cumsum(offsets)
-        starts, stops = offsets[:-1][slice_indices], offsets[1:][slice_indices]
-        return [slice(int(s), int(e)) for s, e in zip(starts, stops, strict=True)]
+        return np.column_stack([offsets[:-1][slice_indices], offsets[1:][slice_indices]]).astype(np.int64)

@@ -52,6 +52,28 @@ def validate_sampler[**Param, RetType](
     return wrapper
 
 
+def as_runs(requests: list[slice] | np.ndarray) -> np.ndarray:
+    """A load request's rows as an ``(n, 2)`` array of ``[start, stop)`` runs.
+
+    Runs pass through; a 1-D index array is runs of one row; a list of slices is read off once.
+    """
+    if isinstance(requests, np.ndarray):
+        if requests.ndim == 2:
+            return requests
+        return np.column_stack([requests, requests + 1])
+    starts = np.fromiter((s.start for s in requests), dtype=np.int64, count=len(requests))
+    stops = np.fromiter((s.stop for s in requests), dtype=np.int64, count=len(requests))
+    return np.column_stack([starts, stops])
+
+
+def rows_of_runs(runs: np.ndarray) -> np.ndarray:
+    """Every row of ``(n, 2)`` ``[start, stop)`` runs, in order, in one vectorised pass."""
+    lengths = runs[:, 1] - runs[:, 0]
+    rows = np.arange(int(lengths.sum()), dtype=np.int64)
+    rows += np.repeat(runs[:, 0] - (np.cumsum(lengths) - lengths), lengths)
+    return rows
+
+
 def split_given_size(a: np.ndarray, size: int) -> list[np.ndarray]:
     """Wrapper around `np.split` to split up an array into `size` chunks"""
     return np.split(a, np.arange(size, len(a), size))
