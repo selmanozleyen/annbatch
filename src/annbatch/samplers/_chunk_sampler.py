@@ -181,7 +181,9 @@ class _ChunkSampler(Sampler):
             yield {"requests": request_slices, "splits": split_batch_indices}
         # On the last yield, drop the last uneven batch and create new batch_indices since the in-memory size of this last yield could be divisible by batch_size but smaller than preload_nchunks * chunk_size
         final_slices = slices_per_request[-1]
-        total_obs_in_last_batch = int((final_slices[:, 1] - final_slices[:, 0]).sum())
+        total_obs_in_last_batch = (
+            int(final_slices.size) if self._chunk_size == 1 else int((final_slices[:, 1] - final_slices[:, 0]).sum())
+        )
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:
@@ -195,8 +197,9 @@ class _ChunkSampler(Sampler):
     def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> np.ndarray:
         """The chunks, as an ``(n, 2)`` array of ``[start, stop)`` runs; the last may be incomplete.
 
-        Built as arrays throughout: a `slice` per chunk is one Python object per row at
-        chunk_size 1, and the loader only takes the starts and stops back out of it.
+        Built as arrays throughout: a `slice` per chunk is one Python object per row, and the
+        loader only takes the starts and stops back out of it. At ``chunk_size == 1`` a flat
+        integer index array instead, which the loader also consumes directly.
         """
         start, stop = self._resolve_start_stop(n_obs)
         if self._replacement:
@@ -208,6 +211,12 @@ class _ChunkSampler(Sampler):
     ) -> np.ndarray:
         """Draw random chunk positions with replacement."""
         num_samples = self._resolve_num_samples(n_obs)
+        if self._chunk_size == 1:
+            # One row per chunk is the same draw, and the loader takes an integer
+            # array directly -- see `_requests_to_dataset_rows`. Going through
+            # slices would build a Python object per row here and unpack it with a
+            # one-element `arange` per row there.
+            return rng.integers(start, stop, size=num_samples)
         n_slices, remainder = divmod(num_samples, self._chunk_size)
         starts = rng.integers(start, stop - self._chunk_size + 1, size=n_slices, dtype=np.int64)
         runs = np.column_stack([starts, starts + self._chunk_size])
@@ -222,6 +231,15 @@ class _ChunkSampler(Sampler):
         The incomplete slice (slice that is less than chunk_size) is always placed last in iteration order regardless
         of shuffling -- ensuring no observation is duplicated.
         """
+        if self._chunk_size == 1:
+            # Every chunk is one row, so the layout IS the index array: there is no
+            # incomplete tail to place last, and the loader indexes with integers
+            # anyway. Building `slice` objects instead costs one Python object per
+            # observation -- 100M of them, and ~15 GB, for a 100M-row collection.
+            indices = np.arange(start, stop)
+            if self.shuffle:
+                rng.shuffle(indices)
+            return indices
         slice_indices = np.arange(math.ceil((stop - start) / self._chunk_size))
         if self.shuffle:
             rng.shuffle(slice_indices)

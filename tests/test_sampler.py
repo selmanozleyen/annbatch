@@ -892,6 +892,40 @@ class TestDistributedSampler:
         assert set().union(*all_indices) == set(range(n_obs))
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_chunk_size_one_yields_indices(replacement: bool):
+    """At chunk_size=1 the sampler hands the loader integers, not slice objects.
+
+    One row per chunk means the layout already IS the index array, and
+    ``Loader._requests_to_dataset_rows`` takes an integer array directly. Building
+    slices instead costs one Python object per observation, which for a 100M-row
+    collection was 212 s and ~15 GB before a single batch was yielded.
+    """
+    n_obs = 1000
+    sampler = RandomSampler(
+        chunk_size=1,
+        preload_nchunks=8,
+        batch_size=4,
+        replacement=replacement,
+        num_samples=20 if replacement else None,
+        rng=np.random.default_rng(0),
+    )
+    requests = sampler._compute_slices(n_obs, np.random.default_rng(0))
+    assert isinstance(requests, np.ndarray)
+    assert np.issubdtype(requests.dtype, np.integer)
+    if replacement:
+        assert requests.size == 20
+        assert requests.min() >= 0 and requests.max() < n_obs
+    else:
+        # An epoch still covers every observation exactly once.
+        assert np.array_equal(np.sort(requests), np.arange(n_obs))
+
+    # Anything wider than one row is an (n, 2) array of [start, stop) runs.
+    wide = RandomSampler(chunk_size=4, preload_nchunks=8, batch_size=4, rng=np.random.default_rng(0))
+    runs = wide._compute_slices(n_obs, np.random.default_rng(0))
+    assert runs.ndim == 2 and runs.shape[1] == 2 and (np.diff(runs) == 4).all()
+
+
 def test_request_forms_describe_the_same_rows():
     """Runs, a list of slices and a 1-D index array are one request, and expand to its rows."""
     from annbatch.utils import rows_of_runs

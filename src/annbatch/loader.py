@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import asyncio
+import os
 from collections import OrderedDict
-from functools import singledispatchmethod
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial, singledispatchmethod
 from importlib.metadata import version
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, Literal, NamedTuple, Self, cast
+from typing import TYPE_CHECKING, Literal, Self, cast
 from warnings import warn
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import zarr
-import zarr.core.sync as zsync
 from packaging.version import Version
 from scipy import sparse as sp
 from zarr import Array as ZarrArray
@@ -21,13 +21,12 @@ from annbatch.samplers import RandomSampler, SequentialSampler
 from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
     CSRContainer,
-    MultiBasicIndexer,
     as_runs,
     check_lt_1,
     check_var_shapes,
     convert,
     load_all_aligned,
-    rows_of_runs,
+    ramp,
     validate_sampler,
     warn_ignored_obs_aligned,
 )
@@ -48,12 +47,62 @@ if TYPE_CHECKING:
 zarr_version = Version(version("zarr"))
 
 
-class CSRDatasetElems(NamedTuple):
-    """Container for cached objects that will be indexed into to generate CSR matrices"""
+_FETCH_POOL: ThreadPoolExecutor | None = None
 
-    indptr: np.ndarray
-    indices: zarr.AsyncArray
-    data: zarr.AsyncArray
+
+def _fetch_pool() -> ThreadPoolExecutor:
+    """The pool the synchronous fetch runs on. A WIDTH, so a knob rather than an arm.
+
+    `ANNBATCH_FETCH_THREADS` sets it. The default is `min(32, cpus + 4)`, which is what
+    `asyncio`'s own default executor would have given, so leaving it unset keeps the
+    concurrency the gather-based version had.
+
+    Sized once, on first use. Resizing mid-run would put two widths inside one measurement.
+    """
+    global _FETCH_POOL
+    if _FETCH_POOL is None:
+        default = min(32, (os.cpu_count() or 1) + 4)
+        width = int(os.environ.get("ANNBATCH_FETCH_THREADS", default))
+        _FETCH_POOL = ThreadPoolExecutor(max_workers=width, thread_name_prefix="annbatch-fetch")
+        print(f"[annbatch] synchronous fetch pool: {width} threads", flush=True)
+    return _FETCH_POOL
+
+
+class _Runs:
+    """Runs of rows in one dataset, ``starts[i] : starts[i] + lengths[i]``, in buffer order.
+
+    What a loader's chunks are, and what a range read takes: its rows exist only for the
+    callers that need one entry per row (obs, indices, an in-memory source), built once.
+    """
+
+    def __init__(self, starts: np.ndarray, lengths: np.ndarray) -> None:
+        self.starts, self.lengths = starts, lengths
+        self._rows: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return int(self.lengths.sum())
+
+    @property
+    def rows(self) -> np.ndarray:
+        if self._rows is None:
+            self._rows = ramp(self.starts, self.lengths)
+        return self._rows
+
+    def nnz(self, indptr: np.ndarray) -> int:
+        """Non-zeros in the runs, off a CSR's `indptr`: one lookup per run, not per row."""
+        return int((indptr[self.starts + self.lengths] - indptr[self.starts]).sum())
+
+
+def _csr_parts(dataset: BackingArray_T) -> tuple[np.ndarray, np.dtype, np.dtype]:
+    """``(indptr, data dtype, indices dtype)`` for a backed or in-memory CSR.
+
+    Sizing the output buffer needs all three before any read happens, and a backed
+    dataset answers without IO: its `indptr` is held in memory and the dtypes come off
+    the group metadata.
+    """
+    if isinstance(dataset, ad.abc.CSRDataset):
+        return dataset.indptr, dataset.dtype, dataset.indices_dtype
+    return dataset.indptr, dataset.data.dtype, dataset.indices.dtype
 
 
 if find_spec("numba"):
@@ -173,7 +222,6 @@ class Loader[
     _shapes: list[tuple[int, int]]
     _preload_to_gpu: bool = True
     _to: Literal["torch", "jax"] | None = None
-    _sparse_dataset_elem_cache: dict[int, CSRDatasetElems]
     _batch_sampler: Sampler
     _collection_added: bool = False
     _dtypes_homogeneous: bool = True
@@ -232,7 +280,6 @@ class Loader[
         self._to = to
         self._train_datasets = []
         self._shapes = []
-        self._sparse_dataset_elem_cache = {}
 
     def __len__(self) -> int:
         return self._batch_sampler.n_batches(self.n_obs)
@@ -497,6 +544,13 @@ class Loader[
                 "allocation and dtype promotion in the loader; consider casting all datasets to a common dtype.",
                 stacklevel=2,
             )
+        if isinstance(dataset, ad.abc.CSRDataset):
+            # Sizing a batch reads all three of these, and a backed dataset resolves
+            # them lazily through synchronous store calls. Batches run on zarr's event
+            # loop, which refuses those. Registration is the loader's one synchronous
+            # phase -- it already resolves `shape` and `backend` above -- so the whole
+            # set is resolved here, once, rather than warmed per batch.
+            _ = (dataset.indptr, dataset.dtype, dataset.indices_dtype)
         self._shapes = self._shapes + [dataset.shape]
         self._train_datasets = datasets
         if self._obs is not None:  # obs exist
@@ -513,8 +567,10 @@ class Loader[
             )
         return self
 
-    def _requests_to_dataset_rows(self, requests: list[slice] | np.ndarray) -> OrderedDict[int, np.ndarray]:
-        """Given a ndarray or list of slices, give the lookup between on-disk datasets and row indices relative to that dataset.
+    def _requests_to_dataset_rows(
+        self, requests: list[slice] | np.ndarray
+    ) -> tuple[OrderedDict[int, _Runs], np.ndarray]:
+        """Given a ndarray or list of slices, the runs of rows each on-disk dataset is asked for.
 
         Parameters
         ----------
@@ -523,35 +579,59 @@ class Loader[
 
         Returns
         -------
-            A lookup between the dataset and its row indices, ordered by keys, and the permutation
-            ``order`` mapping each in-memory buffer position to its index in the original chunk order
-            (the buffer is filled in dataset order, so ``order`` is what undoes that reordering).
+            A lookup between the dataset and its runs of rows, ordered by keys, and the
+            permutation ``order`` mapping each in-memory buffer position to its index in the
+            original request order (the buffer is filled in dataset order, so ``order`` is what
+            undoes that reordering).
         """
         if isinstance(requests, np.ndarray) and requests.ndim == 1:
-            global_index = requests
+            run_starts = requests.astype(np.int64, copy=False)
+            run_lengths = np.ones_like(run_starts)
         else:
-            global_index = rows_of_runs(as_runs(requests))
+            runs = as_runs(requests)
+            run_starts, run_lengths = runs[:, 0], runs[:, 1] - runs[:, 0]
+        keep = run_lengths > 0
+        run_starts, run_lengths = run_starts[keep], run_lengths[keep]
+        # Where each run's rows land in request order.
+        request_at = np.cumsum(run_lengths) - run_lengths
 
-        # Locate each requested row in its dataset by binary-searching the dataset boundaries,
-        sizes = np.fromiter(
-            (shape[0] for shape in self._shapes),
-            dtype=np.int64,
-            count=len(self._shapes),
-        )
+        sizes = np.fromiter((shape[0] for shape in self._shapes), dtype=np.int64, count=len(self._shapes))
         ends = np.cumsum(sizes)
         starts = ends - sizes
-        dataset_of_row = np.searchsorted(ends, global_index, side="right")
+        dataset_of_run = np.searchsorted(ends, run_starts, side="right")
+        # A run crossing a dataset boundary is cut there. Rare, so the cut is a loop over
+        # just those runs.
+        last = np.searchsorted(ends, run_starts + run_lengths - 1, side="right")
+        if (cross := np.flatnonzero(last != dataset_of_run)).size:
+            pieces = [(run_starts, run_lengths, request_at, dataset_of_run)]
+            parts = []
+            for i in cross:
+                at, left, where = run_starts[i], run_lengths[i], request_at[i]
+                for ds in range(dataset_of_run[i], last[i] + 1):
+                    n = min(left, int(ends[ds]) - at)
+                    parts.append((at, n, where, ds))
+                    at, left, where = at + n, left - n, where + n
+            whole = np.ones(run_starts.size, dtype=bool)
+            whole[cross] = False
+            cut = np.array(parts, dtype=np.int64).T
+            run_starts, run_lengths, request_at, dataset_of_run = (
+                np.concatenate([p[whole], c]) for p, c in zip(pieces[0], cut, strict=True)
+            )
 
-        # Group rows by dataset: a stable sort keeps the within-dataset order
-        order = np.argsort(dataset_of_row, kind="stable")
-        grouped = dataset_of_row[order]
+        # Runs grouped by dataset and ascending within it -- a sort of RUNS, not rows. Ascending
+        # keeps runs that touch next to each other, so a range read merges them, and keeps rows
+        # of one inner chunk together, so it is read and decoded once for all of them.
+        run_order = np.lexsort((run_starts, dataset_of_run))
+        grouped = dataset_of_run[run_order]
         group_start = np.concatenate([[0], np.flatnonzero(np.diff(grouped)) + 1])
         group_end = np.append(group_start[1:], grouped.size)
 
-        result: OrderedDict[int, np.ndarray] = OrderedDict()
+        result: OrderedDict[int, _Runs] = OrderedDict()
         for gs, ge in zip(group_start, group_end, strict=True):
             ds = int(grouped[gs])
-            result[ds] = global_index[order[gs:ge]] - starts[ds]
+            picked = run_order[gs:ge]
+            result[ds] = _Runs(run_starts[picked] - starts[ds], run_lengths[picked])
+        order = ramp(request_at[run_order], run_lengths[run_order])
         return result, order
 
     def _alloc(self, shape: tuple[int, ...], dtype: np.dtype, *, use_pinned: bool) -> np.ndarray:
@@ -561,7 +641,7 @@ class Loader[
             return cpx.empty_pinned(shape, dtype)
         return np.empty(shape, dtype)
 
-    def _allocate_out(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> CSRContainer | np.ndarray:
+    def _allocate_out(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> CSRContainer | np.ndarray:
         """Preallocate a single contiguous output buffer covering all datasets and rows.
 
         For sparse data the buffer is a :class:`~annbatch.utils.CSRContainer` whose ``data``
@@ -570,22 +650,14 @@ class Loader[
         For dense data it is a plain :class:`numpy.ndarray` of shape
         ``(total_rows, n_var)``.
 
-        Must be called after :meth:`_ensure_sparse_cache` for sparse datasets.
         """
         total_rows = sum(len(rows) for rows in dataset_index_to_rows.values())
 
-        if (is_backed := issubclass(self.dataset_type, ad.abc.CSRDataset)) or issubclass(
-            self.dataset_type, sp.csr_array | sp.csr_matrix
-        ):
-            datasets = self._sparse_dataset_elem_cache if is_backed else self._train_datasets
-            total_nnz = sum(
-                int((datasets[idx].indptr[rows + 1] - datasets[idx].indptr[rows]).sum())
-                for idx, rows in dataset_index_to_rows.items()
-            )
-            first_idx = next(iter(dataset_index_to_rows))
-            data_dtype = datasets[first_idx].data.dtype
-            indices_dtype = datasets[first_idx].indices.dtype
-            indptr_dtype = datasets[first_idx].indptr.dtype
+        if issubclass(self.dataset_type, ad.abc.CSRDataset | sp.csr_array | sp.csr_matrix):
+            parts = {idx: _csr_parts(self._train_datasets[idx]) for idx in dataset_index_to_rows}
+            total_nnz = sum(runs.nnz(parts[idx][0]) for idx, runs in dataset_index_to_rows.items())
+            first_indptr, data_dtype, indices_dtype = parts[next(iter(dataset_index_to_rows))]
+            indptr_dtype = first_indptr.dtype
             return CSRContainer(
                 elems=(
                     self._alloc((total_nnz,), data_dtype, use_pinned=self._preload_to_gpu),
@@ -609,7 +681,7 @@ class Loader[
 
         def dtypes_of(d):
             if isinstance(d, ad.abc.CSRDataset):
-                return (d.group["data"].dtype, d.group["indices"].dtype)
+                return (d.dtype, d.indices_dtype)
             if hasattr(d, "data") and hasattr(d, "indices"):
                 return (d.data.dtype, d.indices.dtype)
             return (d.dtype,)
@@ -618,30 +690,27 @@ class Loader[
         return all(dtypes_of(d) == first for d in datasets[1:])
 
     def _allocate_per_dataset_outs(
-        self, dataset_index_to_rows: OrderedDict[int, np.ndarray]
+        self, dataset_index_to_rows: OrderedDict[int, _Runs]
     ) -> OrderedDict[int, CSRContainer | np.ndarray]:
         """Allocate one output buffer per dataset, each using that dataset's native dtype(s).
 
         Used when datasets have differing dtypes — the per-dataset buffers are concatenated
         into a final buffer of the promoted dtype by :meth:`_concatenate_outs`.
-        Must be called after :meth:`_ensure_sparse_cache` for backed-sparse datasets.
         """
-        is_backed_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
-        is_sparse = is_backed_sparse or issubclass(self.dataset_type, sp.csr_array | sp.csr_matrix)
+        is_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset | sp.csr_array | sp.csr_matrix)
         outs: OrderedDict[int, CSRContainer | np.ndarray] = OrderedDict()
         if is_sparse:
-            datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
             for idx, rows in dataset_index_to_rows.items():
-                ds = datasets[idx]
-                nnz = int((ds.indptr[rows + 1] - ds.indptr[rows]).sum())
+                indptr, data_dtype, indices_dtype = _csr_parts(self._train_datasets[idx])
+                nnz = rows.nnz(indptr)
                 outs[idx] = CSRContainer(
                     elems=(
-                        self._alloc((nnz,), ds.data.dtype, use_pinned=False),
-                        self._alloc((nnz,), ds.indices.dtype, use_pinned=False),
+                        self._alloc((nnz,), data_dtype, use_pinned=False),
+                        self._alloc((nnz,), indices_dtype, use_pinned=False),
                         self._alloc((len(rows) + 1,), np.min_scalar_type(nnz), use_pinned=False),
                     ),
                     shape=(len(rows), self.n_var),
-                    dtype=ds.data.dtype,
+                    dtype=data_dtype,
                 )
         else:
             for idx, rows in dataset_index_to_rows.items():
@@ -686,9 +755,9 @@ class Loader[
         return out
 
     @singledispatchmethod
-    async def _fetch_data(
+    def _fetch_data(
         self,
-        dataset: ZarrArray | CSRDatasetElems,
+        dataset: ZarrArray | ad.abc.CSRDataset,
         rows: np.ndarray,
         out: CSRContainer | np.ndarray,
     ) -> None:
@@ -712,150 +781,97 @@ class Loader[
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
     @_fetch_data.register
-    async def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
-        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        row_runs = np.split(rows, breaks)
-        indexer = MultiBasicIndexer(
-            [
-                zarr.core.indexing.BasicIndexer(
-                    (slice(int(r[0]), int(r[-1]) + 1), Ellipsis),
-                    shape=dataset.metadata.shape,
-                    chunk_grid=dataset.metadata.chunk_grid if zarr_version <= Version("3.1.6") else dataset._chunk_grid,
-                )
-                for r in row_runs
-            ]
-        )
-        buffer_prototype = zarr.core.buffer.default_buffer_prototype()
-        await dataset._async_array._get_selection(
-            indexer,
-            prototype=buffer_prototype,
-            out=buffer_prototype.nd_buffer(out),
-        )
+    def _fetch_data_dense(self, dataset: ZarrArray, rows: _Runs, out: np.ndarray) -> None:
+        """The runs, handed to the codec pipeline whole.
 
-    async def _create_sparse_elems(self, idx: int) -> CSRDatasetElems:
-        """Fetch the in-memory indptr, and backed indices and data for a given dataset index.
-
-        Parameters
-        ----------
-            idx
-                The index
-
-        Returns
-        -------
-            The constituent elems of the CSR dataset.
+        A zarr with a range selection takes them as runs, and a pipeline that implements its
+        hook reads them without an indexer. Older zarr gets one orthogonal selection of the
+        rows, which it groups by chunk itself: a range read built from `BasicIndexer`s, one per
+        run, measured up to 2.3x slower than that on a fragmented draw.
         """
-        if isinstance(ds := self._train_datasets[idx], ZarrArray):
-            raise ValueError(f"Requested sparse dataset at idx {idx} of {self._train_datasets} but found dense array")
-        indptr = await ds.group._async_group.getitem("indptr")
-        return CSRDatasetElems(
-            *(
-                await asyncio.gather(
-                    indptr.getitem(Ellipsis),
-                    ds.group._async_group.getitem("indices"),
-                    ds.group._async_group.getitem("data"),
-                )
-            )
-        )
-
-    async def _ensure_sparse_cache(self) -> None:
-        """Build up the cache of datasets i.e., in-memory indptr, and backed indices and data."""
-        arr_idxs = [idx for idx in range(len(self._train_datasets)) if idx not in self._sparse_dataset_elem_cache]
-        all_elems: list[CSRDatasetElems] = await asyncio.gather(
-            *(
-                self._create_sparse_elems(idx)
-                for idx in range(len(self._train_datasets))
-                if idx not in self._sparse_dataset_elem_cache
-            )
-        )
-        for idx, elems in zip(arr_idxs, all_elems, strict=True):
-            self._sparse_dataset_elem_cache[idx] = elems
-
-    def _get_elem_from_cache(self, dataset_idx: int) -> CSRDatasetElems | ZarrArray:
-        """Return the arrays (zarr or otherwise) needed to represent on-disk data at a given index.
-
-        Parameters
-        ----------
-            dataset_idx
-                The index of the dataset whose arrays are sought.
-
-        Returns
-        -------
-            The arrays representing the sparse data.
-        """
-        if dataset_idx not in self._sparse_dataset_elem_cache:
-            raise ValueError("Cache not prepared")
-        return self._sparse_dataset_elem_cache[dataset_idx]
+        prototype = zarr.core.buffer.default_buffer_prototype()
+        # A zarr with a range selection takes the runs as they are: its codec pipeline can read
+        # them without an indexer, which the per-run `BasicIndexer` above never could.
+        if hasattr(dataset, "get_range_selection"):
+            dataset.get_range_selection(rows.starts, rows.lengths, out=prototype.nd_buffer(out))
+            return
+        dataset.get_orthogonal_selection((rows.rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
-    async def _fetch_data_numpy_matrix(
+    def _fetch_data_numpy_matrix(
         self,
         dataset: np.ndarray,
-        rows: np.ndarray,
+        rows: _Runs,
         out: np.ndarray,
     ) -> None:
-        out[:] = dataset[rows]
+        out[:] = dataset[rows.rows]
 
     @_fetch_data.register
-    async def _fetch_data_csr_matrix(
+    def _fetch_data_csr_matrix(
         self,
         dataset: sp.csr_matrix | sp.csr_array,
-        rows: np.ndarray,
+        rows: _Runs,
         out: CSRContainer,
     ) -> None:
         _csr_subset_rows(
             dataset.data,
             dataset.indices,
             dataset.indptr,
-            np.ascontiguousarray(rows),
+            np.ascontiguousarray(rows.rows),
             out.elems[0],
             out.elems[1],
         )
 
     @_fetch_data.register
-    async def _fetch_data_sparse(
+    def _fetch_data_sparse(
         self,
-        dataset: CSRDatasetElems,
-        rows: np.ndarray,
+        dataset: ad.abc.CSRDataset,
+        rows: _Runs,
         out: CSRContainer,
     ) -> None:
-        # See https://github.com/scverse/anndata/blob/361325fc621887bf4f381e9412b150fcff599ff7/src/anndata/_core/sparse_dataset.py#L272-L295
-        # for the inspiration of this function.
-        breaks = np.flatnonzero(np.diff(rows) != 1) + 1
-        row_runs = np.split(rows, breaks)
-        indptr, indices, data = dataset
-        indptr_indices = [indptr[slice(s[0], s[-1] + 2)] for s in row_runs]
-        indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
-        indexer_data, indexer_indices = (
-            MultiBasicIndexer(
-                [
-                    zarr.core.indexing.BasicIndexer(
-                        (l,),
-                        shape=arr.metadata.shape,
-                        chunk_grid=arr.metadata.chunk_grid if zarr_version <= Version("3.1.6") else arr._chunk_grid,
-                    )
-                    for l in indptr_limits
-                ]
-            )
-            for arr in [data, indices]
-        )
+        """Read the rows through anndata's synchronous interface. Nothing else.
 
-        buffer_prototype = zarr.core.buffer.default_buffer_prototype()
-        await asyncio.gather(
-            data._get_selection(
-                indexer_data,
-                prototype=buffer_prototype,
-                out=buffer_prototype.nd_buffer(out.elems[0]),
-            ),
-            indices._get_selection(
-                indexer_indices,
-                prototype=buffer_prototype,
-                out=buffer_prototype.nd_buffer(out.elems[1]),
-            ),
-        )
+        `read_rows(out=)` -- no async entry point, no zarr privates. It is safe because
+        NOTHING here runs on zarr's event loop any more: `_index_datasets` is an ordinary
+        method and its fetches run on pool workers, so a worker is free to block on the
+        sync bridge. That was the one thing `aread_rows` existed to work around.
 
-    async def _index_datasets(
+        Concurrency is unaffected: it comes from the pipeline's own workers WITHIN each
+        read, and from :meth:`_run_fetches` ACROSS datasets.
+
+        `read_rows` keeps `out=` without keeping asyncio: the decode lands straight in
+        the caller's buffers, which under `preload_to_gpu` are PINNED host memory. The
+        `__getitem__` arm copies the whole batch into pinned afterwards instead -- under
+        1% of a CPU-bound batch, and a much larger share of a GPU-bound one, which is
+        what this third arm exists to price.
+
+        `indptr` is not filled here. It spans every dataset in the batch, so only
+        :meth:`_index_datasets` knows the offsets, and it writes it afterwards.
+        """
+        # An anndata that reads runs takes them as they are, one range each.
+        if hasattr(dataset, "read_row_ranges"):
+            dataset.read_row_ranges(rows.starts, rows.lengths, out=(out.elems[0], out.elems[1]))
+            return
+        dataset.read_rows(rows.rows, out=(out.elems[0], out.elems[1]))
+
+    def _run_fetches(self, tasks: list) -> None:
+        """Run the per-dataset fetches concurrently, on threads instead of a loop.
+
+        One task per dataset, the same shape as the `asyncio.gather` this replaces. A pool
+        worker is not zarr's loop thread, so each task is free to make ordinary synchronous
+        anndata calls -- which is the entire reason the async fetch interface existed.
+
+        `map` is consumed rather than left lazy: an exception in a worker surfaces on
+        iteration, and an unconsumed generator would swallow it.
+        """
+        if len(tasks) == 1:
+            tasks[0]()  # no pool hop for the single-dataset case
+            return
+        list(_fetch_pool().map(lambda task: task(), tasks))
+
+    def _index_datasets(
         self,
-        dataset_index_to_rows: OrderedDict[int, np.ndarray],
+        dataset_index_to_rows: OrderedDict[int, _Runs],
     ) -> CSRContainer | np.ndarray:
         """Preallocate one output buffer, dispatch concurrent fetches into per-dataset views, then return the buffer.
 
@@ -866,26 +882,24 @@ class Loader[
         """
         is_backed_sparse = issubclass(self.dataset_type, ad.abc.CSRDataset)
         is_sparse = is_backed_sparse or issubclass(self.dataset_type, sp.csr_array | sp.csr_matrix)
-        if is_backed_sparse:
-            await self._ensure_sparse_cache()
-
         if not self._dtypes_homogeneous:
             per_dataset_outs = self._allocate_per_dataset_outs(dataset_index_to_rows)
             tasks = [
-                self._fetch_data(
-                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
+                partial(
+                    self._fetch_data,
+                    self._train_datasets[dataset_idx],
                     rows,
                     per_dataset_outs[dataset_idx],
                 )
                 for dataset_idx, rows in dataset_index_to_rows.items()
             ]
-            await asyncio.gather(*tasks)
+            self._run_fetches(tasks)
             if is_sparse:
-                datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
+                datasets = self._train_datasets
                 for dataset_idx, rows in dataset_index_to_rows.items():
                     sub_out = per_dataset_outs[dataset_idx]
                     cached_indptr = datasets[dataset_idx].indptr
-                    per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                    per_row_nnz = cached_indptr[rows.rows + 1] - cached_indptr[rows.rows]
                     sub_out.elems[2][0] = 0
                     np.cumsum(per_row_nnz, out=sub_out.elems[2][1:])
             return self._concatenate_outs(per_dataset_outs)
@@ -899,9 +913,8 @@ class Loader[
         for dataset_idx, rows in dataset_index_to_rows.items():
             nrows = len(rows)
             if is_sparse:
-                datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
-                cached_indptr = datasets[dataset_idx].indptr
-                nnz = int((cached_indptr[rows + 1] - cached_indptr[rows]).sum())
+                datasets = self._train_datasets
+                nnz = rows.nnz(datasets[dataset_idx].indptr)
                 out_view: CSRContainer | np.ndarray = CSRContainer(
                     elems=(
                         out.elems[0][nnz_offset : nnz_offset + nnz],
@@ -915,25 +928,19 @@ class Loader[
             else:
                 out_view = out[row_offset : row_offset + nrows]
 
-            tasks.append(
-                self._fetch_data(
-                    self._get_elem_from_cache(dataset_idx) if is_backed_sparse else self._train_datasets[dataset_idx],
-                    rows,
-                    out_view,
-                )
-            )
+            tasks.append(partial(self._fetch_data, self._train_datasets[dataset_idx], rows, out_view))
             row_offset += nrows
 
-        await asyncio.gather(*tasks)
+        self._run_fetches(tasks)
 
         if is_sparse:
-            datasets = self._sparse_dataset_elem_cache if is_backed_sparse else self._train_datasets
+            datasets = self._train_datasets
             running_nnz = 0
             row_pos = 0
             out.elems[2][0] = 0
             for dataset_idx, rows in dataset_index_to_rows.items():
                 cached_indptr = datasets[dataset_idx].indptr
-                per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                per_row_nnz = cached_indptr[rows.rows + 1] - cached_indptr[rows.rows]
                 dest = out.elems[2][row_pos + 1 : row_pos + len(rows) + 1]
                 np.cumsum(per_row_nnz, out=dest)
                 dest += running_nnz
@@ -982,7 +989,7 @@ class Loader[
             inv = inv_buffer[:n]
             inv[order] = positions[:n]
 
-            raw_out: CSRContainer | np.ndarray = zsync.sync(self._index_datasets(dataset_index_to_rows))
+            raw_out: CSRContainer | np.ndarray = self._index_datasets(dataset_index_to_rows)
 
             if is_sparse:
                 in_memory_data = self._sp_module.csr_matrix(
@@ -1009,15 +1016,15 @@ class Loader[
             if self._preload_to_gpu and is_sparse:
                 self._np_module.get_default_memory_pool().free_all_blocks()
 
-    def _maybe_accumulate_obs(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> pd.DataFrame | None:
+    def _maybe_accumulate_obs(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> pd.DataFrame | None:
         """Gather obs labels for the loaded rows if possible."""
         if self._obs is None:
             return None
-        return pd.concat([self._obs[idx].iloc[rows] for idx, rows in dataset_index_to_rows.items()])
+        return pd.concat([self._obs[idx].iloc[rows.rows] for idx, rows in dataset_index_to_rows.items()])
 
-    def _maybe_accumulate_indices(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> np.ndarray | None:
+    def _maybe_accumulate_indices(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> np.ndarray | None:
         """Gather original indices for the loaded rows if possible."""
         if self._return_index is False:
             return None
         dataset_offsets = np.concatenate(([0], np.cumsum([shape[0] for shape in self._shapes])))
-        return np.concatenate([rows + dataset_offsets[idx] for idx, rows in dataset_index_to_rows.items()])
+        return np.concatenate([rows.rows + dataset_offsets[idx] for idx, rows in dataset_index_to_rows.items()])
