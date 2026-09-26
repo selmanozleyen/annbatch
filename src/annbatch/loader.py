@@ -790,8 +790,6 @@ class Loader[
         run, measured up to 2.3x slower than that on a fragmented draw.
         """
         prototype = zarr.core.buffer.default_buffer_prototype()
-        # A zarr with a range selection takes the runs as they are: its codec pipeline can read
-        # them without an indexer, which the per-run `BasicIndexer` above never could.
         if hasattr(dataset, "get_range_selection"):
             dataset.get_range_selection(rows.starts, rows.lengths, out=prototype.nd_buffer(out))
             return
