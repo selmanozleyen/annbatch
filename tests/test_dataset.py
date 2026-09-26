@@ -973,9 +973,10 @@ def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch)
 
     A backed read only goes straight into the caller's buffer when the rows are
     ascending and distinct; otherwise anndata reads into a full-size temporary and
-    gathers from it. `_requests_to_dataset_rows` sorts within each dataset for exactly
+    gathers from it. `_requests_to_dataset_rows` sorts runs within each dataset for exactly
     this reason, and a stable sort on the dataset key alone -- which is what it used to
-    do -- silently sends every read down the copying path.
+    do -- silently sends every read down the copying path. On a zarr with a range selection
+    there is no description to sort for: the runs are read as asked.
     """
     import anndata._core.sparse_dataset as sparse_dataset_module
 
@@ -1002,5 +1003,9 @@ def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch)
     for _ in loader:
         pass
 
+    # A zarr with a range selection reads the runs as asked: no description, no gather.
+    if hasattr(zarr.Array, "get_range_selection"):
+        assert reads == {"direct": 0, "gathered": 0}
+        return
     assert reads["direct"] > 0
     assert reads["gathered"] == 0

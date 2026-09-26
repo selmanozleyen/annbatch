@@ -69,6 +69,39 @@ def _fetch_pool() -> ThreadPoolExecutor:
     return _FETCH_POOL
 
 
+def _ramp(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """``starts[i] : starts[i] + lengths[i]`` for every ``i``, laid end to end, in one pass."""
+    offsets = np.cumsum(lengths) - lengths
+    out = np.arange(int(lengths.sum()), dtype=np.int64)
+    out += np.repeat(starts - offsets, lengths)
+    return out
+
+
+class _Runs:
+    """Runs of rows in one dataset, ``starts[i] : starts[i] + lengths[i]``, in buffer order.
+
+    What a loader's chunks are, and what a range read takes: its rows exist only for the
+    callers that need one entry per row (obs, indices, an in-memory source), built once.
+    """
+
+    def __init__(self, starts: np.ndarray, lengths: np.ndarray) -> None:
+        self.starts, self.lengths = starts, lengths
+        self._rows: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return int(self.lengths.sum())
+
+    @property
+    def rows(self) -> np.ndarray:
+        if self._rows is None:
+            self._rows = _ramp(self.starts, self.lengths)
+        return self._rows
+
+    def nnz(self, indptr: np.ndarray) -> int:
+        """Non-zeros in the runs, off a CSR's `indptr`: one lookup per run, not per row."""
+        return int((indptr[self.starts + self.lengths] - indptr[self.starts]).sum())
+
+
 def _csr_parts(dataset: BackingArray_T) -> tuple[np.ndarray, np.dtype, np.dtype]:
     """``(indptr, data dtype, indices dtype)`` for a backed or in-memory CSR.
 
@@ -570,8 +603,8 @@ class Loader[
             )
         return self
 
-    def _requests_to_dataset_rows(self, requests: list[slice] | np.ndarray) -> OrderedDict[int, np.ndarray]:
-        """Given a ndarray or list of slices, give the lookup between on-disk datasets and row indices relative to that dataset.
+    def _requests_to_dataset_rows(self, requests: list[slice] | np.ndarray) -> tuple[OrderedDict[int, _Runs], np.ndarray]:
+        """Given a ndarray or list of slices, the runs of rows each on-disk dataset is asked for.
 
         Parameters
         ----------
@@ -580,57 +613,62 @@ class Loader[
 
         Returns
         -------
-            A lookup between the dataset and its row indices, ordered by keys, and the permutation
-            ``order`` mapping each in-memory buffer position to its index in the original chunk order
-            (the buffer is filled in dataset order, so ``order`` is what undoes that reordering).
+            A lookup between the dataset and its runs of rows, ordered by keys, and the
+            permutation ``order`` mapping each in-memory buffer position to its index in the
+            original request order (the buffer is filled in dataset order, so ``order`` is what
+            undoes that reordering).
         """
         if isinstance(requests, np.ndarray) and np.issubdtype(requests.dtype, np.integer):
-            global_index = requests
+            run_starts = requests.astype(np.int64, copy=False)
+            run_lengths = np.ones_like(run_starts)
         else:
-            # One flat ramp, rebased per slice, rather than an `arange` and an allocation
-            # per slice followed by a concatenate of them all. The loop form's iteration
-            # count is the SLICE count, and at chunk_size 1 that is one slice per row --
-            # so it scaled with the batch rather than with the number of runs in it.
-            # Two scalar `fromiter`s, NOT one with a `(int64, 2)` subarray dtype: that
-            # form makes numpy unpack a Python tuple per slice, which measured SLOWER
-            # than the concatenate-of-aranges it replaced -- 18.5k -> 16.0k rows/s on a
-            # strided draw, consistently across chunk sizes.
-            slice_starts = np.fromiter(
-                (s.start for s in requests), dtype=np.int64, count=len(requests)
-            )
-            stops = np.fromiter(
-                (s.stop for s in requests), dtype=np.int64, count=len(requests)
-            )
-            lengths = stops - slice_starts
-            offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(lengths)])
-            global_index = np.arange(int(offsets[-1]), dtype=np.int64)
-            global_index -= np.repeat(offsets[:-1], lengths)
-            global_index += np.repeat(slice_starts, lengths)
+            # Two scalar `fromiter`s, NOT one with a `(int64, 2)` subarray dtype: that form
+            # makes numpy unpack a Python tuple per slice, which measured slower.
+            run_starts = np.fromiter((s.start for s in requests), dtype=np.int64, count=len(requests))
+            stops = np.fromiter((s.stop for s in requests), dtype=np.int64, count=len(requests))
+            run_lengths = stops - run_starts
+        keep = run_lengths > 0
+        run_starts, run_lengths = run_starts[keep], run_lengths[keep]
+        # Where each run's rows land in request order.
+        request_at = np.cumsum(run_lengths) - run_lengths
 
-        # Locate each requested row in its dataset by binary-searching the dataset boundaries,
-        sizes = np.fromiter(
-            (shape[0] for shape in self._shapes),
-            dtype=np.int64,
-            count=len(self._shapes),
-        )
+        sizes = np.fromiter((shape[0] for shape in self._shapes), dtype=np.int64, count=len(self._shapes))
         ends = np.cumsum(sizes)
         starts = ends - sizes
-        dataset_of_row = np.searchsorted(ends, global_index, side="right")
+        dataset_of_run = np.searchsorted(ends, run_starts, side="right")
+        # A run crossing a dataset boundary is cut there. Rare, so the cut is a loop over
+        # just those runs.
+        last = np.searchsorted(ends, run_starts + run_lengths - 1, side="right")
+        if (cross := np.flatnonzero(last != dataset_of_run)).size:
+            pieces = [(run_starts, run_lengths, request_at, dataset_of_run)]
+            parts = []
+            for i in cross:
+                at, left, where = run_starts[i], run_lengths[i], request_at[i]
+                for ds in range(dataset_of_run[i], last[i] + 1):
+                    n = min(left, int(ends[ds]) - at)
+                    parts.append((at, n, where, ds))
+                    at, left, where = at + n, left - n, where + n
+            whole = np.ones(run_starts.size, dtype=bool)
+            whole[cross] = False
+            cut = np.array(parts, dtype=np.int64).T
+            run_starts, run_lengths, request_at, dataset_of_run = (
+                np.concatenate([p[whole], c]) for p, c in zip(pieces[0], cut, strict=True)
+            )
 
-        # Group rows by dataset, and sort within each group. Ascending rows are what
-        # lets a backed read land straight in the caller's buffer -- out of order it
-        # costs a full-size temporary and a gather to put back. The batch's own order is
-        # not lost: `__iter__` inverts `order` before yielding, so it restores whatever
-        # permutation is chosen here.
-        order = np.lexsort((global_index, dataset_of_row))
-        grouped = dataset_of_row[order]
+        # Runs grouped by dataset and ascending within it -- a sort of RUNS, not rows. Ascending
+        # keeps runs that touch next to each other, so a range read merges them, and keeps rows
+        # of one inner chunk together, so it is read and decoded once for all of them.
+        run_order = np.lexsort((run_starts, dataset_of_run))
+        grouped = dataset_of_run[run_order]
         group_start = np.concatenate([[0], np.flatnonzero(np.diff(grouped)) + 1])
         group_end = np.append(group_start[1:], grouped.size)
 
-        result: OrderedDict[int, np.ndarray] = OrderedDict()
+        result: OrderedDict[int, _Runs] = OrderedDict()
         for gs, ge in zip(group_start, group_end, strict=True):
             ds = int(grouped[gs])
-            result[ds] = global_index[order[gs:ge]] - starts[ds]
+            picked = run_order[gs:ge]
+            result[ds] = _Runs(run_starts[picked] - starts[ds], run_lengths[picked])
+        order = _ramp(request_at[run_order], run_lengths[run_order])
         return result, order
 
     def _alloc(self, shape: tuple[int, ...], dtype: np.dtype, *, use_pinned: bool) -> np.ndarray:
@@ -640,7 +678,7 @@ class Loader[
             return cpx.empty_pinned(shape, dtype)
         return np.empty(shape, dtype)
 
-    def _allocate_out(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> CSRContainer | np.ndarray:
+    def _allocate_out(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> CSRContainer | np.ndarray:
         """Preallocate a single contiguous output buffer covering all datasets and rows.
 
         For sparse data the buffer is a :class:`~annbatch.utils.CSRContainer` whose ``data``
@@ -654,10 +692,7 @@ class Loader[
 
         if issubclass(self.dataset_type, ad.abc.CSRDataset | sp.csr_array | sp.csr_matrix):
             parts = {idx: _csr_parts(self._train_datasets[idx]) for idx in dataset_index_to_rows}
-            total_nnz = sum(
-                int((parts[idx][0][rows + 1] - parts[idx][0][rows]).sum())
-                for idx, rows in dataset_index_to_rows.items()
-            )
+            total_nnz = sum(runs.nnz(parts[idx][0]) for idx, runs in dataset_index_to_rows.items())
             first_indptr, data_dtype, indices_dtype = parts[next(iter(dataset_index_to_rows))]
             indptr_dtype = first_indptr.dtype
             return CSRContainer(
@@ -692,7 +727,7 @@ class Loader[
         return all(dtypes_of(d) == first for d in datasets[1:])
 
     def _allocate_per_dataset_outs(
-        self, dataset_index_to_rows: OrderedDict[int, np.ndarray]
+        self, dataset_index_to_rows: OrderedDict[int, _Runs]
     ) -> OrderedDict[int, CSRContainer | np.ndarray]:
         """Allocate one output buffer per dataset, each using that dataset's native dtype(s).
 
@@ -704,7 +739,7 @@ class Loader[
         if is_sparse:
             for idx, rows in dataset_index_to_rows.items():
                 indptr, data_dtype, indices_dtype = _csr_parts(self._train_datasets[idx])
-                nnz = int((indptr[rows + 1] - indptr[rows]).sum())
+                nnz = rows.nnz(indptr)
                 outs[idx] = CSRContainer(
                     elems=(
                         self._alloc((nnz,), data_dtype, use_pinned=False),
@@ -783,7 +818,7 @@ class Loader[
         raise NotImplementedError(f"Cannot fetch data for type {type(dataset)}")
 
     @_fetch_data.register
-    def _fetch_data_dense(self, dataset: ZarrArray, rows: np.ndarray, out: np.ndarray) -> None:
+    def _fetch_data_dense(self, dataset: ZarrArray, rows: _Runs, out: np.ndarray) -> None:
         """One selection, handed to the codec pipeline whole.
 
         This used to derive RUNS from the rows and read them as ranges, which meant a
@@ -807,34 +842,34 @@ class Loader[
         `read_ranges` both go.
         """
         prototype = zarr.core.buffer.default_buffer_prototype()
-        # A zarr with a range selection takes the rows as one range each: its codec pipeline can
-        # read them without an indexer, which the per-run `BasicIndexer` above never could.
+        # A zarr with a range selection takes the runs as they are: its codec pipeline can read
+        # them without an indexer, which the per-run `BasicIndexer` above never could.
         if hasattr(dataset, "get_range_selection"):
-            dataset.get_range_selection(rows, np.ones_like(rows), out=prototype.nd_buffer(out))
+            dataset.get_range_selection(rows.starts, rows.lengths, out=prototype.nd_buffer(out))
             return
-        dataset.get_orthogonal_selection((rows, slice(None)), out=prototype.nd_buffer(out))
+        dataset.get_orthogonal_selection((rows.rows, slice(None)), out=prototype.nd_buffer(out))
 
     @_fetch_data.register
     def _fetch_data_numpy_matrix(
         self,
         dataset: np.ndarray,
-        rows: np.ndarray,
+        rows: _Runs,
         out: np.ndarray,
     ) -> None:
-        out[:] = dataset[rows]
+        out[:] = dataset[rows.rows]
 
     @_fetch_data.register
     def _fetch_data_csr_matrix(
         self,
         dataset: sp.csr_matrix | sp.csr_array,
-        rows: np.ndarray,
+        rows: _Runs,
         out: CSRContainer,
     ) -> None:
         _csr_subset_rows(
             dataset.data,
             dataset.indices,
             dataset.indptr,
-            np.ascontiguousarray(rows),
+            np.ascontiguousarray(rows.rows),
             out.elems[0],
             out.elems[1],
         )
@@ -843,7 +878,7 @@ class Loader[
     def _fetch_data_sparse(
         self,
         dataset: ad.abc.CSRDataset,
-        rows: np.ndarray,
+        rows: _Runs,
         out: CSRContainer,
     ) -> None:
         """Read the rows through anndata's synchronous interface. Nothing else.
@@ -865,8 +900,11 @@ class Loader[
         `indptr` is not filled here. It spans every dataset in the batch, so only
         :meth:`_index_datasets` knows the offsets, and it writes it afterwards.
         """
-        dataset.read_rows(rows, out=(out.elems[0], out.elems[1]))
-        return
+        # An anndata that reads runs takes them as they are, one range each.
+        if hasattr(dataset, "read_row_ranges"):
+            dataset.read_row_ranges(rows.starts, rows.lengths, out=(out.elems[0], out.elems[1]))
+            return
+        dataset.read_rows(rows.rows, out=(out.elems[0], out.elems[1]))
 
     def _run_fetches(self, tasks: list) -> None:
         """Run the per-dataset fetches concurrently, on threads instead of a loop.
@@ -885,7 +923,7 @@ class Loader[
 
     def _index_datasets(
         self,
-        dataset_index_to_rows: OrderedDict[int, np.ndarray],
+        dataset_index_to_rows: OrderedDict[int, _Runs],
     ) -> CSRContainer | np.ndarray:
         """Preallocate one output buffer, dispatch concurrent fetches into per-dataset views, then return the buffer.
 
@@ -913,7 +951,7 @@ class Loader[
                 for dataset_idx, rows in dataset_index_to_rows.items():
                     sub_out = per_dataset_outs[dataset_idx]
                     cached_indptr = datasets[dataset_idx].indptr
-                    per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                    per_row_nnz = cached_indptr[rows.rows + 1] - cached_indptr[rows.rows]
                     sub_out.elems[2][0] = 0
                     np.cumsum(per_row_nnz, out=sub_out.elems[2][1:])
             return self._concatenate_outs(per_dataset_outs)
@@ -928,8 +966,7 @@ class Loader[
             nrows = len(rows)
             if is_sparse:
                 datasets = self._train_datasets
-                cached_indptr = datasets[dataset_idx].indptr
-                nnz = int((cached_indptr[rows + 1] - cached_indptr[rows]).sum())
+                nnz = rows.nnz(datasets[dataset_idx].indptr)
                 out_view: CSRContainer | np.ndarray = CSRContainer(
                     elems=(
                         out.elems[0][nnz_offset : nnz_offset + nnz],
@@ -955,7 +992,7 @@ class Loader[
             out.elems[2][0] = 0
             for dataset_idx, rows in dataset_index_to_rows.items():
                 cached_indptr = datasets[dataset_idx].indptr
-                per_row_nnz = cached_indptr[rows + 1] - cached_indptr[rows]
+                per_row_nnz = cached_indptr[rows.rows + 1] - cached_indptr[rows.rows]
                 dest = out.elems[2][row_pos + 1 : row_pos + len(rows) + 1]
                 np.cumsum(per_row_nnz, out=dest)
                 dest += running_nnz
@@ -1040,15 +1077,15 @@ class Loader[
             if self._preload_to_gpu and is_sparse:
                 self._np_module.get_default_memory_pool().free_all_blocks()
 
-    def _maybe_accumulate_obs(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> pd.DataFrame | None:
+    def _maybe_accumulate_obs(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> pd.DataFrame | None:
         """Gather obs labels for the loaded rows if possible."""
         if self._obs is None:
             return None
-        return pd.concat([self._obs[idx].iloc[rows] for idx, rows in dataset_index_to_rows.items()])
+        return pd.concat([self._obs[idx].iloc[rows.rows] for idx, rows in dataset_index_to_rows.items()])
 
-    def _maybe_accumulate_indices(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> np.ndarray | None:
+    def _maybe_accumulate_indices(self, dataset_index_to_rows: OrderedDict[int, _Runs]) -> np.ndarray | None:
         """Gather original indices for the loaded rows if possible."""
         if self._return_index is False:
             return None
         dataset_offsets = np.concatenate(([0], np.cumsum([shape[0] for shape in self._shapes])))
-        return np.concatenate([rows + dataset_offsets[idx] for idx, rows in dataset_index_to_rows.items()])
+        return np.concatenate([rows.rows + dataset_offsets[idx] for idx, rows in dataset_index_to_rows.items()])
