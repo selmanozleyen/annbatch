@@ -53,6 +53,32 @@ def validate_sampler[**Param, RetType](
     return wrapper
 
 
+def as_runs(requests: list[slice] | np.ndarray) -> np.ndarray:
+    """A load request's rows as an ``(n, 2)`` array of ``[start, stop)`` runs.
+
+    Runs pass through; a 1-D index array is runs of one row; a list of slices is read off once.
+    """
+    if isinstance(requests, np.ndarray):
+        if requests.ndim == 2:
+            return requests
+        return np.column_stack([requests, requests + 1])
+    starts = np.fromiter((s.start for s in requests), dtype=np.int64, count=len(requests))
+    stops = np.fromiter((s.stop for s in requests), dtype=np.int64, count=len(requests))
+    return np.column_stack([starts, stops])
+
+
+def ramp(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """``starts[i] : starts[i] + lengths[i]`` for every ``i``, laid end to end, in one pass."""
+    rows = np.arange(int(lengths.sum()), dtype=np.int64)
+    rows += np.repeat(starts - (np.cumsum(lengths) - lengths), lengths)
+    return rows
+
+
+def rows_of_runs(runs: np.ndarray) -> np.ndarray:
+    """Every row of ``(n, 2)`` ``[start, stop)`` runs, in order."""
+    return ramp(runs[:, 0], runs[:, 1] - runs[:, 0])
+
+
 def split_given_size(a: np.ndarray, size: int) -> list[np.ndarray]:
     """Wrapper around `np.split` to split up an array into `size` chunks.
 
@@ -80,30 +106,6 @@ class CSRContainer:
     elems: tuple[np.ndarray, np.ndarray, np.ndarray]
     shape: tuple[int, int]
     dtype: np.dtype
-
-
-# TODO: make this part of the public zarr or zarrs-python API.
-# We can do chunk coalescing in zarrs based on integer arrays, so I think
-# there would make sense with ezclump or similar.
-# Another "solution" would be for zarrs to support integer indexing properly, if that pipeline works,
-# or make this an "experimental setting" and to use integer indexing for the zarr-python pipeline.
-# See: https://github.com/zarr-developers/zarr-python/issues/3175 for why this is better than simpler alternatives.
-class MultiBasicIndexer(zarr.core.indexing.Indexer):
-    """Custom indexer to enable joint fetching of disparate slices"""
-
-    def __init__(self, indexers: list[zarr.core.indexing.Indexer]):
-        self.shape = (sum(i.shape[0] for i in indexers), *indexers[0].shape[1:])
-        self.drop_axes = indexers[0].drop_axes  # maybe?
-        self.indexers = indexers
-
-    def __iter__(self):
-        total = 0
-        for i in self.indexers:
-            for c in i:
-                out_selection = c[2]
-                gap = out_selection[0].stop - out_selection[0].start
-                yield type(c)(c[0], c[1], (slice(total, total + gap), *out_selection[1:]), c[3])
-                total += gap
 
 
 def _spawn_worker_rng(rng: np.random.Generator, worker_id: int) -> np.random.Generator:

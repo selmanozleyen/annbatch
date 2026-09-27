@@ -25,8 +25,10 @@ class LoadRequest(TypedDict):
     Attributes
     ----------
     requests
-        Either an array of indices to load that must be the same size as the sum of the split sizes,
-        or a list of slices with a range of chunk_size except the last one which may be smaller but not empty.
+        What to load, as one of: an ``(n, 2)`` integer array of ``[start, stop)`` runs of rows, each
+        chunk_size long except the last, which may be shorter but not empty (what the built-in
+        samplers yield); a list of slices of the same runs; or a 1-D array of row indices. The rows
+        in total must match the sum of the split sizes.
 
         .. versionchanged:: 0.2.0
             Renamed from ``chunks`` to ``requests``.
