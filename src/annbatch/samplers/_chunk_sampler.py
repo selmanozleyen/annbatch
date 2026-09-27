@@ -11,6 +11,7 @@ import numpy as np
 from annbatch.abc import Sampler
 from annbatch.samplers._utils import (
     get_torch_worker_info,
+    resolve_rng,
     validate_chunk_batch_preload_sizes,
     validate_mask_and_resolve,
     validate_mask_n_obs_and_resolve,
@@ -56,7 +57,7 @@ class _ChunkSampler(Sampler):
 
         start, stop = validate_mask_and_resolve(mask)
         validate_chunk_batch_preload_sizes(chunk_size, preload_nchunks, batch_size)
-        self._rng = rng or np.random.default_rng()
+        self._rng = resolve_rng(rng)
         self._replacement = replacement
         self._num_samples = num_samples
         self._in_memory_size = chunk_size * preload_nchunks
@@ -142,7 +143,7 @@ class _ChunkSampler(Sampler):
     def _iter_from_slices(
         self,
         n_obs: int,
-        slices: list[slice],
+        slices: np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -161,7 +162,7 @@ class _ChunkSampler(Sampler):
 
     def _iter_from_slices_base(
         self,
-        slices: list[slice],
+        slices: np.ndarray,
         batch_rng: np.random.Generator,
         worker_info: WorkerInfo | None,
     ) -> Iterator[LoadRequest]:
@@ -174,13 +175,15 @@ class _ChunkSampler(Sampler):
         split_batch_indices = split_given_size(batch_indices, self.batch_size)
         for request_slices in slices_per_request[:-1]:
             if self.shuffle:
-                # Avoid copies using in-place shuffling since `self.shuffle` should not change mid-training
+                # shuffle in place; `split_given_size` copies the pieces out
                 batch_rng.shuffle(batch_indices)
                 split_batch_indices = split_given_size(batch_indices, self.batch_size)
             yield {"requests": request_slices, "splits": split_batch_indices}
         # On the last yield, drop the last uneven batch and create new batch_indices since the in-memory size of this last yield could be divisible by batch_size but smaller than preload_nchunks * chunk_size
         final_slices = slices_per_request[-1]
-        total_obs_in_last_batch = int(sum(s.stop - s.start for s in final_slices))
+        total_obs_in_last_batch = (
+            int(final_slices.size) if self._chunk_size == 1 else int((final_slices[:, 1] - final_slices[:, 0]).sum())
+        )
         if total_obs_in_last_batch == 0:  # pragma: no cover
             raise RuntimeError("Last batch was found to have no observations. Please open an issue.")
         if self._drop_last:
@@ -191,10 +194,12 @@ class _ChunkSampler(Sampler):
         batch_indices = split_given_size(indices, self.batch_size)
         yield {"requests": final_slices, "splits": batch_indices}
 
-    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> list[slice]:
-        """Compute slices from start and stop indices.
+    def _compute_slices(self, n_obs: int, rng: np.random.Generator) -> np.ndarray:
+        """The chunks, as an ``(n, 2)`` array of ``[start, stop)`` runs; the last may be incomplete.
 
-        Slices are computed such that the last slice may be incomplete.
+        Built as arrays throughout: a `slice` per chunk is one Python object per row, and the
+        loader only takes the starts and stops back out of it. At ``chunk_size == 1`` a flat
+        integer index array instead, which the loader also consumes directly.
         """
         start, stop = self._resolve_start_stop(n_obs)
         if self._replacement:
@@ -203,23 +208,38 @@ class _ChunkSampler(Sampler):
 
     def _compute_slices_with_replacement(
         self, start: int, stop: int, n_obs: int, rng: np.random.Generator
-    ) -> list[slice]:
-        """Draw random slice positions with replacement."""
+    ) -> np.ndarray:
+        """Draw random chunk positions with replacement."""
         num_samples = self._resolve_num_samples(n_obs)
+        if self._chunk_size == 1:
+            # One row per chunk is the same draw, and the loader takes an integer
+            # array directly -- see `_requests_to_dataset_rows`. Going through
+            # slices would build a Python object per row here and unpack it with a
+            # one-element `arange` per row there.
+            return rng.integers(start, stop, size=num_samples)
         n_slices, remainder = divmod(num_samples, self._chunk_size)
-        start_indices = rng.integers(start, stop - self._chunk_size + 1, size=n_slices)
-        res = [slice(int(s), int(s + self._chunk_size)) for s in start_indices]
+        starts = rng.integers(start, stop - self._chunk_size + 1, size=n_slices, dtype=np.int64)
+        runs = np.column_stack([starts, starts + self._chunk_size])
         if remainder > 0 and not self._drop_last:
-            start_index = rng.integers(start, stop - remainder + 1)
-            res.append(slice(start_index, start_index + remainder))
-        return res
+            start_index = rng.integers(start, stop - remainder + 1, dtype=np.int64)
+            runs = np.vstack([runs, [[start_index, start_index + remainder]]])
+        return runs
 
-    def _compute_slices_without_replacement(self, start: int, stop: int, rng: np.random.Generator) -> list[slice]:
+    def _compute_slices_without_replacement(self, start: int, stop: int, rng: np.random.Generator) -> np.ndarray:
         """Compute slices covering the full range exactly once.
 
         The incomplete slice (slice that is less than chunk_size) is always placed last in iteration order regardless
         of shuffling -- ensuring no observation is duplicated.
         """
+        if self._chunk_size == 1:
+            # Every chunk is one row, so the layout IS the index array: there is no
+            # incomplete tail to place last, and the loader indexes with integers
+            # anyway. Building `slice` objects instead costs one Python object per
+            # observation -- 100M of them, and ~15 GB, for a 100M-row collection.
+            indices = np.arange(start, stop)
+            if self.shuffle:
+                rng.shuffle(indices)
+            return indices
         slice_indices = np.arange(math.ceil((stop - start) / self._chunk_size))
         if self.shuffle:
             rng.shuffle(slice_indices)
@@ -229,5 +249,4 @@ class _ChunkSampler(Sampler):
         incomplete = (stop - start) % self._chunk_size
         offsets[pivot_index + 1] = incomplete if incomplete else self._chunk_size
         offsets = np.cumsum(offsets)
-        starts, stops = offsets[:-1][slice_indices], offsets[1:][slice_indices]
-        return [slice(int(s), int(e)) for s, e in zip(starts, stops, strict=True)]
+        return np.column_stack([offsets[:-1][slice_indices], offsets[1:][slice_indices]]).astype(np.int64)
