@@ -973,12 +973,6 @@ def _backed_csrs(tmp_path: Path, sizes: tuple[int, ...] = (120, 90, 150)):
     ("chunk_size", "preload_nchunks"), [(1, 64), (8, 8), (32, 2)], ids=["scattered", "mixed", "blocks"]
 )
 def test_backed_csr_batches_match_reference(tmp_path: Path, chunk_size: int, preload_nchunks: int) -> None:
-    """Every batch must be the requested rows of the concatenation, in the requested order.
-
-    Parametrised across the scatter range because the read shape changes with it:
-    ``chunk_size=1`` is a row at a time, ``32`` is contiguous blocks, and the rows are
-    reordered on the way to the store in both cases.
-    """
     datasets, reference = _backed_csrs(tmp_path)
     loader = Loader(
         shuffle=True,
@@ -1000,15 +994,7 @@ def test_backed_csr_batches_match_reference(tmp_path: Path, chunk_size: int, pre
 
 
 def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch) -> None:
-    """Rows must reach anndata already ascending, or `out=` buys nothing.
-
-    A backed read only goes straight into the caller's buffer when the rows are
-    ascending and distinct; otherwise anndata reads into a full-size temporary and
-    gathers from it. `_requests_to_dataset_rows` sorts runs within each dataset for exactly
-    this reason, and a stable sort on the dataset key alone -- which is what it used to
-    do -- silently sends every read down the copying path. On a zarr with a range selection
-    there is no description to sort for: the runs are read as asked.
-    """
+    """Runs reach anndata ascending, so `read_rows(out=)` writes straight into the buffer."""
     import anndata._core.sparse_dataset as sparse_dataset_module
 
     datasets, _ = _backed_csrs(tmp_path)
@@ -1034,7 +1020,6 @@ def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch)
     for _ in loader:
         pass
 
-    # A zarr with a range selection reads the runs as asked: no description, no gather.
     if hasattr(zarr.Array, "get_range_selection"):
         assert reads == {"direct": 0, "gathered": 0}
         return

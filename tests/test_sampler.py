@@ -894,13 +894,7 @@ class TestDistributedSampler:
 
 @pytest.mark.parametrize("replacement", [False, True])
 def test_chunk_size_one_yields_indices(replacement: bool):
-    """At chunk_size=1 the sampler hands the loader integers, not slice objects.
-
-    One row per chunk means the layout already IS the index array, and
-    ``Loader._requests_to_dataset_rows`` takes an integer array directly. Building
-    slices instead costs one Python object per observation, which for a 100M-row
-    collection was 212 s and ~15 GB before a single batch was yielded.
-    """
+    """At chunk_size=1 the sampler yields row indices; wider chunks yield ``(n, 2)`` runs."""
     n_obs = 1000
     sampler = RandomSampler(
         chunk_size=1,
@@ -917,23 +911,19 @@ def test_chunk_size_one_yields_indices(replacement: bool):
         assert requests.size == 20
         assert requests.min() >= 0 and requests.max() < n_obs
     else:
-        # An epoch still covers every observation exactly once.
         assert np.array_equal(np.sort(requests), np.arange(n_obs))
 
-    # Anything wider than one row is an (n, 2) array of [start, stop) runs.
     wide = RandomSampler(chunk_size=4, preload_nchunks=8, batch_size=4, rng=np.random.default_rng(0))
     runs = wide._compute_slices(n_obs, np.random.default_rng(0))
     assert runs.ndim == 2 and runs.shape[1] == 2 and (np.diff(runs) == 4).all()
 
 
 def test_request_forms_describe_the_same_rows():
-    """Runs, a list of slices and a 1-D index array are one request, and expand to its rows."""
-    from annbatch.utils import rows_of_runs
+    from annbatch.utils import ramp
 
     runs = np.array([[5, 8], [0, 1], [20, 24]])
     want = [5, 6, 7, 0, 20, 21, 22, 23]
-    for form in (runs, [slice(5, 8), slice(0, 1), slice(20, 24)]):
-        np.testing.assert_array_equal(as_runs(form), runs)
-        assert rows_of_runs(as_runs(form)).tolist() == want
-    assert rows_of_runs(as_runs(np.array(want))).tolist() == want
-    assert rows_of_runs(np.empty((0, 2), dtype=np.int64)).size == 0
+    np.testing.assert_array_equal(as_runs([slice(5, 8), slice(0, 1), slice(20, 24)]), runs)
+    assert ramp(runs[:, 0], np.diff(runs).ravel()).tolist() == want
+    np.testing.assert_array_equal(as_runs(np.array(want)), np.column_stack([want, np.add(want, 1)]))
+    assert as_runs([]).shape == (0, 2)
