@@ -54,29 +54,17 @@ def validate_sampler[**Param, RetType](
 
 
 def as_runs(requests: list[slice] | np.ndarray) -> np.ndarray:
-    """A load request's rows as an ``(n, 2)`` array of ``[start, stop)`` runs.
-
-    Runs pass through; a 1-D index array is runs of one row; a list of slices is read off once.
-    """
+    """A load request's rows as an ``(n, 2)`` array of ``[start, stop)`` runs."""
     if isinstance(requests, np.ndarray):
-        if requests.ndim == 2:
-            return requests
-        return np.column_stack([requests, requests + 1])
-    starts = np.fromiter((s.start for s in requests), dtype=np.int64, count=len(requests))
-    stops = np.fromiter((s.stop for s in requests), dtype=np.int64, count=len(requests))
-    return np.column_stack([starts, stops])
+        return requests if requests.ndim == 2 else np.column_stack([requests, requests + 1])
+    return np.array([(s.start, s.stop) for s in requests], dtype=np.int64).reshape(-1, 2)
 
 
 def ramp(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
-    """``starts[i] : starts[i] + lengths[i]`` for every ``i``, laid end to end, in one pass."""
+    """``starts[i] : starts[i] + lengths[i]`` for every ``i``, concatenated."""
     rows = np.arange(int(lengths.sum()), dtype=np.int64)
     rows += np.repeat(starts - (np.cumsum(lengths) - lengths), lengths)
     return rows
-
-
-def rows_of_runs(runs: np.ndarray) -> np.ndarray:
-    """Every row of ``(n, 2)`` ``[start, stop)`` runs, in order."""
-    return ramp(runs[:, 0], runs[:, 1] - runs[:, 0])
 
 
 def split_given_size(a: np.ndarray, size: int) -> list[np.ndarray]:

@@ -115,8 +115,7 @@ class Sampler(ABC):
                     raise ValueError("shuffle must be set when splits are not provided in LoadRequest")
 
                 # Calculate total observations from requests
-                runs = as_runs(load_request["requests"])
-                total_obs = int((runs[:, 1] - runs[:, 0]).sum())
+                total_obs = int(np.diff(as_runs(load_request["requests"])).sum())
 
                 # Generate indices with optional shuffling and split into batches
                 indices = np.random.permutation(total_obs) if shuffle else np.arange(total_obs)
