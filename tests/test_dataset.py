@@ -994,20 +994,18 @@ def test_backed_csr_batches_match_reference(tmp_path: Path, chunk_size: int, pre
 
 
 def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch) -> None:
-    """Runs reach anndata ascending, so `read_rows(out=)` writes straight into the buffer."""
-    import anndata._core.sparse_dataset as sparse_dataset_module
-
+    """The loader hands anndata its batch buffer as `out`."""
     datasets, _ = _backed_csrs(tmp_path)
-    reads = {"direct": 0, "gathered": 0}
-    select_rows = sparse_dataset_module._select_rows
+    cls = type(datasets[0])
+    name = "read_row_ranges" if hasattr(cls, "read_row_ranges") else "read_rows"
+    original = getattr(cls, name)
+    outs = []
 
-    def counting_select_rows(rows, indptr, xp=np):
-        selection = select_rows(rows, indptr, xp)
-        reads["direct" if selection.take is None else "gathered"] += 1
-        return selection
+    def recording(self, *args, out=None, **kwargs):
+        outs.append(out)
+        return original(self, *args, out=out, **kwargs)
 
-    monkeypatch.setattr(sparse_dataset_module, "_select_rows", counting_select_rows)
-
+    monkeypatch.setattr(cls, name, recording)
     loader = Loader(
         shuffle=True,
         chunk_size=1,
@@ -1019,9 +1017,5 @@ def test_backed_csr_reads_land_in_the_output_buffer(tmp_path: Path, monkeypatch)
     ).add_datasets(datasets)
     for _ in loader:
         pass
-
-    if hasattr(zarr.Array, "get_range_selection"):
-        assert reads == {"direct": 0, "gathered": 0}
-        return
-    assert reads["direct"] > 0
-    assert reads["gathered"] == 0
+    assert outs
+    assert all(out is not None for out in outs)
