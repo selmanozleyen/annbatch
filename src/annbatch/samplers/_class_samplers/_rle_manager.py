@@ -126,14 +126,10 @@ class RLEManager:
             },
             index=pd.Index(classes_to_sample, name="cat"),
         )
-        # Row of the table above for each class code, -1 where the class is not drawable.
-        self._position_of_code = np.full(len(self._classes.categories), -1, dtype=self._classes.codes.dtype)
+        # Rows of the table above, by class code. Rebuilt with the table, so a code keeps its
+        # meaning across a mask change while a row number does not.
+        self._position_of_code = np.full(len(self._classes.categories), -1, dtype=np.int64)
         self._position_of_code[classes_to_sample] = np.arange(classes_to_sample.shape[0])
-
-    @property
-    def codes(self) -> np.ndarray:
-        """The class codes that may be drawn, in the order :attr:`weights` indexes them."""
-        return self._per_class_sampling_info.index.to_numpy()
 
     @property
     def weights(self) -> np.ndarray:
@@ -167,33 +163,38 @@ class RLEManager:
         Parameters
         ----------
         class_of_slice
-            An array of class *codes* into ``classes.categories``, one per slice to generate. A code
-            that is not currently drawable raises.
+            An array of class *codes* into ``classes.categories``, one per slice to generate, such
+            that each slice contains only that class. A code that is not currently drawable raises.
 
         Returns
         -------
             list of slices
         """
-        # Draw a uniform chunk start among all of the class' possible starts, which weights each run by the
-        # number of chunks that are possible to sample within it. `searchsorted`  turns that start into a run and an offset inside it.
         positions = self._position_of_code[class_of_slice]
         if (undrawable := class_of_slice[positions < 0]).size:
             raise ValueError(
                 f"Class {self._classes.categories[undrawable[0]]!r} is not drawable in the current range "
                 f"[{self._mask.start}, {self._mask.stop}) or carries a non-positive weight."
             )
+        class_of_slice = positions
+
         starts_before = self._class_runs["starts_before"].to_numpy()
         n_starts = self._class_runs["n_starts"].to_numpy()
-        first = self._per_class_sampling_info["first_row_in_runs_of_class"].to_numpy()[positions]
-        last = first + self._per_class_sampling_info["n_runs"].to_numpy()[positions] - 1
-        first_possible_run_position_in_class = starts_before[first]
-        n_possible_positions_in_class = starts_before[last] + n_starts[last] - first_possible_run_position_in_class
-        run_start_in_class = first_possible_run_position_in_class + rng.integers(n_possible_positions_in_class)
-        run_id = np.searchsorted(starts_before, run_start_in_class, side="right") - 1
-        # run_start_in_class - starts_before[run_id] gives the random starting position
-        slice_starts = self._class_runs["start"].to_numpy()[run_id] + run_start_in_class - starts_before[run_id]
+        first = self._per_class_sampling_info["first_row_in_runs_of_class"].to_numpy()[class_of_slice]
+        last = first + self._per_class_sampling_info["n_runs"].to_numpy()[class_of_slice] - 1
+        # Pool the class's chunk starts over its runs and draw one uniformly, so a run is picked in
+        # proportion to how many it holds; searchsorted turns that start into a run and an offset.
+        base = starts_before[first]
+        offset = base + rng.integers(starts_before[last] + n_starts[last] - base)
+        chosen = np.searchsorted(starts_before, offset, side="right") - 1
+        slice_starts = self._class_runs["start"].to_numpy()[chosen] + offset - starts_before[chosen]
 
         return [slice(int(s), int(s + self._chunk_size)) for s in slice_starts]
+
+    @property
+    def emittable_codes(self) -> np.ndarray:
+        """The class codes that can be drawn, in the order :attr:`weights` indexes them."""
+        return self._per_class_sampling_info.index.to_numpy()
 
     @property
     def n_classes(self):

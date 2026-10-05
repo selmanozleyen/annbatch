@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning][].
 
 ## Unreleased
 
+### Feature
+
+- New {class}`~annbatch.samplers.BoundClassSampler`: replays another class sampler's per-batch class schedule against a second annotation column, so one pass reads two annotations in step with each other. It accepts a {class}`~annbatch.samplers.ClassSampler` or another {class}`~annbatch.samplers.BoundClassSampler` (so these chain), and rejects {class}`~annbatch.samplers.WeightedClassSampler`, whose batches mix classes.
+
 ### Changed
 
 - {class}`~annbatch.Loader` no longer validates its batch sampler each time datasets are added; the sampler is validated against the loader's full `n_obs` when iteration starts, so a misconfigured sampler now raises on the first `next(iter(loader))` rather than in `add_adata`/`add_dataset` (https://github.com/scverse/annbatch/issues/289).
