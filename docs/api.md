@@ -13,6 +13,7 @@
 
     Loader
     Loader.__iter__
+    RemapColumns
 ```
 
 (io-helpers)=

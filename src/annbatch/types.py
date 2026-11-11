@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import NotRequired, TypedDict
 
 import anndata as ad
@@ -14,6 +15,8 @@ from .utils import CSRContainer
 type BackingArray_T = ad.abc.CSRDataset | ZarrArray | sp.csr_array | sp.csr_matrix | np.ndarray
 type InputInMemoryArray_T = CSRContainer | np.ndarray
 type OutputInMemoryArray_T = sp.csr_matrix | np.ndarray | CupyCSRMatrix | CupyArray | Tensor | JaxArray | JAXCSRMatrix
+# A dataset's rows as read (CSR for sparse data, an array for dense) -> the same rows in the loader's ``var``.
+type Transform = Callable[[sp.csr_matrix | np.ndarray], sp.csr_matrix | sp.csr_array | np.ndarray]
 
 
 class LoadRequest(TypedDict):

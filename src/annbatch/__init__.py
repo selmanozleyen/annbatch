@@ -22,11 +22,13 @@ if find_spec("cupy") and find_spec("cuda-toolkit"):
 from . import abc, samplers, types
 from .io import DatasetCollection, write_sharded
 from .loader import Loader
+from .utils import RemapColumns
 
 __version__ = version("annbatch")
 
 __all__ = [
     "Loader",
+    "RemapColumns",
     "DatasetCollection",
     "samplers",
     "types",
