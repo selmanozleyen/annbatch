@@ -76,10 +76,10 @@ class BoundClassSampler(_RunClassSampler):
         matching whole labels.
     classes
         Optional second annotation subdividing each bound class, so a batch is coherent on
-        the bound class *and* drawn from one of its subclasses.
+        the bound class *and* drawn from one of its secondary classes.
     class_weights
-        Weights over ``classes.categories``, controlling how often each subclass is drawn
-        within its bound class. A non-positive weight excludes that subclass.
+        Weights over ``classes.categories``, controlling how often each secondary class is drawn
+        within its bound class. A non-positive weight excludes that secondary class.
     mask
         Optional contiguous observation range to restrict sampling to.
     rng
@@ -117,94 +117,97 @@ class BoundClassSampler(_RunClassSampler):
                 "batch_size must be a multiple of chunk_size so each batch replays one inner class as whole chunks. "
                 f"Got chunk_size={chunk_size}, batch_size={batch_size}."
             )
-        outer_codes = codes_of_categorical(classes_to_bind_on, "classes_to_bind_on")
+        bound_codes = codes_of_categorical(classes_to_bind_on, "classes_to_bind_on")
         # the one private member read from the inner sampler
         inner_schedule = inner_sampler._schedule
 
         # matched against whole labels, or with `on` against the label columns it picks
-        inner_proj = inner_schedule.labels
+        inner_labels_on = inner_schedule.labels
         if on is not None:
             try:
                 on = tuple(int(position) for position in on)
             except TypeError:
                 raise TypeError(f"on must be a tuple of label positions or None, got {type(on).__name__}.") from None
             inner_levels = to_level_arrays(inner_schedule.labels)
-            n_inner = len(inner_levels)
-            if not on or any(not 0 <= position < n_inner for position in on):
+            n_inner_columns = len(inner_levels)
+            if not on or any(not 0 <= position < n_inner_columns for position in on):
                 raise ValueError(
-                    f"on must be a non-empty tuple of positions in [0, {n_inner}), since the inner sampler's "
-                    f"labels have {n_inner} column(s). Got {on}. To sample without matching, use an "
+                    f"on must be a non-empty tuple of positions in [0, {n_inner_columns}), since the inner sampler's "
+                    f"labels have {n_inner_columns} column(s). Got {on}. To sample without matching, use an "
                     "independent ClassSampler with the same number of batches."
                 )
-            n_bound = len(to_level_arrays(classes_to_bind_on.categories))
-            if len(on) != n_bound:
+            n_bound_columns = len(to_level_arrays(classes_to_bind_on.categories))
+            if len(on) != n_bound_columns:
                 raise ValueError(
                     f"on selects {len(on)} of the inner sampler's label columns but classes_to_bind_on labels "
-                    f"have {n_bound}; they must match to be compared. Got on={on}."
+                    f"have {n_bound_columns}; they must match to be compared. Got on={on}."
                 )
-            inner_proj = (
+            inner_labels_on = (
                 inner_levels[on[0]] if len(on) == 1 else pd.MultiIndex.from_arrays([inner_levels[p] for p in on])
             )
 
-        # a Categorical's categories are unique, so outer_codes already index them directly
+        # a Categorical's categories are unique, so bound_codes already index them directly
         bound_classes = classes_to_bind_on.categories
-        inner_to_bound = bound_classes.get_indexer(inner_proj)
+        inner_to_bound = bound_classes.get_indexer(inner_labels_on)
 
-        # scatter rather than np.unique: outer_codes is n_obs long, so this stays O(n_obs)
+        # scatter rather than np.unique: bound_codes is n_obs long, so this stays O(n_obs)
         present = np.zeros(len(bound_classes), dtype=bool)
-        present[outer_codes] = True
+        present[bound_codes] = True
         present_codes = np.flatnonzero(present)
 
         present_classes = bound_classes[present_codes]
-        not_in_inner = inner_proj.unique().get_indexer(present_classes) < 0
+        not_in_inner = inner_labels_on.unique().get_indexer(present_classes) < 0
         if not_in_inner.any():
             raise ValueError(
                 f"classes_to_bind_on has classes {list(present_classes[not_in_inner])} not present in the inner "
                 "sampler's classes; classes_to_bind_on must be a subset of the inner sampler's classes."
             )
-        emittable_inner_bound = inner_to_bound[inner_schedule.codes]
-        drawable = np.isin(emittable_inner_bound, present_codes)
+        bound_of_emittable = inner_to_bound[inner_schedule.codes]
+        drawable = np.isin(bound_of_emittable, present_codes)
         if not drawable.all():
-            missing = inner_proj[inner_schedule.codes][~drawable].unique()
+            missing = inner_labels_on[inner_schedule.codes][~drawable].unique()
             raise ValueError(f"The inner sampler can emit classes {list(missing)} absent from classes_to_bind_on.")
-        emittable_bound = np.unique(emittable_inner_bound)
+        emittable_bound_codes = np.unique(bound_of_emittable)
 
-        # the categorical this sampler draws from: the bound class, optionally times a subclass
+        # the categorical this sampler draws from: the bound class, optionally times a secondary class
         if classes is None:
             if class_weights is not None:
                 raise ValueError("class_weights was given but classes is None; pass a secondary `classes` too.")
             joint_to_bound = np.arange(len(bound_classes))
             joint_weight = np.ones(len(bound_classes), dtype=float)
-            joint_classes = pd.Categorical.from_codes(outer_codes, categories=bound_classes.to_flat_index())
+            joint_classes = pd.Categorical.from_codes(bound_codes, categories=bound_classes.to_flat_index())
         else:
-            sec_codes = codes_of_categorical(classes, "classes")
-            if len(classes) != outer_codes.shape[0]:
+            secondary_codes = codes_of_categorical(classes, "classes")
+            if len(classes) != bound_codes.shape[0]:
                 raise ValueError(
-                    f"classes must be the same length as classes_to_bind_on ({outer_codes.shape[0]}), "
+                    f"classes must be the same length as classes_to_bind_on ({bound_codes.shape[0]}), "
                     f"got {len(classes)}."
                 )
-            n_sec = len(classes.categories)
+            n_secondary = len(classes.categories)
             if hasattr(class_weights, "index"):
                 raise TypeError(
                     "class_weights must be an array, not a pandas Series: a Series would be read in positional "
                     "order and its index ignored. Pass class_weights.reindex(classes.categories).to_numpy()."
                 )
-            sec_weights = np.ones(n_sec) if class_weights is None else np.asarray(class_weights, dtype=float)
-            if sec_weights.shape != (n_sec,):
+            secondary_weights = (
+                np.ones(n_secondary) if class_weights is None else np.asarray(class_weights, dtype=float)
+            )
+            if secondary_weights.shape != (n_secondary,):
                 raise ValueError(
                     f"class_weights must have one weight per class in classes.categories "
-                    f"(expected shape ({n_sec},), got {sec_weights.shape})."
+                    f"(expected shape ({n_secondary},), got {secondary_weights.shape})."
                 )
-            if not (sec_weights > 0).any():
+            if not (secondary_weights > 0).any():
                 raise ValueError("class_weights must have at least one positive weight.")
 
-            joint_codes, joint_raw = pd.factorize(outer_codes.astype(np.int64) * n_sec + sec_codes)
-            joint_to_bound, j_sec = joint_raw // n_sec, joint_raw % n_sec
-            joint_weight = sec_weights[j_sec]
-            labels = pd.MultiIndex.from_arrays(
-                to_level_arrays(bound_classes.take(joint_to_bound)) + to_level_arrays(classes.categories.take(j_sec))
+            joint_codes, joint_keys = pd.factorize(bound_codes.astype(np.int64) * n_secondary + secondary_codes)
+            joint_to_bound, joint_to_secondary = joint_keys // n_secondary, joint_keys % n_secondary
+            joint_weight = secondary_weights[joint_to_secondary]
+            joint_labels = pd.MultiIndex.from_arrays(
+                to_level_arrays(bound_classes.take(joint_to_bound))
+                + to_level_arrays(classes.categories.take(joint_to_secondary))
             )
-            joint_classes = pd.Categorical.from_codes(joint_codes, categories=labels.to_flat_index())
+            joint_classes = pd.Categorical.from_codes(joint_codes, categories=joint_labels.to_flat_index())
 
         super().__init__(
             chunk_size,
@@ -213,7 +216,7 @@ class BoundClassSampler(_RunClassSampler):
             classes=joint_classes,
             num_samples=inner_sampler.n_batches(0) * batch_size,
             # zero the joint classes whose bound class the inner sampler can never emit
-            class_weights=np.where(np.isin(joint_to_bound, emittable_bound), joint_weight, 0.0),
+            class_weights=np.where(np.isin(joint_to_bound, emittable_bound_codes), joint_weight, 0.0),
             mask=mask,
             drop_last=False,
             rng=rng,
@@ -239,7 +242,7 @@ class _BoundSchedule:
     """The class of every batch of a :class:`BoundClassSampler` pass.
 
     The inner schedule's class for each batch, mapped onto the bound annotation and then to one
-    of its subclasses. It has the same ``labels``, ``codes`` and :meth:`draw` as a
+    of its secondary classes. It has the same ``labels``, ``codes`` and :meth:`draw` as a
     :class:`ClassSampler`'s schedule, which is what lets a bound sampler be bound to in turn.
     """
 
@@ -291,9 +294,15 @@ class _BoundSchedule:
         group, group_start = np.unique(drawable_bound[order], return_index=True)
         group_end = np.append(group_start[1:], order.shape[0])
         cum_weight = np.cumsum(drawable_weight[order])
-        hi = cum_weight[group_end - 1]
-        lo = np.concatenate(([0.0], hi[:-1]))
-        g = np.searchsorted(group, bound_of_batch)
-        target = lo[g] + rng.random(bound_of_batch.shape[0]) * (hi[g] - lo[g])
-        hit = np.clip(np.searchsorted(cum_weight, target, side="right"), group_start[g], group_end[g] - 1)
-        return drawable_codes[order[hit]]
+        group_weight_end = cum_weight[group_end - 1]
+        group_weight_start = np.concatenate(([0.0], group_weight_end[:-1]))
+        group_of_batch = np.searchsorted(group, bound_of_batch)
+        target = group_weight_start[group_of_batch] + rng.random(bound_of_batch.shape[0]) * (
+            group_weight_end[group_of_batch] - group_weight_start[group_of_batch]
+        )
+        chosen = np.clip(
+            np.searchsorted(cum_weight, target, side="right"),
+            group_start[group_of_batch],
+            group_end[group_of_batch] - 1,
+        )
+        return drawable_codes[order[chosen]]

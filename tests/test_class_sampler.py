@@ -173,6 +173,12 @@ def _assert_shares(sampler: ClassSampler, codes: np.ndarray, expected: dict[int,
             "must be divisible",
             id="batch_not_divisible",
         ),
+        pytest.param(
+            pd.Categorical(np.repeat([0, 1], 50)), {"batch_size": 0}, ValueError, "batch_size", id="batch_zero"
+        ),
+        pytest.param(
+            pd.Categorical(np.repeat([0, 1], 50)), {"batch_size": -1}, ValueError, "batch_size", id="batch_negative"
+        ),
         pytest.param(np.repeat([0, 1], 50), {}, TypeError, "pandas.Categorical", id="not_categorical"),
         pytest.param(
             pd.Categorical.from_codes([-1, 0, 0, 1, 1] * 20, categories=[0, 1]),
