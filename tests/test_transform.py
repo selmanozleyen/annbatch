@@ -91,10 +91,50 @@ def _double(x):  # module level, so picklable
     return x * 2
 
 
-def test_declared_var_needs_transform_for_other_width():
+@pytest.mark.parametrize("backed", [True, False], ids=["backed", "in-memory"])
+def test_declared_var_remaps_by_name_by_default(tmp_path: Path, backed: bool):
+    adatas = _datasets(tmp_path, backed=backed, dtypes=["float32"] * 3)
+    loader = _loader(var=pd.DataFrame(index=UNION))
+    loader.add_adatas(adatas)  # no transforms: each dataset is placed by its var_names
+    expected = ad.concat([a.to_memory() if backed else a for a in adatas], join="outer")[:, UNION]
+    np.testing.assert_allclose(_read_all(loader), expected.X.toarray())
+
+
+def test_same_width_other_order_is_placed_by_name():
+    a = _adata(["g2", "g0", "g1"], 10, "float32", 0)
+    loader = _loader(var=pd.DataFrame(index=["g0", "g1", "g2"]))
+    loader.add_adata(a)
+    np.testing.assert_allclose(_read_all(loader), a[:, ["g0", "g1", "g2"]].X.toarray())
+
+
+def test_feature_missing_from_declared_var_raises():
+    loader = _loader(var=pd.DataFrame(index=UNION[:3]))
+    with pytest.raises(ValueError, match="not in target"):
+        loader.add_adata(_adata(VARS[1], 10, "float32", 0))
+
+
+def test_dense_with_other_var_names_needs_transform():
+    loader = _loader(var=pd.DataFrame(index=["g0", "g1"]))
+    dense = ad.AnnData(X=np.zeros((10, 2), dtype="float32"), var=pd.DataFrame(index=["g1", "g0"]))
+    with pytest.raises(ValueError, match="it is dense"):
+        loader.add_adata(dense)
+
+
+def test_declared_var_needs_transform_for_other_width_without_var():
     loader = _loader(var=pd.DataFrame(index=UNION))
     with pytest.raises(ValueError, match="give it a transform"):
-        loader.add_adata(_adata(VARS[0], 10, "float32", 0))
+        loader.add_dataset(_adata(VARS[0], 10, "float32", 0).X)
+
+
+@pytest.mark.parametrize("method", ["add_adatas", "add_datasets"])
+def test_wrong_transforms_length_adds_nothing(method: str):
+    adatas = [_adata(VARS[0], 10, "float32", i) for i in range(3)]
+    loader = _loader()
+    items = adatas if method == "add_adatas" else [a.X for a in adatas]
+    with pytest.raises(ValueError, match="transforms has 1 entries for 3 datasets"):
+        getattr(loader, method)(items, transforms=[None])
+    with pytest.raises(ValueError, match="No datasets added yet"):
+        loader.n_var  # noqa: B018
 
 
 def test_declared_var_accepts_matching_width_without_transform():

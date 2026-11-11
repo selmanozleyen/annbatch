@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
-- {meth}`~annbatch.Loader.add_dataset`, {meth}`~annbatch.Loader.add_adata` and their plural forms take a per-dataset `transform`, applied to that dataset's rows each time they are read, before they are stacked with other datasets' rows. With the new `var` argument of {class}`~annbatch.Loader`, which fixes the features of every batch, datasets of different widths can share a loader.
+- {meth}`~annbatch.Loader.add_dataset`, {meth}`~annbatch.Loader.add_adata` and their plural forms take a per-dataset `transform`, applied to that dataset's rows each time they are read, before they are stacked with other datasets' rows. With the new `var` argument of {class}`~annbatch.Loader`, which fixes the features of every batch, datasets of different widths can share a loader: a sparse dataset added with its own `var` is placed by name by default.
 - {class}`~annbatch.RemapColumns`, a `transform` that moves a sparse dataset's columns onto a target feature list, e.g. the union of every dataset's `var_names`, as {func}`anndata.concat` with `join="outer"` would, without rewriting the data on disk. Unmeasured features stay implicit, and {attr}`~annbatch.RemapColumns.col_map` records which ones each dataset measured.
 
 ## [0.3.1]

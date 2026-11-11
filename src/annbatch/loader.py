@@ -22,6 +22,7 @@ from annbatch.types import BackingArray_T, LoaderOutput, OutputInMemoryArray_T
 from annbatch.utils import (
     CSRContainer,
     MultiBasicIndexer,
+    RemapColumns,
     check_lt_1,
     check_var_shapes,
     convert,
@@ -82,6 +83,13 @@ else:  # pragma: no cover
         raise ImportError("numba must be installed for in-memory sparse data: `pip install annbatch[numba]`")
 
 
+def _check_lengths(n: int, **lists: list | None) -> None:
+    """Raises before anything is added if a per-dataset list does not have one entry per dataset."""
+    for name, values in lists.items():
+        if values is not None and len(values) != n:
+            raise ValueError(f"{name} has {len(values)} entries for {n} datasets; give one per dataset.")
+
+
 def _cupy_dtype(dtype: np.dtype) -> np.dtype:
     if dtype in {np.dtype("float32"), np.dtype("float64"), np.dtype("bool")}:
         return dtype
@@ -140,9 +148,9 @@ class Loader[
             The output library for which you would like your array output.
         var
             The features of every yielded batch. Without it, every dataset must have the same features and the first
-            dataset's ``var`` is yielded. With it, a dataset of another width is accepted when it comes with a
-            ``transform`` (see :meth:`add_dataset`) whose output has these features, e.g.
-            :class:`~annbatch.RemapColumns` onto the union of every dataset's ``var_names``.
+            dataset's ``var`` is yielded. With it, a sparse dataset added with its own ``var`` is placed by name
+            (:class:`~annbatch.RemapColumns`), so it may hold any subset of these features in any order; a dataset
+            without ``var`` must have this width, and a ``transform`` (see :meth:`add_dataset`) overrides both.
 
 
     Examples
@@ -377,6 +385,7 @@ class Loader[
                 One ``transform`` per adata, as in :meth:`add_dataset`.
         """
         check_lt_1([len(adatas)], ["Number of adatas"])
+        _check_lengths(len(adatas), transforms=transforms)
         for adata, transform in zip(adatas, [None] * len(adatas) if transforms is None else transforms, strict=True):
             self._add_adata_unchecked(adata, transform)
         return self
@@ -388,7 +397,8 @@ class Loader[
         ----------
             adata
                 A :class:`anndata.AnnData` object, with :class:`zarr.Array`, :class:`scipy.sparse.csr_matrix`, :class:`scipy.sparse.csr_array`, :class:`numpy.ndarray`, or :class:`anndata.abc.CSRDataset` as the data matrix in :attr:`~anndata.AnnData.X`, and :attr:`~anndata.AnnData.obs` containing annotations to yield in a :class:`pandas.DataFrame`.
-                :attr:`~anndata.AnnData.var` must match the ``var`` of any previously added datasets.
+                :attr:`~anndata.AnnData.var` must match the ``var`` of any previously added datasets,
+                unless the loader was given its own ``var``.
                 Only `X`, `obs`, and `var` are kept for now: any :attr:`~anndata.AnnData.obsm` and :attr:`~anndata.AnnData.layers` elements are ignored and a :class:`FutureWarning` is emitted (a future release will additionally load and yield them if present in the passed in `adata`).
             transform
                 Applied to this adata's rows each time they are read, as in :meth:`add_dataset`.
@@ -440,6 +450,7 @@ class Loader[
                 One ``transform`` per dataset, as in :meth:`add_dataset`.
         """
         n = len(datasets)
+        _check_lengths(n, obs=obs, var=var, transforms=transforms)
         for ds, o, v, t in zip(
             datasets,
             [None] * n if obs is None else obs,
@@ -474,8 +485,8 @@ class Loader[
                 Applied to this dataset's rows each time they are read, before they are stacked with other datasets'
                 rows: it takes them as a :class:`scipy.sparse.csr_matrix` (sparse data) or :class:`numpy.ndarray`
                 (dense) and returns the same rows, in order, as CSR or an array with the loader's
-                :attr:`n_var` columns, e.g. :class:`~annbatch.RemapColumns`. A transform lets a dataset of
-                another width join a loader created with ``var``. Datasets with a transform are read into their own
+                :attr:`n_var` columns, e.g. :class:`~annbatch.RemapColumns`. Without one, a loader created with
+                ``var`` remaps a sparse dataset whose ``var_names`` differ from it by name. Datasets with a transform are read into their own
                 buffer and copied once into the window. Use a picklable callable (not a lambda) if the loader goes
                 to :class:`torch.utils.data.DataLoader` workers.
         """
@@ -533,6 +544,8 @@ class Loader[
         datasets = self._train_datasets + [dataset]
         if not self._var_declared:
             check_var_shapes(datasets)  # a transform must then keep the width; checked when it runs
+        elif transform is None and var is not None and not var.index.equals(cast("pd.DataFrame", self._var).index):
+            transform = self._default_transform(dataset, var)
         elif transform is None and dataset.shape[1] != self.n_var:
             raise ValueError(
                 f"The dataset has {dataset.shape[1]} columns but the loader's var has {self.n_var}; give it a "
@@ -564,6 +577,16 @@ class Loader[
                 "The var of the new dataset does not match the existing var."
             )
         return self
+
+    def _default_transform(self, dataset: BackingArray, var: pd.DataFrame) -> RemapColumns:
+        """Places a dataset's columns by name in the loader's ``var``; raises if it has a feature the loader lacks."""
+        if len(var) != dataset.shape[1]:
+            raise ValueError(f"var has {len(var)} rows but the dataset has {dataset.shape[1]} columns.")
+        if not isinstance(dataset, ad.abc.CSRDataset | sp.csr_matrix | sp.csr_array):
+            raise ValueError(
+                "The dataset's var_names differ from the loader's var and it is dense; give it a transform onto that var."
+            )
+        return RemapColumns(var.index, cast("pd.DataFrame", self._var).index)
 
     def _requests_to_dataset_rows(self, requests: list[slice] | np.ndarray) -> OrderedDict[int, np.ndarray]:
         """Given a ndarray or list of slices, give the lookup between on-disk datasets and row indices relative to that dataset.
