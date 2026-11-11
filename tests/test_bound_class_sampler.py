@@ -13,7 +13,6 @@ import pandas as pd
 import pytest
 
 from annbatch.samplers import BoundClassSampler, ClassSampler, WeightedClassSampler
-from annbatch.samplers._class_samplers._bound_class_sampler import project_index
 from tests.test_class_sampler import make_sampler
 
 CT = np.repeat(["B", "T"], 100)
@@ -60,15 +59,14 @@ def batch_keys(sampler, key_of_obs, n_obs: int) -> list:
 
 
 def expected_labels(sampler, positions: tuple[int, ...] | None = None) -> list:
-    """The per-batch class labels ``sampler``'s own schedule source would draw.
+    """The per-batch class labels a bound ``sampler``'s inner schedule would draw.
 
-    For a bound sampler that is its private copy of the inner one, so the oracle must be an
-    identically built twin -- asking the caller's own instance would draw from a different
-    generator.
+    That schedule is a private copy drawing from ``sampler``'s own generator, so the oracle must
+    be an identically built twin -- asking the caller's own instance would draw different ones.
     """
-    source = getattr(sampler, "_inner_sampler", sampler)
-    schedule = source.batch_schedule()[: source.n_batches(0)]
-    return list(project_index(source.vocab, positions)[schedule])
+    schedule = sampler._schedule
+    labels = schedule.inner.labels[schedule.inner.draw(sampler.rng)[: schedule.n_inner_batches]]
+    return list(labels) if positions is None else [tuple(label[p] for p in positions) for label in labels]
 
 
 def four_class_pair() -> tuple[ClassSampler, pd.Categorical]:
@@ -154,8 +152,8 @@ def test_a_schedule_naming_an_undrawable_class_is_rejected():
     # searchsorted maps a code that is not emittable onto a *neighbouring* class, so a schedule
     # that names one must raise rather than quietly sample something else
     class AlwaysSecond(ClassSampler):
-        def batch_schedule(self):
-            return np.full(self._n_batch_slots, 1, dtype=np.int64)
+        def _chunk_schedule(self, n_chunks):
+            return np.full(n_chunks, 1, dtype=np.int64)
 
     sampler = make_sampler(
         pd.Categorical(np.repeat(["A", "B", "C"], 100)),
@@ -207,7 +205,7 @@ def test_on_binds_subset_by_position():
     sampler = make_bound(make_inner(inner_classes, num_samples=2000), condition, on=(0, 1))
 
     expected = expected_labels(make_bound(make_inner(inner_classes, num_samples=2000), condition, on=(0, 1)), (0, 1))
-    assert batch_keys(sampler, project_index(condition.categories, (0, 1))[condition.codes], len(condition)) == expected
+    assert batch_keys(sampler, condition, len(condition)) == expected
 
 
 @pytest.mark.parametrize(
@@ -215,7 +213,7 @@ def test_on_binds_subset_by_position():
     [
         pytest.param((0, 1, 2), ValueError, "but classes_to_bind_on labels have 2", id="too_many_positions"),
         pytest.param((5,), ValueError, r"positions in \[0, 3\)", id="position_out_of_range"),
-        pytest.param((), ValueError, "exactly one class", id="empty_with_several_bound_classes"),
+        pytest.param((), ValueError, "non-empty tuple", id="empty"),
         pytest.param(0, TypeError, "must be a tuple of label positions", id="bare_int"),
     ],
 )
@@ -261,20 +259,6 @@ def test_within_class_weights_shares():
     drawn = donor.codes[np.concatenate(batches(sampler, len(donor)))]
     shares = np.bincount(drawn, minlength=2) / drawn.size
     assert abs(shares[0] - 0.75) < 0.02 and abs(shares[1] - 0.25) < 0.02
-
-
-def test_empty_on_draws_subclasses_unconditionally():
-    # the unconditional link: on=() binds every inner class to the one bound class, so the
-    # subclass of each batch follows class_weights whatever class the inner drew
-    donor = pd.Categorical((["d1"] * 20 + ["d2"] * 20) * 10)
-    kwargs = {"on": (), "classes": donor, "class_weights": np.array([3.0, 1.0])}
-    sampler, twin = (make_bound(make_inner(CT, num_samples=40_000), np.zeros(len(donor)), **kwargs) for _ in range(2))
-
-    inner_of_batch = np.array(expected_labels(twin))
-    donor_of_batch = np.array(batch_keys(sampler, donor, len(donor)))
-    for label in ("B", "T"):
-        share = (donor_of_batch[inner_of_batch == label] == "d1").mean()
-        assert abs(share - 0.75) < 0.03, f"inner class {label} must not shift the subclass draw"
 
 
 @pytest.mark.parametrize("via", ["constructor", "setter"])

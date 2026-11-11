@@ -22,7 +22,7 @@ class WeightedClassSampler(_RunClassSampler):
     """
 
     def _chunk_schedule(self, n_chunks: int) -> np.ndarray:
-        return self._rng.choice(self._rle_manager.emittable_codes, size=n_chunks, p=self._rle_manager.weights)
+        return self._rng.choice(self._rle_manager.codes, size=n_chunks, p=self._rle_manager.weights)
 
     def _window_splits(self, ids: np.ndarray) -> list[np.ndarray]:
         """Cut a window's row ids into batches after shuffling the window as a whole."""

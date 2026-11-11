@@ -159,8 +159,8 @@ class _RunClassSampler(Sampler):
 
     # -- one pass ----------------------------------------------------------------------
 
-    def _slices_for_pass(self) -> list[slice]:
-        """The ``chunk_size`` slices a whole pass reads, the last one short if needed."""
+    def _iter_requests(self) -> Iterator[LoadRequest]:
+        # the `chunk_size` slices a whole pass reads, the last one short if needed
         n_chunks, remainder = divmod(self._num_samples, self._chunk_size)
         if remainder > 0:
             n_chunks += 1
@@ -168,12 +168,10 @@ class _RunClassSampler(Sampler):
         if remainder > 0:
             last = int(slices[-1].start)
             slices[-1] = slice(last, last + remainder)
-        return slices
 
-    def _iter_requests(self) -> Iterator[LoadRequest]:
         window_size = self._preload_nchunks * self._chunk_size
         full_ids = np.arange(window_size)
-        for window in itertools.batched(self._slices_for_pass(), self._preload_nchunks):
+        for window in itertools.batched(slices, self._preload_nchunks):
             n_rows = (len(window) - 1) * self._chunk_size + (window[-1].stop - window[-1].start)
             splits = self._window_splits(full_ids if n_rows == window_size else np.arange(n_rows))
             if self._drop_last and splits[-1].size < self._batch_size:
@@ -183,38 +181,36 @@ class _RunClassSampler(Sampler):
             yield {"requests": list(window), "splits": splits}
 
 
-class _ScheduledClassSampler(_RunClassSampler):
-    """A class sampler that decides the class of every *batch* up front.
+class _ClassSchedule:
+    """The class of every batch of a :class:`ClassSampler` pass.
 
-    :meth:`batch_schedule` draws one class code per batch of a pass, and each chunk is read
-    from the class of the batch covering its rows. Being class-per-batch is what makes a
-    sampler replayable, which is why :class:`~annbatch.samplers.BoundClassSampler` takes one.
+    Being class-per-batch is what makes a sampler replayable, so this object is all a
+    :class:`~annbatch.samplers.BoundClassSampler` reads from the sampler it binds to:
+    ``labels`` (what the drawn codes index into), ``codes`` (the codes that can be drawn under
+    the sampler's current mask and weights) and :meth:`draw`.
     """
 
-    @property
-    def vocab(self) -> pd.Index:
-        """The labels a schedule's class codes index into."""
-        return self._classes.categories
+    def __init__(self, labels: pd.Index, rle_manager: RLEManager, chunk_size: int, batch_size: int, n_slots: int):
+        self.labels = labels
+        self._rle_manager = rle_manager
+        self._chunk_size, self._batch_size, self._n_slots = chunk_size, batch_size, n_slots
 
     @property
-    def emittable_codes(self) -> np.ndarray:
-        """The class codes a schedule may contain, given the current mask and class weights."""
-        return self._rle_manager.emittable_codes
+    def codes(self) -> np.ndarray:
+        return self._rle_manager.codes
 
-    @abstractmethod
-    def batch_schedule(self) -> np.ndarray:
-        """Draw a class code into ``vocab`` for each batch of one pass.
-
-        Returns ``ceil(num_samples / batch_size)`` of them, including the trailing short batch
-        that ``drop_last`` would discard. Each call *draws*, advancing ``rng``.
-        """
-
-    def _chunk_schedule(self, n_chunks: int) -> np.ndarray:
-        # a chunk is read from the class of the batch holding its first row
-        return self.batch_schedule()[(np.arange(n_chunks) * self._chunk_size) // self._batch_size]
+    def draw(self, rng: np.random.Generator) -> np.ndarray:
+        """One class code per batch slot of a pass, including the short one ``drop_last`` discards."""
+        # A class may only change every lcm(chunk_size, batch_size) rows -- the only boundary
+        # where a chunk edge and a batch edge coincide -- i.e. every `slots_per_group` batches.
+        slots_per_group = self._chunk_size // math.gcd(self._chunk_size, self._batch_size)
+        groups = rng.choice(
+            self._rle_manager.codes, size=math.ceil(self._n_slots / slots_per_group), p=self._rle_manager.weights
+        )
+        return np.repeat(groups, slots_per_group)[: self._n_slots]
 
 
-class ClassSampler(_ScheduledClassSampler):
+class ClassSampler(_RunClassSampler):
     """Sample class-coherent batches with replacement.
 
     Every batch the :class:`~annbatch.Loader` yields is drawn from a single class:
@@ -323,12 +319,12 @@ class ClassSampler(_ScheduledClassSampler):
         here; pass a seeded :class:`numpy.random.Generator` to control randomness.
     """
 
-    def batch_schedule(self) -> np.ndarray:
-        # A class may only change every lcm(chunk_size, batch_size) rows -- the only boundary
-        # where a chunk edge and a batch edge coincide -- i.e. every `slots_per_group` batches.
-        slots_per_group = self._chunk_size // math.gcd(self._chunk_size, self._batch_size)
-        n_slots = self._n_batch_slots
-        groups = self._rng.choice(
-            self._rle_manager.emittable_codes, size=math.ceil(n_slots / slots_per_group), p=self._rle_manager.weights
+    @property
+    def _schedule(self) -> _ClassSchedule:
+        return _ClassSchedule(
+            self._classes.categories, self._rle_manager, self._chunk_size, self._batch_size, self._n_batch_slots
         )
-        return np.repeat(groups, slots_per_group)[:n_slots]
+
+    def _chunk_schedule(self, n_chunks: int) -> np.ndarray:
+        # a chunk is read from the class of the batch holding its first row
+        return self._schedule.draw(self._rng)[(np.arange(n_chunks) * self._chunk_size) // self._batch_size]
