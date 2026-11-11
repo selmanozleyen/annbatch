@@ -50,6 +50,56 @@ class CSRContainer:
     dtype: np.dtype
 
 
+class RemapColumns:
+    """A ``transform`` (see :meth:`annbatch.Loader.add_dataset`) moving a sparse dataset's columns onto ``target``.
+
+    Column ``j``, named ``source[j]``, becomes column ``target.get_loc(source[j])``. Only the column indices change:
+    the stored values are kept, and a ``target`` feature the dataset lacks stays implicit, not a stored zero, as
+    with :func:`anndata.concat` and ``join="outer"``. :attr:`col_map` records where each column went, i.e. which
+    ``target`` features the dataset measured. Within a row the new indices keep the dataset's own order, so they are
+    unsorted unless that order agrees with ``target``'s.
+
+    Parameters
+    ----------
+        source
+            The dataset's feature names in column order, e.g. its :attr:`~anndata.AnnData.var_names`.
+        target
+            The loader's feature names, e.g. the union of every dataset's ``var_names``; pass
+            ``pd.DataFrame(index=target)`` as the loader's ``var``.
+
+    Examples
+    --------
+        >>> union = pd.Index(["g0", "g1", "g2"])
+        >>> loader = Loader(var=pd.DataFrame(index=union), batch_size=64)
+        >>> for a in adatas:
+        ...     loader.add_adata(a, transform=RemapColumns(a.var_names, union))
+    """
+
+    col_map: np.ndarray
+    """``col_map[j]`` is the ``target`` column that the dataset's column ``j`` lands in."""
+    n_var: int
+    """The number of ``target`` features."""
+
+    def __init__(self, source: Iterable[str], target: Iterable[str]) -> None:
+        source, target = pd.Index(source), pd.Index(target)
+        for name, index in (("source", source), ("target", target)):
+            if not index.is_unique:
+                raise ValueError(f"{name} feature names must be unique.")
+        col_map = target.get_indexer(source)
+        if (missing := source[col_map < 0]).size:
+            raise ValueError(f"{missing.size} source features are not in target, e.g. {list(missing[:5])}.")
+        self.col_map = col_map.astype(np.int32 if len(target) <= np.iinfo(np.int32).max else np.int64)
+        self.n_var = len(target)
+
+    def __call__(self, x: sp.sparse.csr_matrix | sp.sparse.csr_array) -> sp.sparse.csr_matrix | sp.sparse.csr_array:
+        """``x``'s rows with their columns in ``target``."""
+        if not isinstance(x, sp.sparse.csr_matrix | sp.sparse.csr_array):
+            raise TypeError(f"RemapColumns moves the columns of CSR data, got {type(x).__name__}.")
+        if x.shape[1] != self.col_map.size:
+            raise ValueError(f"Expected {self.col_map.size} columns, the length of source, got {x.shape[1]}.")
+        return type(x)((x.data, self.col_map[x.indices], x.indptr), shape=(x.shape[0], self.n_var))
+
+
 # TODO: make this part of the public zarr or zarrs-python API.
 # We can do chunk coalescing in zarrs based on integer arrays, so I think
 # there would make sense with ezclump or similar.
