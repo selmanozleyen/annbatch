@@ -114,8 +114,10 @@ class BoundClassSampler(_ScheduledClassSampler):
         Positions *within the inner sampler's own labels* to match on, for an inner built on
         multi-column labels. ``on=(0,)`` matches ``classes_to_bind_on`` against the first
         column of each inner label. Give one position per column of ``classes_to_bind_on``,
-        whose labels must then be a subset of the *projected* inner labels. Defaults to
-        matching whole labels.
+        whose labels must then be a subset of the *projected* inner labels. ``on=()`` matches
+        on no column: ``classes_to_bind_on`` must then hold a single class, and with
+        ``classes`` each batch's subclass is drawn unconditionally, ignoring the inner's class.
+        Defaults to matching whole labels.
     classes
         Optional second annotation subdividing each bound class, so a batch is coherent on
         the bound class *and* drawn from one of its subclasses.
@@ -168,13 +170,18 @@ class BoundClassSampler(_ScheduledClassSampler):
             except TypeError:
                 raise TypeError(f"on must be a tuple of label positions or None, got {type(on).__name__}.") from None
             n_inner = len(to_level_arrays(inner_sampler.vocab))
-            if not on or any(not 0 <= position < n_inner for position in on):
+            if any(not 0 <= position < n_inner for position in on):
                 raise ValueError(
-                    f"on must be a non-empty tuple of positions in [0, {n_inner}), since the inner sampler's "
+                    f"on must be a tuple of positions in [0, {n_inner}), since the inner sampler's "
                     f"labels have {n_inner} column(s). Got {on}."
                 )
             n_bound = len(to_level_arrays(classes_to_bind_on.categories))
-            if len(on) != n_bound:
+            if not on and len(classes_to_bind_on.categories) != 1:
+                raise ValueError(
+                    "on=() matches on no column, so classes_to_bind_on must have exactly one class, "
+                    f"got {len(classes_to_bind_on.categories)}."
+                )
+            if on and len(on) != n_bound:
                 raise ValueError(
                     f"on selects {len(on)} of the inner sampler's label columns but classes_to_bind_on labels "
                     f"have {n_bound}; they must match to be compared. Got on={on}."
@@ -182,7 +189,10 @@ class BoundClassSampler(_ScheduledClassSampler):
 
         # a Categorical's categories are unique, so outer_codes already index them directly
         bound_classes = classes_to_bind_on.categories
-        inner_proj = project_index(inner_sampler.vocab, on)
+        # on=(): every inner class binds to the single bound class, so the draw ignores the inner's class
+        inner_proj = (
+            bound_classes.repeat(len(inner_sampler.vocab)) if on == () else project_index(inner_sampler.vocab, on)
+        )
         inner_to_bound = bound_classes.get_indexer(inner_proj)
 
         # scatter rather than np.unique: outer_codes is n_obs long, so this stays O(n_obs)

@@ -215,7 +215,7 @@ def test_on_binds_subset_by_position():
     [
         pytest.param((0, 1, 2), ValueError, "but classes_to_bind_on labels have 2", id="too_many_positions"),
         pytest.param((5,), ValueError, r"positions in \[0, 3\)", id="position_out_of_range"),
-        pytest.param((), ValueError, "non-empty tuple", id="empty"),
+        pytest.param((), ValueError, "exactly one class", id="empty_with_several_bound_classes"),
         pytest.param(0, TypeError, "must be a tuple of label positions", id="bare_int"),
     ],
 )
@@ -261,6 +261,20 @@ def test_within_class_weights_shares():
     drawn = donor.codes[np.concatenate(batches(sampler, len(donor)))]
     shares = np.bincount(drawn, minlength=2) / drawn.size
     assert abs(shares[0] - 0.75) < 0.02 and abs(shares[1] - 0.25) < 0.02
+
+
+def test_empty_on_draws_subclasses_unconditionally():
+    # the unconditional link: on=() binds every inner class to the one bound class, so the
+    # subclass of each batch follows class_weights whatever class the inner drew
+    donor = pd.Categorical((["d1"] * 20 + ["d2"] * 20) * 10)
+    kwargs = {"on": (), "classes": donor, "class_weights": np.array([3.0, 1.0])}
+    sampler, twin = (make_bound(make_inner(CT, num_samples=40_000), np.zeros(len(donor)), **kwargs) for _ in range(2))
+
+    inner_of_batch = np.array(expected_labels(twin))
+    donor_of_batch = np.array(batch_keys(sampler, donor, len(donor)))
+    for label in ("B", "T"):
+        share = (donor_of_batch[inner_of_batch == label] == "d1").mean()
+        assert abs(share - 0.75) < 0.03, f"inner class {label} must not shift the subclass draw"
 
 
 @pytest.mark.parametrize("via", ["constructor", "setter"])
